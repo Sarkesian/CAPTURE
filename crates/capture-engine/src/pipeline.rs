@@ -1,0 +1,382 @@
+//! One running replay session: capture → CFR encode → segment ring, plus replay saves.
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use capture_protocol::{EncoderInfo, Quality, SavedClip};
+
+use crate::audio::{AudioPipeline, SourceSpec};
+use crate::av::Packet;
+use crate::gpu::Gpu;
+use crate::mux::{SegmentWriter, StreamDesc};
+use crate::ring::{Ring, Segment};
+use crate::video::VideoEncoder;
+use crate::{clock, save, storage, wgc};
+
+pub const SEGMENT_SECS: f64 = 2.0;
+/// Extra seconds of footage kept beyond the replay length (keyframe slack + save latency).
+const KEEP_SLACK_SECS: f64 = 6.0;
+
+pub struct Settings {
+    pub root: PathBuf,
+    pub game_name: String,
+    pub source: SourceKind,
+    pub fps: u32,
+    pub quality: Quality,
+    pub cursor: bool,
+    pub audio: Vec<SourceSpec>,
+}
+
+pub enum SourceKind {
+    Window(isize),
+    Monitor(isize),
+}
+
+/// Values that can change while the session runs.
+#[derive(Clone, Copy)]
+pub struct Live {
+    pub replay_secs: u32,
+    pub cap_bytes: u64,
+    pub min_free_bytes: u64,
+}
+
+pub struct Shared {
+    pub ring: Mutex<Ring>,
+    pub session_dir: PathBuf,
+    pub root: PathBuf,
+    pub game_name: String,
+    pub t0: u64,
+    pub live: Mutex<Live>,
+    pub attention: Mutex<Option<String>>,
+    pub frames_encoded: AtomicU64,
+    pub frames_dropped: AtomicU64,
+    pub mux_done: AtomicBool,
+    pub saves_in_progress: AtomicU32,
+    pub track_names: Vec<String>,
+}
+
+impl Shared {
+    pub fn now(&self) -> f64 {
+        clock::secs_since(self.t0)
+    }
+
+    fn set_attention(&self, msg: Option<String>) {
+        *self.attention.lock().unwrap() = msg;
+    }
+
+    /// Delete this session's buffer files once the session has ended and no save needs them.
+    pub fn cleanup_if_idle(&self) {
+        if !self.mux_done.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut ring = self.ring.lock().unwrap();
+        let removed = ring.retain(f64::INFINITY, f64::NEG_INFINITY, 0, u64::MAX);
+        for s in removed {
+            let _ = std::fs::remove_file(&s.path);
+        }
+        if ring.segments().iter().all(|s| s.end.is_some()) && ring.segments().iter().all(|s| s.protect == 0) {
+            for s in ring.segments() {
+                let _ = std::fs::remove_file(&s.path);
+            }
+            let _ = std::fs::remove_file(self.session_dir.join("session.json"));
+            let _ = std::fs::remove_dir(&self.session_dir);
+        }
+    }
+}
+
+pub struct Pipeline {
+    pub shared: Arc<Shared>,
+    pub capture: Arc<wgc::Capture>,
+    pub encoder: EncoderInfo,
+    pub audio: Option<AudioPipeline>,
+    stop: Arc<AtomicBool>,
+    video_thread: Option<std::thread::JoinHandle<()>>,
+    mux_thread: Option<std::thread::JoinHandle<()>>,
+    _gpu: Arc<Gpu>,
+}
+
+impl Pipeline {
+    pub fn start(s: Settings, live: Live) -> Result<Self, String> {
+        let gpu = Arc::new(Gpu::create()?);
+        let source = match s.source {
+            SourceKind::Window(h) => wgc::Source::Window(h),
+            SourceKind::Monitor(h) => wgc::Source::Monitor(h),
+        };
+        let capture = Arc::new(wgc::Capture::start(&gpu, source, s.cursor)?);
+        let encoder = VideoEncoder::open(gpu.clone(), capture.width, capture.height, s.fps, s.quality)?;
+        let info = encoder.info.clone();
+
+        let buffer = storage::buffer_dir(&s.root);
+        let session_dir = buffer.join(format!("{}_{}", storage::local_stamp(), std::process::id()));
+        std::fs::create_dir_all(&session_dir).map_err(|e| format!("Cannot write to the capture folder: {e}"))?;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let t0 = clock::now_100ns();
+        let (tx, rx) = sync_channel::<Packet>(8192);
+
+        let mut streams = vec![unsafe { StreamDesc::from_ctx(encoder.codec_ctx()) }];
+        let audio = if s.audio.is_empty() {
+            None
+        } else {
+            let tx = tx.clone();
+            let a = AudioPipeline::start(s.audio.clone(), t0, stop.clone(), 1, move |p| {
+                let _ = tx.send(p);
+            })?;
+            for (p, tb) in a.params() {
+                streams.push(unsafe { StreamDesc::copy_of(*p, *tb) });
+            }
+            Some(a)
+        };
+        let track_names = audio.as_ref().map(|a| a.track_names().to_vec()).unwrap_or_default();
+        let manifest = serde_json::json!({
+            "capture_session": 1,
+            "game": s.game_name,
+            "video": { "encoder": info.name, "width": info.width, "height": info.height, "fps": info.fps },
+            "audio_tracks": track_names,
+            "segment_container": "mpegts",
+        });
+        let _ = std::fs::write(session_dir.join("session.json"), serde_json::to_vec_pretty(&manifest).unwrap());
+
+        let shared = Arc::new(Shared {
+            ring: Mutex::new(Ring::default()),
+            session_dir,
+            root: s.root.clone(),
+            game_name: s.game_name.clone(),
+            t0,
+            live: Mutex::new(live),
+            attention: Mutex::new(None),
+            frames_encoded: AtomicU64::new(0),
+            frames_dropped: AtomicU64::new(0),
+            mux_done: AtomicBool::new(false),
+            saves_in_progress: AtomicU32::new(0),
+            track_names,
+        });
+
+        let mux_thread = {
+            let shared = shared.clone();
+            std::thread::Builder::new().name("mux".into()).spawn(move || run_mux(shared, rx, streams)).unwrap()
+        };
+        let video_thread = {
+            let (shared, capture, stop) = (shared.clone(), capture.clone(), stop.clone());
+            let fps = s.fps;
+            std::thread::Builder::new()
+                .name("video".into())
+                .spawn(move || run_video(shared, capture, encoder, fps, stop, tx))
+                .unwrap()
+        };
+        Ok(Self {
+            shared,
+            capture,
+            encoder: info,
+            audio,
+            stop,
+            video_thread: Some(video_thread),
+            mux_thread: Some(mux_thread),
+            _gpu: gpu,
+        })
+    }
+
+    pub fn set_live(&self, live: Live) {
+        *self.shared.live.lock().unwrap() = live;
+    }
+
+    /// Start an asynchronous replay save ending now. `done` receives the verified clip or a
+    /// plain-language failure.
+    pub fn request_save(&self, done: impl FnOnce(Result<(SavedClip, f64), String>) + Send + 'static, save_id: u64) -> f64 {
+        let shared = self.shared.clone();
+        let t_end = shared.now();
+        let secs = shared.live.lock().unwrap().replay_secs as f64;
+        shared.saves_in_progress.fetch_add(1, Ordering::SeqCst);
+        std::thread::Builder::new()
+            .name(format!("save-{save_id}"))
+            .spawn(move || {
+                let r = do_save(&shared, t_end, secs, save_id);
+                shared.saves_in_progress.fetch_sub(1, Ordering::SeqCst);
+                shared.cleanup_if_idle();
+                done(r.map(|c| (c, secs)));
+            })
+            .unwrap();
+        secs
+    }
+}
+
+impl Drop for Pipeline {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(t) = self.video_thread.take() {
+            let _ = t.join();
+        }
+        if let Some(a) = self.audio.as_mut() {
+            a.join();
+        }
+        if let Some(t) = self.mux_thread.take() {
+            let _ = t.join();
+        }
+        self.shared.cleanup_if_idle();
+    }
+}
+
+fn run_video(shared: Arc<Shared>, capture: Arc<wgc::Capture>, mut enc: VideoEncoder, fps: u32, stop: Arc<AtomicBool>, tx: std::sync::mpsc::SyncSender<Packet>) {
+    let period = 10_000_000u64 / fps as u64; // 100 ns units
+    let mut n: i64 = 0;
+    let mut send = |p: Packet| {
+        let _ = tx.send(p);
+    };
+    while !stop.load(Ordering::Relaxed) {
+        let due = shared.t0 + n as u64 * period;
+        let now = clock::now_100ns();
+        if now < due {
+            std::thread::sleep(Duration::from_micros((due - now) / 10));
+            continue;
+        }
+        let behind = ((now - due) / period) as i64;
+        if behind > 0 {
+            shared.frames_dropped.fetch_add(behind as u64, Ordering::Relaxed);
+            n += behind;
+        }
+        if capture.closed.load(Ordering::Relaxed) {
+            shared.set_attention(Some("The captured window closed. Choose another window or display.".into()));
+            break;
+        }
+        let latest = capture.latest.lock().unwrap();
+        if latest.has_frame {
+            match enc.encode(&latest, n, &mut send) {
+                Ok(()) => {
+                    shared.frames_encoded.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    drop(latest);
+                    shared.set_attention(Some(format!("Video encoding failed: {e}")));
+                    break;
+                }
+            }
+        }
+        n += 1;
+    }
+    enc.flush(&mut send);
+}
+
+fn run_mux(shared: Arc<Shared>, rx: Receiver<Packet>, streams: Vec<StreamDesc>) {
+    let mut writer: Option<SegmentWriter> = None;
+    let mut seg_start = 0.0;
+    let mut last_video = 0.0;
+    let mut seq: u64 = 0;
+    let mut disk_paused = false;
+    let mut last_free_check = Instant::now() - Duration::from_secs(10);
+    loop {
+        let p = match rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(p) => p,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        let is_video = p.track == 0;
+        if is_video {
+            last_video = p.secs();
+        }
+        let rotate = is_video && p.is_key() && (writer.is_none() || p.secs() >= seg_start + SEGMENT_SECS);
+        if rotate && (writer.is_some() || last_free_check.elapsed() >= Duration::from_secs(1)) {
+            last_free_check = Instant::now();
+            if let Some(w) = writer.take() {
+                let bytes = w.finish();
+                shared.ring.lock().unwrap().close_last(p.secs(), bytes);
+            }
+            let live = *shared.live.lock().unwrap();
+            let keep = live.replay_secs as f64 + KEEP_SLACK_SECS;
+            let free = storage::free_bytes(&shared.session_dir).unwrap_or(u64::MAX);
+            let need = live.min_free_bytes.saturating_sub(free);
+            let removed = shared.ring.lock().unwrap().retain(p.secs(), keep, live.cap_bytes, need);
+            for s in &removed {
+                let _ = std::fs::remove_file(&s.path);
+            }
+            let free = storage::free_bytes(&shared.session_dir).unwrap_or(u64::MAX);
+            if free < live.min_free_bytes {
+                if !disk_paused {
+                    disk_paused = true;
+                    shared.set_attention(Some(format!(
+                        "Low disk space ({} GB free). Replay paused to protect saved clips. Free up space or change the capture folder.",
+                        free / 1_000_000_000
+                    )));
+                }
+                continue;
+            }
+            if disk_paused {
+                disk_paused = false;
+                shared.set_attention(None);
+            }
+            seq += 1;
+            let path = shared.session_dir.join(format!("seg_{seq:06}.ts"));
+            match SegmentWriter::create(&path, &streams) {
+                Ok(w) => {
+                    writer = Some(w);
+                    seg_start = p.secs();
+                    shared.ring.lock().unwrap().push(Segment { seq, path, start: seg_start, end: None, bytes: 0, protect: 0 });
+                }
+                Err(e) => {
+                    shared.set_attention(Some(format!("Cannot write the replay buffer: {e}")));
+                    continue;
+                }
+            }
+        }
+        if let Some(w) = writer.as_mut() {
+            if let Err(e) = w.write(p) {
+                shared.set_attention(Some(format!("Cannot write the replay buffer: {e}")));
+            }
+        }
+    }
+    if let Some(w) = writer.take() {
+        let bytes = w.finish();
+        shared.ring.lock().unwrap().close_last(last_video + 1.0 / 60.0, bytes);
+    }
+    shared.mux_done.store(true, Ordering::SeqCst);
+}
+
+fn do_save(shared: &Shared, t_end: f64, secs: f64, save_id: u64) -> Result<SavedClip, String> {
+    let sel = {
+        let mut ring = shared.ring.lock().unwrap();
+        let sel = ring.select(t_end, secs).ok_or("Nothing has been buffered yet. Wait a moment and try again.")?;
+        ring.protect(&sel.seqs);
+        sel
+    };
+    // Wait until the segment holding `t_end` (and late audio after it) is closed on disk.
+    let deadline = Instant::now() + Duration::from_secs_f64(SEGMENT_SECS * 3.0 + 2.0);
+    while Instant::now() < deadline && !shared.mux_done.load(Ordering::SeqCst) && !shared.ring.lock().unwrap().is_complete_through(t_end) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (all, segs) = {
+        let mut ring = shared.ring.lock().unwrap();
+        // Only closed tail segments: an open one is still being written and would end in a
+        // partial packet.
+        let closed: Vec<u64> = ring.segments().iter().filter(|s| s.end.is_some()).map(|s| s.seq).collect();
+        let tail: Vec<u64> = ring
+            .tail_after(t_end, SEGMENT_SECS + 1.0)
+            .into_iter()
+            .filter(|s| !sel.seqs.contains(s) && closed.contains(s))
+            .collect();
+        ring.protect(&tail);
+        let all: Vec<u64> = sel.seqs.iter().chain(tail.iter()).copied().collect();
+        let mut segs = ring.paths_for(&all);
+        segs.sort_by_key(|s| s.0);
+        (all, segs.into_iter().map(|(_, p, st)| (p, st)).collect::<Vec<_>>())
+    };
+    let result = (|| {
+        let dir = storage::clips_dir(&shared.root, &shared.game_name);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create the clips folder: {e}"))?;
+        let name = storage::clip_file_name(&storage::local_stamp(), &shared.game_name, "Clip");
+        let path = storage::reserve_unique_path(&dir, &name).map_err(|e| format!("Cannot create the clip file: {e}"))?;
+        let clip = save::remux(&segs, sel.start, sel.end, &shared.track_names, &path)?;
+        Ok(SavedClip {
+            save_id,
+            path: clip.path.to_string_lossy().into_owned(),
+            requested_secs: secs,
+            duration_secs: clip.duration_secs,
+            bytes: clip.bytes,
+            video_streams: clip.video_streams,
+            audio_tracks: clip.audio_tracks,
+        })
+    })();
+    shared.ring.lock().unwrap().unprotect(&all);
+    result
+}

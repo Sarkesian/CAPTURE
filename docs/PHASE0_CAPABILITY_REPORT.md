@@ -1,8 +1,9 @@
 # Phase 0 capability report
 
 **Date:** 2026-11-08 · **Branch:** `phase0/spikes` · **Machine:** the user's workstation (below).
-Every result here comes from a run on this machine. Media files are in `spikes/out/`, which git
-ignores because the files contain real screen content. Re-run commands are listed at the end.
+Every result here comes from a run on this machine. Representative media (`mux1`, `game1`) is kept in
+`spikes/out/`, which git ignores because it contains real screen content. Bulkier spike output (`audio1`,
+`obs1`) was deleted after measurement; its numbers are recorded below. Re-run commands are listed at the end.
 
 ## 1. Environment
 
