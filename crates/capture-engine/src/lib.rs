@@ -15,6 +15,7 @@ pub mod pipeline;
 pub mod ring;
 pub mod save;
 pub mod sound;
+pub mod stems;
 pub mod storage;
 pub mod targets;
 pub mod thumb;
@@ -173,6 +174,21 @@ impl Engine {
                     mic::test(device, |phase, peak, message| {
                         emit(Message::new(re, Event::MicTest { phase: phase.into(), peak: (peak * 100.0).round() / 100.0, message }));
                     });
+                });
+            }
+            Command::ExportStems { path } => {
+                let emit = self.emit.clone();
+                std::thread::spawn(move || {
+                    let ev = match stems::export(Path::new(&path)) {
+                        Ok(r) => Event::StemsDone {
+                            path,
+                            folder: Some(r.folder.to_string_lossy().into_owned()),
+                            files: r.files.iter().map(|f| f.to_string_lossy().into_owned()).collect(),
+                            error: None,
+                        },
+                        Err(e) => Event::StemsDone { path, folder: None, files: vec![], error: Some(e) },
+                    };
+                    emit(Message::new(re, ev));
                 });
             }
             Command::ClipInfo { path } => {

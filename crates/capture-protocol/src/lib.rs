@@ -55,6 +55,8 @@ pub enum Command {
     MicMonitor { enabled: bool, #[serde(default)] device: Option<String> },
     /// Record ~3 s from the microphone, then play it back on the default output.
     MicTest { #[serde(default)] device: Option<String> },
+    /// "Editor audio files": synchronized WAV per isolated track next to the clip.
+    ExportStems { path: String },
     /// Thumbnail + duration for a saved clip (answered with `ClipInfo`).
     ClipInfo { path: String },
     ListTargets,
@@ -82,6 +84,7 @@ pub enum Event {
     ReviewFailed { message: String },
     ClipInfo { path: String, thumb: Option<String>, duration_secs: Option<f64>, error: Option<String> },
     AudioDevices { inputs: Vec<AudioDevice>, outputs: Vec<AudioDevice>, apps: Vec<AudioApp> },
+    StemsDone { path: String, folder: Option<String>, files: Vec<String>, error: Option<String> },
     /// Mic test progress: phase "recording" | "playing" | "done" | "failed".
     MicTest { phase: String, peak: f32, message: Option<String> },
 }
