@@ -5,8 +5,10 @@ pub mod audio;
 pub mod av;
 pub mod clock;
 pub mod detect;
+pub mod devices;
 pub mod gpu;
 pub mod hotkey;
+pub mod mic;
 pub mod mux;
 pub mod overlay;
 pub mod pipeline;
@@ -26,7 +28,7 @@ use std::time::Instant;
 
 use capture_protocol::*;
 
-use audio::SourceSpec;
+use audio::{MixParams, Role, Source, SourceSpec};
 use overlay::{Kind, Notice, Overlay};
 use pipeline::{Live, Pipeline, SaveKind, Settings, SourceKind};
 
@@ -59,6 +61,7 @@ pub struct Engine {
     capture_fps: f64,
     last_state: Option<EngineState>,
     last_retry: Instant,
+    mic_monitor: Option<mic::Monitor>,
 }
 
 pub fn fmt_secs(s: f64) -> String {
@@ -85,6 +88,7 @@ impl Engine {
             capture_fps: 0.0,
             last_state: None,
             last_retry: Instant::now(),
+            mic_monitor: None,
         }
     }
 
@@ -139,6 +143,38 @@ impl Engine {
                 }
                 None => self.send(re, Event::ReviewFailed { message: "Nothing is being recorded right now.".into() }),
             },
+            Command::ListAudio => {
+                let emit = self.emit.clone();
+                std::thread::spawn(move || {
+                    unsafe {
+                        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+                    }
+                    use windows::Win32::Media::Audio::{eCapture, eRender};
+                    emit(Message::new(re, Event::AudioDevices {
+                        inputs: devices::list(eCapture),
+                        outputs: devices::list(eRender),
+                        apps: devices::audio_apps(),
+                    }));
+                });
+            }
+            Command::MicMonitor { enabled, device } => {
+                self.mic_monitor = None; // stop the old one before opening the device again
+                if enabled {
+                    self.mic_monitor = Some(mic::Monitor::start(device));
+                }
+            }
+            Command::MicTest { device } => {
+                self.mic_monitor = None;
+                let emit = self.emit.clone();
+                std::thread::spawn(move || {
+                    unsafe {
+                        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+                    }
+                    mic::test(device, |phase, peak, message| {
+                        emit(Message::new(re, Event::MicTest { phase: phase.into(), peak: (peak * 100.0).round() / 100.0, message }));
+                    });
+                });
+            }
             Command::ClipInfo { path } => {
                 let root = self.cfg.as_ref().map(|c| PathBuf::from(&c.capture_root)).unwrap_or_default();
                 let emit = self.emit.clone();
@@ -200,7 +236,7 @@ impl Engine {
                     || old.fps != cfg.fps
                     || old.quality != cfg.quality
                     || old.capture_cursor != cfg.capture_cursor
-                    || old.audio != cfg.audio
+                    || !old.audio.same_sources(&cfg.audio)
                     || old.capture_root != cfg.capture_root
             }
             None => true,
@@ -210,7 +246,7 @@ impl Engine {
         let auto_lists_only = matches!((&self.cfg, &cfg), (Some(old), new)
             if matches!(old.target, CaptureTarget::Auto { .. }) && matches!(new.target, CaptureTarget::Auto { .. })
             && old.fps == new.fps && old.quality == new.quality && old.capture_cursor == new.capture_cursor
-            && old.audio == new.audio && old.capture_root == new.capture_root);
+            && old.audio.same_sources(&new.audio) && old.capture_root == new.capture_root);
         let live = live_of(&cfg);
         let now_ignored = match (&cfg.target, &self.pipeline) {
             (CaptureTarget::Auto { ignore, .. }, Some(p)) => ignore.iter().any(|i| i.eq_ignore_ascii_case(&p.shared.target_exe)),
@@ -219,6 +255,9 @@ impl Engine {
         self.cfg = Some(cfg);
         if let Some(p) = &self.pipeline {
             p.set_live(live);
+            if let (Some(a), Some(c)) = (&p.audio, &self.cfg) {
+                a.set_mix(mix_of(c));
+            }
         }
         if !self.replay_on {
             return;
@@ -260,7 +299,12 @@ impl Engine {
                 self.pipeline = Some(p);
                 let hk = if cfg.save_hotkey.is_empty() { "Save clip in CAPTURE".to_string() } else { cfg.save_hotkey.clone() };
                 let title = if display { "Recording your display".to_string() } else { format!("Recording {name}") };
-                self.notice(Kind::Recording, title, format!("{hk} saves the last {}", fmt_secs(live_of(cfg).replay_secs as f64)));
+                let mic = match (cfg.audio.mic_enabled, cfg.audio.mic_muted) {
+                    (true, false) => " · mic ON",
+                    (true, true) => " · mic muted",
+                    _ => "",
+                };
+                self.notice(Kind::Recording, title, format!("{hk} saves the last {}{mic}", fmt_secs(live_of(cfg).replay_secs as f64)));
             }
             Err(e) => self.start_error = Some(failed(e)),
         }
@@ -474,9 +518,14 @@ impl Engine {
             markers: vec![],
             now_secs: 0.0,
             session_secs: None,
+            mic_monitor: None,
             leftover_buffer_bytes,
             free_bytes,
         };
+        if self.mic_monitor.as_ref().is_some_and(|m| m.started.elapsed().as_secs() > 300) {
+            self.mic_monitor = None;
+        }
+        st.mic_monitor = self.mic_monitor.as_ref().map(|m| m.level());
         if !self.replay_on {
             return st;
         }
@@ -606,13 +655,41 @@ fn base_settings(cfg: &EngineConfig) -> Result<PathBuf, Unresolved> {
     Ok(PathBuf::from(&cfg.capture_root))
 }
 
+/// Audio sources for a session. `game = Some((pid, exe))` for a game/app window, `None` for
+/// whole-display capture (where "System Audio" already contains everything, so voice chat is
+/// kept as its own track but not added to the mix again, and Other Desktop would be identical).
+pub fn audio_sources(cfg: &EngineConfig, game: Option<(u32, &str)>) -> Vec<Source> {
+    let a = &cfg.audio;
+    let mut v = Vec::new();
+    let display = game.is_none();
+    if a.game_audio {
+        v.push(match game {
+            Some((pid, _)) => Source { spec: SourceSpec::Process { pid }, role: Role::Game, label: "Game Audio".into(), in_mix: true },
+            None => Source { spec: SourceSpec::AllExceptCapture, role: Role::Game, label: "System Audio".into(), in_mix: true },
+        });
+    }
+    if a.mic_enabled {
+        v.push(Source { spec: SourceSpec::Mic { device_id: a.mic_device.clone() }, role: Role::Mic, label: "Microphone".into(), in_mix: true });
+    }
+    if let (true, Some(exe)) = (a.voice_enabled, a.voice_app.clone().filter(|e| !e.trim().is_empty())) {
+        let same_as_game = game.is_some_and(|(_, g)| g.eq_ignore_ascii_case(&exe));
+        let in_mix = !same_as_game && !(display && a.game_audio);
+        v.push(Source { spec: SourceSpec::App { exe }, role: Role::Voice, label: "Voice Chat".into(), in_mix });
+    }
+    if a.other_enabled && !(display && a.game_audio) {
+        v.push(Source { spec: SourceSpec::AllExceptCapture, role: Role::Other, label: "Other Desktop".into(), in_mix: false });
+    }
+    v
+}
+
+pub fn mix_of(cfg: &EngineConfig) -> MixParams {
+    let v = &cfg.audio.volumes;
+    MixParams { game: v.game.clamp(0.0, 2.0), mic: v.mic.clamp(0.0, 2.0), voice: v.voice.clamp(0.0, 2.0), mic_muted: cfg.audio.mic_muted }
+}
+
 fn settings_for_window(cfg: &EngineConfig, w: &WindowTarget, detected_by: Option<&str>) -> Result<Settings, Unresolved> {
     let root = base_settings(cfg)?;
-    let audio = if cfg.audio.game_audio {
-        vec![SourceSpec::Process { pid: w.pid, label: "Game Audio".into() }]
-    } else {
-        vec![]
-    };
+    let audio = audio_sources(cfg, Some((w.pid, &w.exe)));
     Ok(Settings {
         root,
         game_name: w.app_name.clone(),
@@ -624,6 +701,7 @@ fn settings_for_window(cfg: &EngineConfig, w: &WindowTarget, detected_by: Option
         quality: cfg.quality,
         cursor: cfg.capture_cursor,
         audio,
+        mix: mix_of(cfg),
     })
 }
 
@@ -660,11 +738,7 @@ fn resolve(cfg: &EngineConfig) -> Result<Settings, Unresolved> {
         CaptureTarget::Display { index } => {
             let mons = targets::monitors();
             let m = mons.iter().find(|m| m.target.index == *index).ok_or_else(|| failed("That display is not connected."))?;
-            let audio = if cfg.audio.game_audio {
-                vec![SourceSpec::AllExceptCapture { label: "System Audio".into() }]
-            } else {
-                vec![]
-            };
+            let audio = audio_sources(cfg, None);
             Ok(Settings {
                 root,
                 game_name: "Desktop".into(),
@@ -676,6 +750,7 @@ fn resolve(cfg: &EngineConfig) -> Result<Settings, Unresolved> {
                 quality: cfg.quality,
                 cursor: cfg.capture_cursor,
                 audio,
+                mix: mix_of(cfg),
             })
         }
     }

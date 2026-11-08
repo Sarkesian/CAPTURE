@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use capture_protocol::{EncoderInfo, Marker, MarkerConfig, MarkerFootage, Quality, Review, SavedClip};
 
-use crate::audio::{AudioPipeline, SourceSpec};
+use crate::audio::{AudioPipeline, MixParams, Source};
 use crate::av::Packet;
 use crate::gpu::Gpu;
 use crate::mux::{SegmentWriter, StreamDesc};
@@ -30,7 +30,8 @@ pub struct Settings {
     pub fps: u32,
     pub quality: Quality,
     pub cursor: bool,
-    pub audio: Vec<SourceSpec>,
+    pub audio: Vec<Source>,
+    pub mix: MixParams,
 }
 
 pub enum SourceKind {
@@ -256,7 +257,7 @@ impl Pipeline {
             None
         } else {
             let tx = tx.clone();
-            let a = AudioPipeline::start(s.audio.clone(), t0, stop.clone(), 1, move |p| {
+            let a = AudioPipeline::start(s.audio.clone(), s.mix, t0, stop.clone(), 1, move |p| {
                 let _ = tx.send(p);
             })?;
             for (p, tb) in a.params() {

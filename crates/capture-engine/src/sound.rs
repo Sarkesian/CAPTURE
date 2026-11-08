@@ -38,13 +38,15 @@ pub fn play_chime(volume: f32) {
         return;
     }
     std::thread::spawn(move || {
-        if let Err(e) = play(&chime_samples(volume)) {
+        if let Err(e) = play_samples(&chime_samples(volume)) {
             eprintln!("chime: {e}");
         }
     });
 }
 
-fn play(samples: &[f32]) -> windows::core::Result<()> {
+/// Play interleaved 48 kHz stereo float samples on the default output, blocking until done.
+/// Streams through a 200 ms buffer, so any length works.
+pub fn play_samples(samples: &[f32]) -> windows::core::Result<()> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
@@ -59,23 +61,37 @@ fn play(samples: &[f32]) -> windows::core::Result<()> {
             wBitsPerSample: 32,
             cbSize: 0,
         };
-        let frames = (samples.len() / 2) as u32;
-        let dur_100ns = (frames as i64 * 10_000_000 / RATE as i64) + 1_000_000;
         client.Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-            dur_100ns,
+            2_000_000,
             0,
             &fmt,
             None,
         )?;
-        let cap = client.GetBufferSize()?.min(frames);
+        let size = client.GetBufferSize()?;
         let render: IAudioRenderClient = client.GetService()?;
-        let buf = render.GetBuffer(cap)?;
-        std::ptr::copy_nonoverlapping(samples.as_ptr(), buf as *mut f32, cap as usize * 2);
-        render.ReleaseBuffer(cap, 0)?;
-        client.Start()?;
-        std::thread::sleep(Duration::from_millis((cap as u64 * 1000 / RATE as u64) + 60));
+        let total = samples.len() / 2;
+        let mut pos = 0usize;
+        let mut started = false;
+        while pos < total {
+            let free = (size - client.GetCurrentPadding()?) as usize;
+            let n = free.min(total - pos);
+            if n > 0 {
+                let buf = render.GetBuffer(n as u32)?;
+                std::ptr::copy_nonoverlapping(samples.as_ptr().add(pos * 2), buf as *mut f32, n * 2);
+                render.ReleaseBuffer(n as u32, 0)?;
+                pos += n;
+            }
+            if !started {
+                client.Start()?;
+                started = true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        while client.GetCurrentPadding()? > 0 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let _ = client.Stop();
     }
     Ok(())

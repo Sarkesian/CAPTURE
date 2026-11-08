@@ -49,6 +49,12 @@ pub enum Command {
     /// Full-session recording, independent of the replay length (uses the same capture).
     StartSession,
     StopSession,
+    /// Microphones, outputs and apps that currently play audio (answered with `AudioDevices`).
+    ListAudio,
+    /// Live level of a microphone while settings are open (nothing is recorded).
+    MicMonitor { enabled: bool, #[serde(default)] device: Option<String> },
+    /// Record ~3 s from the microphone, then play it back on the default output.
+    MicTest { #[serde(default)] device: Option<String> },
     /// Thumbnail + duration for a saved clip (answered with `ClipInfo`).
     ClipInfo { path: String },
     ListTargets,
@@ -75,6 +81,9 @@ pub enum Event {
     ReviewReady(Review),
     ReviewFailed { message: String },
     ClipInfo { path: String, thumb: Option<String>, duration_secs: Option<f64>, error: Option<String> },
+    AudioDevices { inputs: Vec<AudioDevice>, outputs: Vec<AudioDevice>, apps: Vec<AudioApp> },
+    /// Mic test progress: phase "recording" | "playing" | "done" | "failed".
+    MicTest { phase: String, peak: f32, message: Option<String> },
 }
 
 /// A playable snapshot of the buffer. `start`/`end` are session-timeline seconds of its first
@@ -193,8 +202,80 @@ fn yes() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AudioConfig {
     /// Capture the target app's own audio (process loopback); for Display targets this
-    /// becomes the whole-device output mix ("System audio").
+    /// becomes everything you hear ("System Audio").
     pub game_audio: bool,
+    /// Microphone is OFF unless explicitly enabled.
+    #[serde(default)]
+    pub mic_enabled: bool,
+    /// Endpoint ID of the chosen microphone; `None` = Windows default input. A chosen device
+    /// that disconnects is never silently replaced by another one.
+    #[serde(default)]
+    pub mic_device: Option<String>,
+    /// Muted: the Microphone track and the mix receive silence (nothing from the mic is kept).
+    #[serde(default)]
+    pub mic_muted: bool,
+    /// Separate voice-chat app (e.g. Discord.exe), captured from that app only.
+    #[serde(default)]
+    pub voice_enabled: bool,
+    #[serde(default)]
+    pub voice_app: Option<String>,
+    /// "Other Desktop": everything you hear except CAPTURE. Overlaps game and voice chat, so it
+    /// is kept as its own track and NOT added to Preview Mix (no doubled sound).
+    #[serde(default)]
+    pub other_enabled: bool,
+    /// Preview Mix levels (0..=2). Isolated tracks are always recorded unprocessed.
+    #[serde(default)]
+    pub volumes: Volumes,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Volumes {
+    pub game: f32,
+    pub mic: f32,
+    pub voice: f32,
+}
+
+impl Default for Volumes {
+    fn default() -> Self {
+        Self { game: 1.0, mic: 1.0, voice: 1.0 }
+    }
+}
+
+impl AudioConfig {
+    /// Same sources (a pipeline restart is needed only when this differs).
+    pub fn same_sources(&self, o: &AudioConfig) -> bool {
+        self.game_audio == o.game_audio
+            && self.mic_enabled == o.mic_enabled
+            && self.mic_device == o.mic_device
+            && self.voice_enabled == o.voice_enabled
+            && self.voice_app == o.voice_app
+            && self.other_enabled == o.other_enabled
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AudioDevice {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+    /// Virtual devices (e.g. "Steam Streaming Microphone") are labelled so they are never
+    /// mistaken for a real microphone.
+    pub is_virtual: bool,
+}
+
+/// An app that currently has an audio session (i.e. can be picked as voice chat).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AudioApp {
+    pub exe: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MicLevel {
+    pub device: String,
+    pub peak: f32,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -293,6 +374,9 @@ pub struct EngineState {
     /// Full-session recording in progress: seconds recorded so far.
     #[serde(default)]
     pub session_secs: Option<f64>,
+    /// Live microphone level while the mic monitor is on (settings open, not recording).
+    #[serde(default)]
+    pub mic_monitor: Option<MicLevel>,
     pub leftover_buffer_bytes: u64,
     pub free_bytes: Option<u64>,
 }

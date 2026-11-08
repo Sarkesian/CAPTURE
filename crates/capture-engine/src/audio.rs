@@ -1,11 +1,21 @@
 //! WASAPI audio sources aligned to the session timeline, and AAC encoding of
-//! `Preview Mix` + one isolated track per source.
+//! `Preview Mix` + one isolated, unprocessed track per source.
+//!
+//! Sources: the game (process loopback of its process tree), a microphone (a specific capture
+//! device), a voice-chat app (process loopback of that app's tree) and "Other Desktop"
+//! (everything except CAPTURE). Each source runs on its own thread and *retries* on failure
+//! (device unplugged, app not running yet, app restarted) without ever switching to a
+//! different device.
 //!
 //! Alignment: every packet's QPC capture time is converted to a timeline sample index. The
 //! source buffer pads silence for gaps (including the leading gap) and drops samples if the
 //! device clock runs ahead, so sample N of every track always means the same instant.
-//! Endpoint loopback delivers *no* packets while nothing is playing; the encoder pads stalled
-//! tracks against the wall clock so silence never shifts later audio.
+//! Loopback delivers *no* packets while nothing plays; the encoder pads stalled tracks against
+//! the wall clock so silence never shifts later audio.
+//!
+//! Mixing: `Preview Mix` = Σ gain × source over sources marked `in_mix` (soft-limited). A muted
+//! microphone contributes silence to both its own track and the mix. Isolated tracks are
+//! never gain-adjusted.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,44 +26,82 @@ use capture_protocol::TrackState;
 use ffmpeg_sys_next as ff;
 use std::ptr::null_mut;
 use windows::core::{Interface, HSTRING};
-use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Com::*;
-use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, OpenProcess, SetEvent, WaitForSingleObject, PROCESS_SYNCHRONIZE};
 use windows_core::implement;
 
 use crate::av::{self, check, Packet, Rational};
-use crate::clock;
+use crate::{clock, devices};
 
 pub const RATE: u32 = 48_000;
 const CH: usize = 2;
 const DRIFT_TOLERANCE: i64 = 960; // 20 ms
 const STALL_PAD_AFTER: i64 = 9_600; // 200 ms behind wall clock => device is silent/stalled
 const STALL_PAD_TO: i64 = 4_800; // pad up to 100 ms behind wall clock
+const RETRY: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub enum SourceSpec {
     /// Audio rendered by one process and its children (Windows build ≥ 20348).
-    Process { pid: u32, label: String },
-    /// Whole output device mix. `None` = default output.
-    EndpointLoopback { device_id: Option<String>, label: String },
+    Process { pid: u32 },
+    /// Audio of an app found by executable name (its root process and children). Resolved on
+    /// every (re)connect, so it follows the app across restarts.
+    App { exe: String },
+    /// A microphone. `None` = the Windows default input.
+    Mic { device_id: Option<String> },
     /// Everything every app plays *except* CAPTURE's own processes (so CAPTURE's confirmation
-    /// sounds can never be recorded). Process loopback in exclude mode, Windows build ≥ 20348.
-    AllExceptCapture { label: String },
+    /// sounds can never be recorded). Process loopback in exclude mode.
+    AllExceptCapture,
 }
 
-impl SourceSpec {
-    pub fn label(&self) -> &str {
-        match self {
-            SourceSpec::Process { label, .. } | SourceSpec::EndpointLoopback { label, .. } | SourceSpec::AllExceptCapture { label } => label,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Game,
+    Mic,
+    Voice,
+    Other,
+}
+
+#[derive(Debug, Clone)]
+pub struct Source {
+    pub spec: SourceSpec,
+    pub role: Role,
+    pub label: String,
+    /// Added to Preview Mix (false for sources that would double other sources).
+    pub in_mix: bool,
+}
+
+/// Live-adjustable mix settings (no pipeline restart needed).
+#[derive(Debug, Clone, Copy)]
+pub struct MixParams {
+    pub game: f32,
+    pub mic: f32,
+    pub voice: f32,
+    pub mic_muted: bool,
+}
+
+impl Default for MixParams {
+    fn default() -> Self {
+        Self { game: 1.0, mic: 1.0, voice: 1.0, mic_muted: false }
+    }
+}
+
+impl MixParams {
+    fn gain(&self, r: Role) -> f32 {
+        match r {
+            Role::Game => self.game,
+            Role::Mic => self.mic,
+            Role::Voice => self.voice,
+            Role::Other => 0.0,
         }
     }
 }
 
 #[derive(Default)]
-struct TrackBuf {
+pub(crate) struct TrackBuf {
     data: VecDeque<f32>,
     /// Timeline sample index of `data[0]`.
     base: i64,
@@ -64,15 +112,26 @@ struct TrackBuf {
     error: Option<String>,
     mode: String,
     source: String,
+    /// Level-only monitor: samples are measured but not stored.
+    pub(crate) discard: bool,
 }
 
 impl TrackBuf {
+    /// A level-only buffer (mic monitor): measures peaks, stores nothing.
+    pub(crate) fn monitor() -> Self {
+        Self { discard: true, ..Default::default() }
+    }
+
     fn write_pos(&self) -> i64 {
         self.base + (self.data.len() / CH) as i64
     }
 
     /// Append `frames` interleaved stereo frames captured at timeline index `idx`.
     fn push(&mut self, idx: i64, samples: Option<&[f32]>, frames: usize) {
+        if let (true, Some(s)) = (self.discard, samples) {
+            self.measure(s);
+            return;
+        }
         if !self.started {
             self.started = true;
             self.base = idx.max(0);
@@ -94,17 +153,21 @@ impl TrackBuf {
         match samples {
             Some(s) => {
                 let s = &s[skip * CH..frames * CH];
-                let p = s.iter().fold(0f32, |m, x| m.max(x.abs()));
-                if p > 0.0 {
-                    self.signal_seen = true;
-                }
-                if self.peak_at.is_none_or(|t| t.elapsed() > Duration::from_millis(100)) || p > self.peak {
-                    self.peak = p;
-                    self.peak_at = Some(Instant::now());
-                }
+                self.measure(s);
                 self.data.extend(s.iter().copied());
             }
             None => self.data.extend(std::iter::repeat_n(0.0, (frames - skip) * CH)),
+        }
+    }
+
+    fn measure(&mut self, s: &[f32]) {
+        let p = s.iter().fold(0f32, |m, x| m.max(x.abs()));
+        if p > 0.0 {
+            self.signal_seen = true;
+        }
+        if self.peak_at.is_none_or(|t| t.elapsed() > Duration::from_millis(100)) || p > self.peak {
+            self.peak = p;
+            self.peak_at = Some(Instant::now());
         }
     }
 
@@ -118,11 +181,39 @@ impl TrackBuf {
             self.data.extend(std::iter::repeat_n(0.0, (pos - w) as usize * CH));
         }
     }
+
+    pub(crate) fn live_peak(&self) -> f32 {
+        if self.peak_at.is_some_and(|t| t.elapsed() < Duration::from_millis(250)) {
+            self.peak
+        } else {
+            0.0
+        }
+    }
+
+    pub(crate) fn error(&self) -> Option<String> {
+        self.error.clone()
+    }
+
+    pub(crate) fn take_samples(&mut self) -> Vec<f32> {
+        self.data.drain(..).collect()
+    }
+}
+
+/// Soft limiter for the mix: transparent below 0.9, smoothly approaches ±1 above.
+pub fn soft_clip(x: f32) -> f32 {
+    let a = x.abs();
+    if a <= 0.9 {
+        x
+    } else {
+        x.signum() * (0.9 + 0.1 * ((a - 0.9) / 0.1).tanh())
+    }
 }
 
 pub struct AudioPipeline {
     bufs: Vec<Arc<Mutex<TrackBuf>>>,
+    sources: Vec<Source>,
     labels: Vec<String>,
+    mix: Arc<Mutex<MixParams>>,
     threads: Vec<std::thread::JoinHandle<()>>,
     params: Vec<(*mut ff::AVCodecParameters, Rational)>,
 }
@@ -130,17 +221,18 @@ pub struct AudioPipeline {
 unsafe impl Send for AudioPipeline {}
 
 /// Track names in output order: `Preview Mix` then one per source.
-pub fn track_names(sources: &[SourceSpec]) -> Vec<String> {
+pub fn track_names(sources: &[Source]) -> Vec<String> {
     if sources.is_empty() {
         return vec![];
     }
-    std::iter::once("Preview Mix".to_string()).chain(sources.iter().map(|s| s.label().to_string())).collect()
+    std::iter::once("Preview Mix".to_string()).chain(sources.iter().map(|s| s.label.clone())).collect()
 }
 
 impl AudioPipeline {
     /// `first_track` is the muxer track index of `Preview Mix`.
     pub fn start(
-        sources: Vec<SourceSpec>,
+        sources: Vec<Source>,
+        mix: MixParams,
         t0_qpc: u64,
         stop: Arc<AtomicBool>,
         first_track: usize,
@@ -148,17 +240,14 @@ impl AudioPipeline {
     ) -> Result<Self, String> {
         let names = track_names(&sources);
         let bufs: Vec<_> = sources.iter().map(|_| Arc::new(Mutex::new(TrackBuf::default()))).collect();
+        let mix = Arc::new(Mutex::new(mix));
         let mut threads = Vec::new();
-        for (spec, buf) in sources.iter().cloned().zip(bufs.iter().cloned()) {
+        for (src, buf) in sources.iter().cloned().zip(bufs.iter().cloned()) {
             let stop = stop.clone();
             threads.push(
                 std::thread::Builder::new()
-                    .name(format!("audio:{}", spec.label()))
-                    .spawn(move || {
-                        if let Err(e) = capture_source(&spec, &buf, t0_qpc, &stop) {
-                            buf.lock().unwrap().error = Some(e);
-                        }
-                    })
+                    .name(format!("audio:{}", src.label))
+                    .spawn(move || source_thread(&src.spec, &buf, t0_qpc, &stop))
                     .unwrap(),
             );
         }
@@ -168,15 +257,19 @@ impl AudioPipeline {
         }
         let params = encoders.iter().map(|e| (e.params(), e.time_base())).collect();
         if !names.is_empty() {
-            let bufs2 = bufs.clone();
+            let (bufs2, srcs2, mix2) = (bufs.clone(), sources.clone(), mix.clone());
             threads.push(
                 std::thread::Builder::new()
                     .name("audio-encode".into())
-                    .spawn(move || encode_loop(bufs2, encoders, t0_qpc, stop, first_track, out))
+                    .spawn(move || encode_loop(bufs2, srcs2, mix2, encoders, t0_qpc, stop, first_track, out))
                     .unwrap(),
             );
         }
-        Ok(Self { bufs, labels: names, threads, params })
+        Ok(Self { bufs, sources, labels: names, mix, threads, params })
+    }
+
+    pub fn set_mix(&self, m: MixParams) {
+        *self.mix.lock().unwrap() = m;
     }
 
     /// Codec parameters + time base per output track (owned; freed on drop).
@@ -190,24 +283,31 @@ impl AudioPipeline {
 
     pub fn states(&self) -> Vec<TrackState> {
         let mut v = Vec::new();
+        let mix = *self.mix.lock().unwrap();
         let srcs: Vec<_> = self.bufs.iter().map(|b| b.lock().unwrap()).collect();
         if !srcs.is_empty() {
-            let peak = srcs.iter().map(|b| live_peak(b)).fold(0f32, f32::max);
+            let mixed: Vec<usize> = (0..srcs.len()).filter(|&i| self.sources[i].in_mix).collect();
+            let peak = mixed
+                .iter()
+                .filter(|&&i| !(self.sources[i].role == Role::Mic && mix.mic_muted))
+                .map(|&i| srcs[i].live_peak() * mix.gain(self.sources[i].role))
+                .fold(0f32, f32::max);
             v.push(TrackState {
                 name: "Preview Mix".into(),
                 mode: "mix".into(),
-                source: format!("{} source(s)", srcs.len()),
-                peak,
-                signal_seen: srcs.iter().any(|b| b.signal_seen),
+                source: mixed.iter().map(|&i| self.sources[i].label.as_str()).collect::<Vec<_>>().join(" + "),
+                peak: peak.min(1.0),
+                signal_seen: mixed.iter().any(|&i| srcs[i].signal_seen),
                 error: None,
             });
         }
-        for (b, name) in srcs.iter().zip(self.labels.iter().skip(1)) {
+        for (i, (b, name)) in srcs.iter().zip(self.labels.iter().skip(1)).enumerate() {
+            let muted = self.sources[i].role == Role::Mic && mix.mic_muted;
             v.push(TrackState {
                 name: name.clone(),
                 mode: b.mode.clone(),
-                source: b.source.clone(),
-                peak: live_peak(b),
+                source: if muted { format!("{} (muted)", b.source) } else { b.source.clone() },
+                peak: b.live_peak(),
                 signal_seen: b.signal_seen,
                 error: b.error.clone(),
             });
@@ -231,16 +331,31 @@ impl Drop for AudioPipeline {
     }
 }
 
-fn live_peak(b: &TrackBuf) -> f32 {
-    if b.peak_at.is_some_and(|t| t.elapsed() < Duration::from_millis(250)) {
-        b.peak
-    } else {
-        0.0
+/// Capture until `stop`; on any failure, report it and retry the *same* source.
+pub(crate) fn source_thread(spec: &SourceSpec, buf: &Mutex<TrackBuf>, t0_qpc: u64, stop: &AtomicBool) {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+    while !stop.load(Ordering::Relaxed) {
+        match capture_source(spec, buf, t0_qpc, stop) {
+            Ok(()) => return,
+            Err(e) => buf.lock().unwrap().error = Some(e),
+        }
+        let until = Instant::now() + RETRY;
+        while Instant::now() < until {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_loop(
     bufs: Vec<Arc<Mutex<TrackBuf>>>,
+    sources: Vec<Source>,
+    mix: Arc<Mutex<MixParams>>,
     mut encoders: Vec<AacEncoder>,
     t0_qpc: u64,
     stop: Arc<AtomicBool>,
@@ -250,7 +365,7 @@ fn encode_loop(
     let frame = 1024usize;
     let mut next: i64 = 0;
     let mut src = vec![vec![0f32; frame * CH]; bufs.len()];
-    let mut mix = vec![0f32; frame * CH];
+    let mut mixbuf = vec![0f32; frame * CH];
     loop {
         let stopping = stop.load(Ordering::Relaxed);
         let now_idx = clock::timeline_samples(t0_qpc, RATE);
@@ -266,21 +381,28 @@ fn encode_loop(
             .min()
             .unwrap_or(0);
         while next + frame as i64 <= ready {
-            mix.fill(0.0);
+            let p = *mix.lock().unwrap();
+            mixbuf.fill(0.0);
             for (i, b) in bufs.iter().enumerate() {
                 let mut b = b.lock().unwrap();
                 let skip = ((next - b.base).max(0) as usize) * CH;
                 let n = skip.min(b.data.len());
                 b.data.drain(..n);
                 b.base = b.base.max(next);
+                let silence = sources[i].role == Role::Mic && p.mic_muted;
+                let g = if sources[i].in_mix { p.gain(sources[i].role) } else { 0.0 };
                 for (j, s) in b.data.drain(..frame * CH).enumerate() {
+                    let s = if silence { 0.0 } else { s };
                     src[i][j] = s;
-                    mix[j] += s;
+                    mixbuf[j] += s * g;
                 }
                 b.base += frame as i64;
             }
+            for x in mixbuf.iter_mut() {
+                *x = soft_clip(*x);
+            }
             let mut emit = |p: Packet| out(p);
-            let _ = encoders[0].encode(&mix, next, first_track, &mut emit);
+            let _ = encoders[0].encode(&mixbuf, next, first_track, &mut emit);
             for (i, enc) in encoders.iter_mut().skip(1).enumerate() {
                 let _ = enc.encode(&src[i], next, first_track + 1 + i, &mut emit);
             }
@@ -398,55 +520,60 @@ fn float_format() -> WAVEFORMATEX {
     }
 }
 
-pub fn device_name(dev: &IMMDevice) -> String {
-    unsafe {
-        dev.OpenPropertyStore(STGM_READ)
-            .and_then(|s| s.GetValue(&PKEY_Device_FriendlyName))
-            .map(|v| v.to_string())
-            .unwrap_or_else(|_| "Unknown device".into())
+/// Open the client for a source. Errors are plain language for the UI.
+/// Returns the client, stream flags, mode, description, and the process to watch (if any):
+/// process loopback keeps delivering silence after its target exits, so the capture loop must
+/// notice the exit itself and reconnect (to the app's next instance).
+fn open(spec: &SourceSpec) -> Result<(IAudioClient, u32, &'static str, String, Option<u32>), String> {
+    let base = AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+    let loopback = base | AUDCLNT_STREAMFLAGS_LOOPBACK;
+    match spec {
+        SourceSpec::AllExceptCapture => Ok((
+            process_loopback_client(std::process::id(), false).map_err(|e| format!("Could not capture computer audio ({e})"))?,
+            loopback,
+            "process-loopback-exclude",
+            "everything you hear, except CAPTURE's own sounds".into(),
+            None,
+        )),
+        SourceSpec::Process { pid } => Ok((
+            process_loopback_client(*pid, true).map_err(|e| format!("Could not capture this app's audio ({e})"))?,
+            loopback,
+            "process-loopback",
+            format!("process {pid} and its child processes"),
+            Some(*pid),
+        )),
+        SourceSpec::App { exe } => {
+            let pid = devices::root_process(exe).ok_or_else(|| format!("{exe} isn't running. It will be recorded as soon as it starts."))?;
+            Ok((
+                process_loopback_client(pid, true).map_err(|e| format!("Could not capture {exe} ({e})"))?,
+                loopback,
+                "process-loopback",
+                format!("{exe} (process {pid}) and its child processes"),
+                Some(pid),
+            ))
+        }
+        SourceSpec::Mic { device_id } => unsafe {
+            let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|e| e.to_string())?;
+            let dev = match device_id {
+                Some(id) => {
+                    let d = en.GetDevice(&HSTRING::from(id.as_str())).map_err(|_| "Your chosen microphone is not installed any more. Choose another.".to_string())?;
+                    if d.GetState().map(|s| s != DEVICE_STATE_ACTIVE).unwrap_or(true) {
+                        return Err(format!("{} is disconnected. Reconnect it, or choose another microphone.", devices::name_of(&d)));
+                    }
+                    d
+                }
+                None => en.GetDefaultAudioEndpoint(eCapture, eConsole).map_err(|_| "No microphone is connected.".to_string())?,
+            };
+            let name = devices::name_of(&dev);
+            let client = dev.Activate::<IAudioClient>(CLSCTX_ALL, None).map_err(|_| format!("{name} could not be opened. Is another app using it exclusively?"))?;
+            Ok((client, base, "microphone", name, None))
+        },
     }
 }
 
 fn capture_source(spec: &SourceSpec, buf: &Mutex<TrackBuf>, t0_qpc: u64, stop: &AtomicBool) -> Result<(), String> {
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-    }
-    let base = AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-    let (client, flags, mode, source): (IAudioClient, _, _, _) = unsafe {
-        match spec {
-            SourceSpec::AllExceptCapture { .. } => (
-                process_loopback_client(std::process::id(), false).map_err(|e| format!("Could not capture computer audio ({e})"))?,
-                base | AUDCLNT_STREAMFLAGS_LOOPBACK,
-                "process-loopback-exclude",
-                "everything you hear, except CAPTURE's own sounds".to_string(),
-            ),
-            SourceSpec::Process { pid, .. } => (
-                process_loopback_client(*pid, true).map_err(|e| format!("Could not capture this app's audio ({e})"))?,
-                base | AUDCLNT_STREAMFLAGS_LOOPBACK,
-                "process-loopback",
-                format!("process {pid} and its child processes"),
-            ),
-            SourceSpec::EndpointLoopback { device_id, .. } => {
-                let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|e| e.to_string())?;
-                let dev = match device_id {
-                    Some(id) => en.GetDevice(&HSTRING::from(id.as_str())),
-                    None => en.GetDefaultAudioEndpoint(eRender, eConsole),
-                }
-                .map_err(|_| "The selected output device is not connected".to_string())?;
-                (
-                    dev.Activate(CLSCTX_ALL, None).map_err(|e| e.to_string())?,
-                    base | AUDCLNT_STREAMFLAGS_LOOPBACK,
-                    "endpoint-loopback",
-                    format!("everything playing on {}", device_name(&dev)),
-                )
-            }
-        }
-    };
-    {
-        let mut b = buf.lock().unwrap();
-        b.mode = mode.into();
-        b.source = source;
-    }
+    let (client, flags, mode, source, watch) = open(spec)?;
+    let watched = watch.and_then(|pid| unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid).ok() }).map(HandleGuard);
     let fmt = float_format();
     unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 200_000, 0, &fmt, None) }.map_err(|e| e.to_string())?;
     let ev = unsafe { CreateEventW(None, false, false, None) }.map_err(|e| e.to_string())?;
@@ -454,21 +581,40 @@ fn capture_source(spec: &SourceSpec, buf: &Mutex<TrackBuf>, t0_qpc: u64, stop: &
     unsafe { client.SetEventHandle(ev) }.map_err(|e| e.to_string())?;
     let cap: IAudioCaptureClient = unsafe { client.GetService() }.map_err(|e| e.to_string())?;
     unsafe { client.Start() }.map_err(|e| e.to_string())?;
+    {
+        let mut b = buf.lock().unwrap();
+        b.mode = mode.into();
+        b.source = source;
+        b.error = None;
+    }
+    let lost = |what: &str| match spec {
+        SourceSpec::Mic { .. } => format!("The microphone stopped ({what}). Reconnect it; CAPTURE will pick it up again."),
+        SourceSpec::App { exe } => format!("{exe} stopped. It will be recorded again when it restarts."),
+        _ => format!("Audio source stopped ({what})."),
+    };
     while !stop.load(Ordering::Relaxed) {
         unsafe { WaitForSingleObject(ev, 100) };
+        if let Some(h) = &watched {
+            if unsafe { WaitForSingleObject(h.0, 0) } == WAIT_OBJECT_0 {
+                unsafe {
+                    let _ = client.Stop();
+                }
+                return Err(lost("the app closed"));
+            }
+        }
         loop {
-            let n = unsafe { cap.GetNextPacketSize() }.map_err(|_| "Audio source stopped (device or app went away)".to_string())?;
+            let n = unsafe { cap.GetNextPacketSize() }.map_err(|e| lost(&e.message()))?;
             if n == 0 {
                 break;
             }
             let mut data = std::ptr::null_mut();
             let (mut frames, mut bflags, mut qpc) = (0u32, 0u32, 0u64);
-            unsafe { cap.GetBuffer(&mut data, &mut frames, &mut bflags, None, Some(&mut qpc)) }.map_err(|e| e.to_string())?;
+            unsafe { cap.GetBuffer(&mut data, &mut frames, &mut bflags, None, Some(&mut qpc)) }.map_err(|e| lost(&e.message()))?;
             let idx = clock::qpc100ns_to_samples(qpc, t0_qpc, RATE);
             let silent = bflags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
             let samples = (!silent).then(|| unsafe { std::slice::from_raw_parts(data as *const f32, frames as usize * CH) });
             buf.lock().unwrap().push(idx, samples, frames as usize);
-            unsafe { cap.ReleaseBuffer(frames) }.map_err(|e| e.to_string())?;
+            unsafe { cap.ReleaseBuffer(frames) }.map_err(|e| lost(&e.message()))?;
         }
     }
     unsafe {
@@ -560,16 +706,13 @@ mod tests {
         b.push(1000, Some(&s), 480);
         assert_eq!(b.base, 0);
         assert_eq!(b.write_pos(), 1480);
-        // small jitter within tolerance: appended as-is
         b.push(1490, Some(&s), 480);
         assert_eq!(b.write_pos(), 1960);
-        // 100 ms gap: silence inserted so the packet lands at its real time
         b.push(1960 + 4800, Some(&s), 480);
         assert_eq!(b.write_pos(), 1960 + 4800 + 480);
-        // device clock behind: overlapping samples dropped
         let w = b.write_pos();
         b.push(w - 2000, Some(&s), 480);
-        assert_eq!(b.write_pos(), w); // all 480 overlapped -> dropped
+        assert_eq!(b.write_pos(), w);
         assert!(b.signal_seen);
     }
 
@@ -589,5 +732,33 @@ mod tests {
         assert_eq!(b.write_pos(), 4800);
         assert!(b.data.iter().all(|&x| x == 0.0));
         assert!(!b.signal_seen);
+    }
+
+    #[test]
+    fn monitor_buffers_measure_without_storing() {
+        let mut b = TrackBuf { discard: true, ..Default::default() };
+        b.push(0, Some(&vec![0.25f32; 4800 * CH]), 4800);
+        assert!(b.data.is_empty());
+        assert!((b.live_peak() - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn soft_clip_is_transparent_then_bounded() {
+        assert_eq!(soft_clip(0.5), 0.5);
+        assert_eq!(soft_clip(-0.9), -0.9);
+        assert!(soft_clip(3.0) <= 1.0 && soft_clip(3.0) > 0.99);
+        assert!(soft_clip(-3.0) >= -1.0);
+    }
+
+    #[test]
+    fn other_desktop_is_never_mixed_and_track_order_is_stable() {
+        let srcs = vec![
+            Source { spec: SourceSpec::Process { pid: 1 }, role: Role::Game, label: "Game Audio".into(), in_mix: true },
+            Source { spec: SourceSpec::Mic { device_id: None }, role: Role::Mic, label: "Microphone".into(), in_mix: true },
+            Source { spec: SourceSpec::App { exe: "Discord.exe".into() }, role: Role::Voice, label: "Voice Chat".into(), in_mix: true },
+            Source { spec: SourceSpec::AllExceptCapture, role: Role::Other, label: "Other Desktop".into(), in_mix: false },
+        ];
+        assert_eq!(track_names(&srcs), ["Preview Mix", "Game Audio", "Microphone", "Voice Chat", "Other Desktop"]);
+        assert_eq!(MixParams::default().gain(Role::Other), 0.0);
     }
 }
