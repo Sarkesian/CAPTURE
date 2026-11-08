@@ -1,6 +1,6 @@
-//! Global save hotkey on a dedicated message-loop thread.
+//! Global hotkeys (save replay, marker, overlay, session, screenshot) on one message-loop thread.
 //!
-//! Two mechanisms, chosen by key:
+//! Two mechanisms, chosen per key:
 //! - **Regular keys** (F-keys, letters, digits, symbols, PrintScreen…): `RegisterHotKey` with
 //!   `MOD_NOREPEAT`. Windows reports conflicts with other apps, which we surface.
 //! - **Numpad keys**: a low-level keyboard hook (`WH_KEYBOARD_LL`). With NumLock off, Numpad 1
@@ -9,21 +9,21 @@
 //!   never steals the real End/Home/arrow keys. The hook callback only posts a message — it
 //!   does no work — and swallows just the matching key-down/up pair.
 //!
-//! In both cases a debounce window ignores bounces closer than [`DEBOUNCE`], and a held key
-//! fires once.
+//! Every action has its own debounce window ([`DEBOUNCE`]); a held key fires once; two actions
+//! can never share one combination.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use capture_protocol::HotkeyState;
+use capture_protocol::{HotkeyAction, HotkeyState};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const DEBOUNCE: Duration = Duration::from_millis(750);
-const HOTKEY_ID: i32 = 1;
+const HOTKEY_ID: i32 = 1; // + slot index
 const WM_RECONFIGURE: u32 = WM_APP + 1;
 const WM_HOOK_HIT: u32 = WM_APP + 3;
 
@@ -120,14 +120,38 @@ fn key_code(k: &str) -> Option<Key> {
     }
 }
 
+pub fn action_label(a: HotkeyAction) -> &'static str {
+    match a {
+        HotkeyAction::SaveReplay => "Save replay",
+        HotkeyAction::AddMarker => "Add marker",
+        HotkeyAction::ToggleOverlay => "Open overlay",
+        HotkeyAction::ToggleSession => "Start/stop recording",
+        HotkeyAction::Screenshot => "Screenshot",
+    }
+}
+
 // ---- low-level hook state (one hook per process, owned by the hotkey thread) -------------
 
-static HOOK_ACTIVE: AtomicBool = AtomicBool::new(false);
-static HOOK_VK: AtomicU32 = AtomicU32::new(0);
-static HOOK_OFF_VK: AtomicU32 = AtomicU32::new(0);
-static HOOK_MODS: AtomicU32 = AtomicU32::new(0);
+const SLOTS: usize = 8;
+
+struct Slot {
+    active: AtomicBool,
+    vk: AtomicU32,
+    off_vk: AtomicU32,
+    mods: AtomicU32,
+    held: AtomicBool,
+}
+
+#[allow(clippy::declare_interior_mutable_const)]
+const EMPTY_SLOT: Slot = Slot {
+    active: AtomicBool::new(false),
+    vk: AtomicU32::new(0),
+    off_vk: AtomicU32::new(0),
+    mods: AtomicU32::new(0),
+    held: AtomicBool::new(false),
+};
+static HOOK_SLOTS: [Slot; SLOTS] = [EMPTY_SLOT; SLOTS];
 static HOOK_TID: AtomicU32 = AtomicU32::new(0);
-static HOOK_HELD: AtomicBool = AtomicBool::new(false);
 
 fn down(vk: VIRTUAL_KEY) -> bool {
     unsafe { GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000 != 0 }
@@ -160,22 +184,27 @@ pub fn numpad_matches(vk: u32, extended: bool, want_vk: u32, want_off_vk: u32) -
 }
 
 unsafe extern "system" fn ll_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    if code == HC_ACTION as i32 && HOOK_ACTIVE.load(Ordering::Relaxed) {
+    if code == HC_ACTION as i32 {
         let k = &*(lp.0 as *const KBDLLHOOKSTRUCT);
         let ext = k.flags.0 & LLKHF_EXTENDED.0 != 0;
-        if numpad_matches(k.vkCode, ext, HOOK_VK.load(Ordering::Relaxed), HOOK_OFF_VK.load(Ordering::Relaxed)) {
-            let msg = wp.0 as u32;
-            let is_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+        let msg = wp.0 as u32;
+        let is_down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+        for (i, s) in HOOK_SLOTS.iter().enumerate() {
+            if !s.active.load(Ordering::Relaxed)
+                || !numpad_matches(k.vkCode, ext, s.vk.load(Ordering::Relaxed), s.off_vk.load(Ordering::Relaxed))
+            {
+                continue;
+            }
             if is_down {
-                if HOOK_HELD.load(Ordering::Relaxed) {
+                if s.held.load(Ordering::Relaxed) {
                     return LRESULT(1); // auto-repeat of a key we already consumed
                 }
-                if mods_now() == HOOK_MODS.load(Ordering::Relaxed) {
-                    HOOK_HELD.store(true, Ordering::Relaxed);
-                    let _ = PostThreadMessageW(HOOK_TID.load(Ordering::Relaxed), WM_HOOK_HIT, WPARAM(0), LPARAM(0));
+                if mods_now() == s.mods.load(Ordering::Relaxed) {
+                    s.held.store(true, Ordering::Relaxed);
+                    let _ = PostThreadMessageW(HOOK_TID.load(Ordering::Relaxed), WM_HOOK_HIT, WPARAM(i), LPARAM(0));
                     return LRESULT(1);
                 }
-            } else if HOOK_HELD.swap(false, Ordering::Relaxed) {
+            } else if s.held.swap(false, Ordering::Relaxed) {
                 return LRESULT(1);
             }
         }
@@ -183,21 +212,29 @@ unsafe extern "system" fn ll_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT 
     CallNextHookEx(None, code, wp, lp)
 }
 
+pub type Bindings = Vec<(HotkeyAction, String)>;
+
+/// Two actions may not share one key combination: returns the earlier action using it.
+pub fn duplicate_of(bindings: &Bindings, i: usize) -> Option<HotkeyAction> {
+    let me = parse(&bindings[i].1).ok()?;
+    bindings[..i].iter().find(|(_, c)| parse(c).ok() == Some(me)).map(|(a, _)| *a)
+}
+
 pub struct HotkeyService {
     thread_id: u32,
-    wanted: Arc<Mutex<String>>,
-    pub state: Arc<Mutex<HotkeyState>>,
+    wanted: Arc<Mutex<Bindings>>,
+    pub state: Arc<Mutex<Vec<HotkeyState>>>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl HotkeyService {
     pub fn start(
-        combo: &str,
-        on_trigger: impl Fn() + Send + 'static,
-        on_change: impl Fn(HotkeyState) + Send + 'static,
+        bindings: Bindings,
+        on_trigger: impl Fn(HotkeyAction) + Send + 'static,
+        on_change: impl Fn(Vec<HotkeyState>) + Send + 'static,
     ) -> Self {
-        let wanted = Arc::new(Mutex::new(combo.to_string()));
-        let state = Arc::new(Mutex::new(HotkeyState::default()));
+        let wanted = Arc::new(Mutex::new(bindings));
+        let state = Arc::new(Mutex::new(Vec::new()));
         let (tx, rx) = std::sync::mpsc::channel();
         let (w, st) = (wanted.clone(), state.clone());
         let join = std::thread::Builder::new()
@@ -208,11 +245,15 @@ impl HotkeyService {
         Self { thread_id, wanted, state, join: Some(join) }
     }
 
-    pub fn set(&self, combo: &str) {
-        *self.wanted.lock().unwrap() = combo.to_string();
+    pub fn set(&self, bindings: Bindings) {
+        *self.wanted.lock().unwrap() = bindings;
         unsafe {
             let _ = PostThreadMessageW(self.thread_id, WM_RECONFIGURE, WPARAM(0), LPARAM(0));
         }
+    }
+
+    pub fn state_for(&self, a: HotkeyAction) -> HotkeyState {
+        self.state.lock().unwrap().iter().find(|s| s.action == Some(a)).cloned().unwrap_or_default()
     }
 }
 
@@ -227,18 +268,75 @@ impl Drop for HotkeyService {
     }
 }
 
-enum Active {
-    None,
-    Registered,
-    Hook(HHOOK),
+fn release(registered: &mut Vec<i32>, hook: &mut Option<HHOOK>) {
+    for id in registered.drain(..) {
+        unsafe {
+            let _ = UnregisterHotKey(None, id);
+        }
+    }
+    for s in &HOOK_SLOTS {
+        s.active.store(false, Ordering::Relaxed);
+    }
+    if let Some(h) = hook.take() {
+        unsafe {
+            let _ = UnhookWindowsHookEx(h);
+        }
+    }
+}
+
+fn apply(bindings: &Bindings, registered: &mut Vec<i32>, hook: &mut Option<HHOOK>) -> Vec<HotkeyState> {
+    release(registered, hook);
+    let mut states = Vec::new();
+    for (i, (action, combo)) in bindings.iter().enumerate().take(SLOTS) {
+        let st = |ok: bool, message: Option<String>| HotkeyState { action: Some(*action), combo: combo.clone(), registered: ok, message };
+        if combo.trim().is_empty() {
+            states.push(st(false, None));
+            continue;
+        }
+        if let Some(other) = duplicate_of(bindings, i) {
+            states.push(st(false, Some(format!("{combo} is already used for {}.", action_label(other)))));
+            continue;
+        }
+        let state = match parse(combo) {
+            Err(e) => st(false, Some(e)),
+            Ok(c) if c.numpad.is_some() => {
+                if hook.is_none() {
+                    *hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_proc), None, 0) }.ok();
+                }
+                if hook.is_some() {
+                    let s = &HOOK_SLOTS[i];
+                    s.vk.store(c.vk, Ordering::Relaxed);
+                    s.off_vk.store(c.numpad.flatten().unwrap_or(0), Ordering::Relaxed);
+                    s.mods.store(c.mods, Ordering::Relaxed);
+                    s.held.store(false, Ordering::Relaxed);
+                    s.active.store(true, Ordering::Relaxed);
+                    st(true, None)
+                } else {
+                    st(false, Some("Could not listen for numpad keys.".into()))
+                }
+            }
+            Ok(c) => {
+                let id = HOTKEY_ID + i as i32;
+                match unsafe { RegisterHotKey(None, id, HOT_KEY_MODIFIERS(c.mods | MOD_NOREPEAT.0), c.vk) } {
+                    Ok(()) => {
+                        registered.push(id);
+                        st(true, None)
+                    }
+                    Err(_) => st(false, Some(format!("{combo} is already used by another app. Choose a different key."))),
+                }
+            }
+        };
+        states.push(state);
+    }
+    states
 }
 
 fn run(
-    wanted: Arc<Mutex<String>>,
-    state: Arc<Mutex<HotkeyState>>,
+    wanted: Arc<Mutex<Bindings>>,
+    state: Arc<Mutex<Vec<HotkeyState>>>,
     ready: std::sync::mpsc::Sender<u32>,
-    on_trigger: impl Fn(),
-    on_change: impl Fn(HotkeyState),
+    on_trigger: impl Fn(HotkeyAction),
+    on_change: impl Fn(Vec<HotkeyState>),
 ) {
     let mut msg = MSG::default();
     unsafe {
@@ -248,79 +346,38 @@ fn run(
     let tid = unsafe { GetCurrentThreadId() };
     HOOK_TID.store(tid, Ordering::Relaxed);
     let _ = ready.send(tid);
-    let mut active = Active::None;
-    let release = |a: &mut Active| {
-        match a {
-            Active::Registered => unsafe {
-                let _ = UnregisterHotKey(None, HOTKEY_ID);
-            },
-            Active::Hook(h) => unsafe {
-                HOOK_ACTIVE.store(false, Ordering::Relaxed);
-                let _ = UnhookWindowsHookEx(*h);
-            },
-            Active::None => {}
-        }
-        *a = Active::None;
+    let mut registered: Vec<i32> = Vec::new();
+    let mut hook: Option<HHOOK> = None;
+    let mut actions: Vec<HotkeyAction> = Vec::new();
+    let mut last: Vec<Option<Instant>> = vec![None; SLOTS];
+    let reapply = |registered: &mut Vec<i32>, hook: &mut Option<HHOOK>, actions: &mut Vec<HotkeyAction>| {
+        let bindings = wanted.lock().unwrap().clone();
+        *actions = bindings.iter().map(|(a, _)| *a).collect();
+        let states = apply(&bindings, registered, hook);
+        *state.lock().unwrap() = states.clone();
+        on_change(states);
     };
-    let apply = |active: &mut Active| {
-        release(active);
-        let combo = wanted.lock().unwrap().clone();
-        let st = if combo.trim().is_empty() {
-            HotkeyState { combo, registered: false, message: Some("No save hotkey set".into()) }
-        } else {
-            match parse(&combo) {
-                Err(e) => HotkeyState { combo, registered: false, message: Some(e) },
-                Ok(c) if c.numpad.is_some() => {
-                    HOOK_VK.store(c.vk, Ordering::Relaxed);
-                    HOOK_OFF_VK.store(c.numpad.flatten().unwrap_or(0), Ordering::Relaxed);
-                    HOOK_MODS.store(c.mods, Ordering::Relaxed);
-                    HOOK_HELD.store(false, Ordering::Relaxed);
-                    match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_proc), None, 0) } {
-                        Ok(h) => {
-                            HOOK_ACTIVE.store(true, Ordering::Relaxed);
-                            *active = Active::Hook(h);
-                            HotkeyState { combo, registered: true, message: None }
-                        }
-                        Err(e) => HotkeyState { combo, registered: false, message: Some(format!("Could not listen for numpad keys: {e}")) },
-                    }
-                }
-                Ok(c) => match unsafe { RegisterHotKey(None, HOTKEY_ID, HOT_KEY_MODIFIERS(c.mods | MOD_NOREPEAT.0), c.vk) } {
-                    Ok(()) => {
-                        *active = Active::Registered;
-                        HotkeyState { combo, registered: true, message: None }
-                    }
-                    Err(_) => HotkeyState {
-                        message: Some(format!("{combo} is already used by another app. Choose a different hotkey.")),
-                        combo,
-                        registered: false,
-                    },
-                },
-            }
-        };
-        *state.lock().unwrap() = st.clone();
-        on_change(st);
-    };
-    apply(&mut active);
-    let mut last: Option<Instant> = None;
+    reapply(&mut registered, &mut hook, &mut actions);
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
-        let hit = match msg.message {
-            WM_HOTKEY => msg.wParam.0 as i32 == HOTKEY_ID,
-            WM_HOOK_HIT => true,
+        let slot = match msg.message {
+            WM_HOTKEY => Some(msg.wParam.0 as i64 - HOTKEY_ID as i64),
+            WM_HOOK_HIT => Some(msg.wParam.0 as i64),
             WM_RECONFIGURE => {
-                apply(&mut active);
-                false
+                reapply(&mut registered, &mut hook, &mut actions);
+                last = vec![None; SLOTS];
+                None
             }
-            _ => false,
+            _ => None,
         };
-        if hit {
+        if let Some(i) = slot.filter(|i| *i >= 0 && (*i as usize) < actions.len()).map(|i| i as usize) {
             let now = Instant::now();
-            if last.is_none_or(|l| now.duration_since(l) >= DEBOUNCE) {
-                last = Some(now);
-                on_trigger();
+            if last[i].is_none_or(|l| now.duration_since(l) >= DEBOUNCE) {
+                last[i] = Some(now);
+                on_trigger(actions[i]);
             }
         }
     }
-    release(&mut active);
+    release(&mut registered, &mut hook);
 }
 
 #[cfg(test)]
@@ -356,6 +413,18 @@ mod tests {
         assert!(!numpad_matches(end, true, n1, end)); // the real End key is extended
         assert!(numpad_matches(VK_DIVIDE.0 as u32, true, VK_DIVIDE.0 as u32, 0));
         assert!(!numpad_matches(VK_HOME.0 as u32, false, n1, end));
+    }
+
+    #[test]
+    fn duplicate_combos_are_detected() {
+        let b: Bindings = vec![
+            (HotkeyAction::SaveReplay, "Alt+F10".into()),
+            (HotkeyAction::AddMarker, "alt + f10".into()),
+            (HotkeyAction::Screenshot, "".into()),
+        ];
+        assert_eq!(duplicate_of(&b, 1), Some(HotkeyAction::SaveReplay));
+        assert_eq!(duplicate_of(&b, 0), None);
+        assert_eq!(duplicate_of(&b, 2), None);
     }
 
     #[test]

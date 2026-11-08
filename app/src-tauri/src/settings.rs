@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use capture_protocol::{AudioConfig, CaptureTarget, EngineConfig, Quality};
+use capture_protocol::{AudioConfig, CaptureTarget, EngineConfig, Hotkeys, MarkerConfig, Quality};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -41,6 +41,9 @@ pub struct AppSettings {
     /// Auto mode: apps the user marked as games / as not games (exe names).
     pub games: Vec<String>,
     pub ignored: Vec<String>,
+    /// Marker / overlay / session / screenshot hotkeys.
+    pub hotkeys: Hotkeys,
+    pub markers: MarkerConfig,
 }
 
 impl Default for AppSettings {
@@ -62,6 +65,8 @@ impl Default for AppSettings {
             notify_on_save: true,
             games: vec![],
             ignored: vec![],
+            hotkeys: Hotkeys::default(),
+            markers: MarkerConfig::default(),
         }
     }
 }
@@ -92,6 +97,8 @@ impl AppSettings {
             audio: AudioConfig { game_audio: self.game_audio },
             save_hotkey: self.save_hotkey.clone(),
             overlay: self.notify_on_save,
+            hotkeys: self.hotkeys.clone(),
+            markers: self.markers.clone(),
             buffer_cap_bytes: (self.buffer_cap_gb.max(1.0) * 1e9) as u64,
             min_free_bytes: (self.min_free_gb.max(1.0) * 1e9) as u64,
         }
@@ -105,6 +112,9 @@ impl AppSettings {
         };
         self.buffer_cap_gb = self.buffer_cap_gb.clamp(1.0, 2000.0);
         self.min_free_gb = self.min_free_gb.clamp(1.0, 2000.0);
+        self.markers.sound_volume = self.markers.sound_volume.clamp(0.0, 1.0);
+        self.markers.protect_before_secs = self.markers.protect_before_secs.min(600);
+        self.markers.protect_after_secs = self.markers.protect_after_secs.min(600);
         // "Nothing chosen" from older builds becomes Auto: there is always something sensible to do.
         if self.target == TargetPref::None {
             self.target = TargetPref::Auto;

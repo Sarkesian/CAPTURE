@@ -22,6 +22,8 @@ pub struct Segment {
 #[derive(Debug, Default)]
 pub struct Ring {
     segments: Vec<Segment>,
+    /// Marker protection: (marker id, start, end) timeline ranges held back from overwrite.
+    pins: Vec<(u64, f64, f64)>,
 }
 
 /// Segments chosen for a save plus the effective clip start/end on the timeline.
@@ -102,6 +104,39 @@ impl Ring {
         }
     }
 
+    pub fn pin(&mut self, id: u64, start: f64, end: f64) {
+        self.pins.retain(|p| p.0 != id);
+        self.pins.push((id, start, end));
+    }
+
+    pub fn unpin(&mut self, id: u64) {
+        self.pins.retain(|p| p.0 != id);
+    }
+
+    pub fn pinned_ids(&self) -> Vec<u64> {
+        self.pins.iter().map(|p| p.0).collect()
+    }
+
+    fn seg_pinned(&self, s: &Segment) -> bool {
+        let end = s.end.unwrap_or(f64::INFINITY);
+        self.pins.iter().any(|&(_, a, b)| s.start < b && end > a)
+    }
+
+    /// Bytes of closed segments currently held by pins.
+    pub fn pinned_bytes(&self) -> u64 {
+        self.segments.iter().filter(|s| self.seg_pinned(s)).map(|s| s.bytes).sum()
+    }
+
+    /// Oldest pin id (pins are released oldest-first when over budget).
+    pub fn oldest_pin(&self) -> Option<u64> {
+        self.pins.iter().min_by(|a, b| a.1.total_cmp(&b.1)).map(|p| p.0)
+    }
+
+    /// Is footage for timeline time `t` still in the buffer?
+    pub fn covers(&self, t: f64) -> bool {
+        self.segments.iter().any(|s| s.start <= t && s.end.is_none_or(|e| t < e))
+    }
+
     pub fn paths_for(&self, seqs: &[u64]) -> Vec<(u64, PathBuf, f64)> {
         self.segments.iter().filter(|s| seqs.contains(&s.seq)).map(|s| (s.seq, s.path.clone(), s.start)).collect()
     }
@@ -120,7 +155,8 @@ impl Ring {
             let expired = s.end.is_some_and(|e| e < now - keep_secs);
             let over_cap = total > cap_bytes;
             let need_space = need_free_bytes > 0;
-            if closed && s.protect == 0 && (expired || over_cap || need_space) {
+            let pinned = self.seg_pinned(s);
+            if closed && s.protect == 0 && !pinned && (expired || over_cap || need_space) {
                 let s = self.segments.remove(i);
                 total -= s.bytes;
                 need_free_bytes = need_free_bytes.saturating_sub(s.bytes);
@@ -212,6 +248,25 @@ mod tests {
         r.unprotect(&b.seqs);
         r.retain(100.0, 0.0, u64::MAX, 0);
         assert!(r.segments().iter().all(|s| s.end.is_none()));
+    }
+
+    #[test]
+    fn pins_hold_footage_around_markers_until_released() {
+        let mut r = ring(10, 2.0, 100); // 0..20 s
+        r.pin(7, 4.5, 7.0); // marker around t=5: segments 2 (4..6) and 3 (6..8)
+        let removed = r.retain(20.0, 4.0, u64::MAX, 0);
+        let kept: Vec<u64> = r.segments().iter().map(|s| s.seq).collect();
+        assert!(kept.contains(&2) && kept.contains(&3), "pinned segments kept: {kept:?}");
+        assert!(removed.iter().all(|s| s.seq != 2 && s.seq != 3));
+        assert_eq!(r.pinned_bytes(), 200);
+        assert!(r.covers(5.0));
+        assert!(!r.covers(1.0));
+        // a pin can cover the future (segments not yet written)
+        r.pin(8, 19.0, 30.0);
+        assert_eq!(r.oldest_pin(), Some(7));
+        r.unpin(7);
+        let removed = r.retain(20.0, 4.0, u64::MAX, 0);
+        assert!(removed.iter().any(|s| s.seq == 2));
     }
 
     #[test]

@@ -28,6 +28,14 @@
       {e.hotkey.registered ? `✓ ${e.hotkey.combo} is active.` : e.hotkey.message}
     </p>
   {/if}
+  {#each [['add_marker', 'Add marker', 'Bookmarks the moment without saving a clip.', 'marker'], ['toggle_overlay', 'Open overlay', 'Shows CAPTURE on top of your game.', 'overlay']] as [action, title, hint, key] (action)}
+    {@const hs = e?.hotkeys.find(h => h.action === action)}
+    <div class="field">
+      <div class="grow"><div>{title}</div><div class="muted small">{hint}</div></div>
+      <HotkeyField value={s.hotkeys[key as 'marker' | 'overlay']} onchange={v => updateSettings({ hotkeys: { ...s.hotkeys, [key]: v } })} />
+    </div>
+    {#if hs && hs.combo && !hs.registered && hs.message}<p class="small warn">{hs.message}</p>{/if}
+  {/each}
   <div class="field">
     <div class="grow">Frame rate</div>
     <Segmented label="Frame rate" value={s.fps} options={[{ value: 30, label: '30' }, { value: 60, label: '60' }, { value: 120, label: '120' }]} onchange={v => updateSettings({ fps: v })} />
@@ -36,6 +44,31 @@
     <div class="grow">Show the mouse cursor in recordings</div>
     <Toggle checked={s.capture_cursor} label="Show the mouse cursor" onchange={v => updateSettings({ capture_cursor: v })} />
   </div>
+</section>
+
+<section class="card">
+  <h2>Markers</h2>
+  <div class="field">
+    <div class="grow"><div>Play a short sound when a marker is added</div><div class="muted small">CAPTURE keeps this sound out of your recordings. A microphone near your speakers can still hear it.</div></div>
+    <Toggle checked={s.markers.sound} label="Marker sound" onchange={v => updateSettings({ markers: { ...s.markers, sound: v } })} />
+  </div>
+  {#if s.markers.sound}
+    <div class="field">
+      <label class="grow" for="mvol">Sound volume</label>
+      <input id="mvol" type="range" min="0" max="1" step="0.05" value={s.markers.sound_volume} onchange={ev => updateSettings({ markers: { ...s.markers, sound_volume: Number((ev.target as HTMLInputElement).value) } })} />
+    </div>
+  {/if}
+  <div class="field">
+    <div class="grow"><div>Keep footage around markers from being overwritten</div><div class="muted small">Still temporary until you save a clip. Uses at most half of the temporary buffer limit.</div></div>
+    <Toggle checked={s.markers.protect} label="Protect footage around markers" onchange={v => updateSettings({ markers: { ...s.markers, protect: v } })} />
+  </div>
+  {#if s.markers.protect}
+    <div class="field">
+      <span class="grow">Keep before / after the marker (seconds)</span>
+      <input type="number" min="0" max="600" aria-label="Seconds before marker" value={s.markers.protect_before_secs} onchange={ev => updateSettings({ markers: { ...s.markers, protect_before_secs: num(ev) } })} />
+      <input type="number" min="0" max="600" aria-label="Seconds after marker" value={s.markers.protect_after_secs} onchange={ev => updateSettings({ markers: { ...s.markers, protect_after_secs: num(ev) } })} />
+    </div>
+  {/if}
 </section>
 
 <section class="card">

@@ -26,11 +26,17 @@ export interface Settings {
   notify_on_save: boolean;
   games: string[];
   ignored: string[];
+  hotkeys: { marker: string; overlay: string; session: string; screenshot: string };
+  markers: MarkerConfig;
 }
+
+export interface MarkerConfig { sound: boolean; sound_volume: number; protect: boolean; protect_before_secs: number; protect_after_secs: number }
+export type HotkeyAction = 'save_replay' | 'add_marker' | 'toggle_overlay' | 'toggle_session' | 'screenshot';
+export interface Marker { id: number; t: number; at: string; label: string; footage: 'buffered' | 'protected' | 'expired'; note: string | null; saved_in: string[] }
 
 export interface EncoderInfo { name: string; hardware: boolean; width: number; height: number; fps: number; rejected: string[] }
 export interface TrackState { name: string; mode: string; source: string; peak: number; signal_seen: boolean; error: string | null }
-export interface HotkeyState { combo: string; registered: boolean; message: string | null }
+export interface HotkeyState { action: HotkeyAction | null; combo: string; registered: boolean; message: string | null }
 
 export interface EngineState {
   status: Status;
@@ -46,6 +52,9 @@ export interface EngineState {
   tracks: TrackState[];
   saves_in_progress: number;
   hotkey: HotkeyState;
+  hotkeys: HotkeyState[];
+  markers: Marker[];
+  now_secs: number;
   leftover_buffer_bytes: number;
   free_bytes: number | null;
 }
@@ -73,4 +82,6 @@ export type EngineMessage = { v: number; re?: number } & (
   | { event: 'save_finished'; data: SavedClip }
   | { event: 'save_failed'; data: { save_id: number; message: string } }
   | { event: 'error'; data: { message: string } }
+  | { event: 'hotkey_pressed'; data: { action: HotkeyAction } }
+  | { event: 'marker_added'; data: Marker }
 );

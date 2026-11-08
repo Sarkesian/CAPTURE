@@ -36,6 +36,10 @@ pub enum Command {
     Configure(EngineConfig),
     SetReplay { enabled: bool },
     SaveReplay,
+    /// Bookmark the current moment of the running session.
+    AddMarker { #[serde(default)] label: Option<String> },
+    RenameMarker { id: u64, label: String },
+    RemoveMarker { id: u64 },
     ListTargets,
     GetState,
     /// Delete leftover temporary buffer footage that is not part of the running session.
@@ -54,6 +58,82 @@ pub enum Event {
     SaveFailed { save_id: u64, message: String },
     /// A command could not be executed. `message` is plain language for the user.
     Error { message: String },
+    /// A global hotkey whose action belongs to the UI (e.g. opening the overlay).
+    HotkeyPressed { action: HotkeyAction },
+    MarkerAdded(Marker),
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum HotkeyAction {
+    SaveReplay,
+    AddMarker,
+    ToggleOverlay,
+    ToggleSession,
+    Screenshot,
+}
+
+/// Additional global hotkeys (the save hotkey stays in `EngineConfig::save_hotkey`).
+/// Empty string = not set.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Hotkeys {
+    pub marker: String,
+    pub overlay: String,
+    pub session: String,
+    pub screenshot: String,
+}
+
+impl Default for Hotkeys {
+    fn default() -> Self {
+        // Avoids NVIDIA's overlay defaults (Alt+Z, Alt+F9).
+        Self { marker: "Alt+F8".into(), overlay: "Alt+F11".into(), session: String::new(), screenshot: String::new() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct MarkerConfig {
+    /// Short confirmation sound when a marker is added (never recorded, see docs).
+    pub sound: bool,
+    /// 0.0..=1.0
+    pub sound_volume: f32,
+    /// Keep footage around each marker from being overwritten while the session runs.
+    pub protect: bool,
+    pub protect_before_secs: u32,
+    pub protect_after_secs: u32,
+}
+
+impl Default for MarkerConfig {
+    fn default() -> Self {
+        Self { sound: true, sound_volume: 0.35, protect: true, protect_before_secs: 30, protect_after_secs: 15 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkerFootage {
+    /// Footage exists in the temporary buffer and will be overwritten eventually.
+    Buffered,
+    /// Footage around the marker is held back from overwriting (still temporary).
+    Protected,
+    /// The footage is no longer in the buffer.
+    Expired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Marker {
+    pub id: u64,
+    /// Seconds on the session timeline.
+    pub t: f64,
+    /// Local wall-clock time, "HH:MM:SS".
+    pub at: String,
+    pub label: String,
+    pub footage: MarkerFootage,
+    /// Why protection is not active although enabled (e.g. storage limit), if so.
+    pub note: Option<String>,
+    /// Saved clips that contain this moment.
+    pub saved_in: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -68,6 +148,10 @@ pub struct EngineConfig {
     pub audio: AudioConfig,
     /// e.g. "Alt+F10". Empty disables the hotkey.
     pub save_hotkey: String,
+    #[serde(default)]
+    pub hotkeys: Hotkeys,
+    #[serde(default)]
+    pub markers: MarkerConfig,
     /// Show a small on-screen notice (excluded from recordings) when recording starts and
     /// when a clip is saved or fails.
     #[serde(default = "yes")]
@@ -173,7 +257,15 @@ pub struct EngineState {
     pub frames_captured: u64,
     pub tracks: Vec<TrackState>,
     pub saves_in_progress: u32,
+    /// The save hotkey (kept for compatibility); `hotkeys` lists every action.
     pub hotkey: HotkeyState,
+    #[serde(default)]
+    pub hotkeys: Vec<HotkeyState>,
+    #[serde(default)]
+    pub markers: Vec<Marker>,
+    /// Session timeline position "now", seconds (for placing markers on a timeline).
+    #[serde(default)]
+    pub now_secs: f64,
     pub leftover_buffer_bytes: u64,
     pub free_bytes: Option<u64>,
 }
@@ -204,6 +296,8 @@ pub struct TrackState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct HotkeyState {
+    #[serde(default)]
+    pub action: Option<HotkeyAction>,
     pub combo: String,
     pub registered: bool,
     pub message: Option<String>,

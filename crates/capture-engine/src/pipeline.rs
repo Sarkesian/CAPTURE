@@ -6,7 +6,7 @@ use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use capture_protocol::{EncoderInfo, Quality, SavedClip};
+use capture_protocol::{EncoderInfo, Marker, MarkerConfig, MarkerFootage, Quality, SavedClip};
 
 use crate::audio::{AudioPipeline, SourceSpec};
 use crate::av::Packet;
@@ -64,11 +64,106 @@ pub struct Shared {
     pub mux_done: AtomicBool,
     pub saves_in_progress: AtomicU32,
     pub track_names: Vec<String>,
+    /// Markers of this session. Lock order: `ring` before `markers`.
+    pub markers: Mutex<Vec<Marker>>,
+    pub next_marker: AtomicU64,
 }
+
+/// Pins may hold at most this share of the buffer cap; older marker protection is released
+/// first (and the marker says so) rather than letting markers grow the buffer without bound.
+const PIN_BUDGET_SHARE: f64 = 0.5;
 
 impl Shared {
     pub fn now(&self) -> f64 {
         clock::secs_since(self.t0)
+    }
+
+    pub fn add_marker(&self, label: Option<String>, cfg: &MarkerConfig) -> Marker {
+        let t = self.now();
+        let id = self.next_marker.fetch_add(1, Ordering::SeqCst);
+        let mut note = None;
+        if cfg.protect {
+            let cap = self.live.lock().unwrap().cap_bytes;
+            if cap == 0 {
+                note = Some("Not protected: the temporary buffer limit is 0.".into());
+            } else {
+                self.ring.lock().unwrap().pin(id, t - cfg.protect_before_secs as f64, t + cfg.protect_after_secs as f64);
+            }
+        }
+        let m = Marker {
+            id,
+            t: (t * 100.0).round() / 100.0,
+            at: storage::local_stamp()[11..].replace('-', ":"),
+            label: label.unwrap_or_default(),
+            footage: if cfg.protect && note.is_none() { MarkerFootage::Protected } else { MarkerFootage::Buffered },
+            note,
+            saved_in: vec![],
+        };
+        self.markers.lock().unwrap().push(m.clone());
+        self.persist_markers();
+        m
+    }
+
+    pub fn rename_marker(&self, id: u64, label: String) -> bool {
+        let found = self.markers.lock().unwrap().iter_mut().find(|m| m.id == id).map(|m| m.label = label).is_some();
+        self.persist_markers();
+        found
+    }
+
+    pub fn remove_marker(&self, id: u64) -> bool {
+        self.ring.lock().unwrap().unpin(id);
+        let mut ms = self.markers.lock().unwrap();
+        let n = ms.len();
+        ms.retain(|m| m.id != id);
+        let removed = ms.len() != n;
+        drop(ms);
+        self.persist_markers();
+        removed
+    }
+
+    /// Markers with their *current* footage status computed from the ring.
+    pub fn markers_now(&self) -> Vec<Marker> {
+        let ring = self.ring.lock().unwrap();
+        let pinned = ring.pinned_ids();
+        let mut ms = self.markers.lock().unwrap().clone();
+        for m in &mut ms {
+            m.footage = if !ring.covers(m.t) && m.t < self.now() - 1.0 {
+                MarkerFootage::Expired
+            } else if pinned.contains(&m.id) {
+                MarkerFootage::Protected
+            } else {
+                MarkerFootage::Buffered
+            };
+        }
+        ms
+    }
+
+    /// Release the oldest pins while pinned footage exceeds its share of the buffer cap.
+    fn enforce_pin_budget(&self, cap: u64) {
+        let budget = (cap as f64 * PIN_BUDGET_SHARE) as u64;
+        let mut ring = self.ring.lock().unwrap();
+        let mut released = Vec::new();
+        while ring.pinned_bytes() > budget {
+            let Some(id) = ring.oldest_pin() else { break };
+            ring.unpin(id);
+            released.push(id);
+        }
+        drop(ring);
+        if !released.is_empty() {
+            for m in self.markers.lock().unwrap().iter_mut().filter(|m| released.contains(&m.id)) {
+                m.note = Some("Protection released: markers reached their share of the temporary buffer limit. Save it as a clip to keep it.".into());
+            }
+            self.persist_markers();
+        }
+    }
+
+    /// Crash-safe copy of this session's markers next to its buffer segments.
+    fn persist_markers(&self) {
+        let ms = self.markers.lock().unwrap().clone();
+        let tmp = self.session_dir.join("markers.json.tmp");
+        if std::fs::write(&tmp, serde_json::to_vec_pretty(&ms).unwrap()).is_ok() {
+            let _ = std::fs::rename(tmp, self.session_dir.join("markers.json"));
+        }
     }
 
     fn set_attention(&self, msg: Option<String>) {
@@ -90,6 +185,7 @@ impl Shared {
                 let _ = std::fs::remove_file(&s.path);
             }
             let _ = std::fs::remove_file(self.session_dir.join("session.json"));
+            let _ = std::fs::remove_file(self.session_dir.join("markers.json"));
             let _ = std::fs::remove_dir(&self.session_dir);
         }
     }
@@ -168,6 +264,8 @@ impl Pipeline {
             mux_done: AtomicBool::new(false),
             saves_in_progress: AtomicU32::new(0),
             track_names,
+            markers: Mutex::new(Vec::new()),
+            next_marker: AtomicU64::new(1),
         });
 
         let mux_thread = {
@@ -313,6 +411,7 @@ fn run_mux(shared: Arc<Shared>, rx: Receiver<Packet>, streams: Vec<StreamDesc>) 
             let keep = live.replay_secs as f64 + KEEP_SLACK_SECS;
             let free = storage::free_bytes(&shared.session_dir).unwrap_or(u64::MAX);
             let need = live.min_free_bytes.saturating_sub(free);
+            shared.enforce_pin_budget(live.cap_bytes);
             let removed = shared.ring.lock().unwrap().retain(p.secs(), keep, live.cap_bytes, need);
             for s in &removed {
                 let _ = std::fs::remove_file(&s.path);
@@ -359,6 +458,24 @@ fn run_mux(shared: Arc<Shared>, rx: Receiver<Packet>, streams: Vec<StreamDesc>) 
     shared.mux_done.store(true, Ordering::SeqCst);
 }
 
+/// Note which markers a saved clip contains, and write `<clip>.markers.json` next to it (only
+/// when it contains markers) with times relative to the clip start, for editors and FrameCut.
+fn record_markers_in_clip(shared: &Shared, clip: &std::path::Path, start: f64, end: f64) {
+    let mut inside = Vec::new();
+    for m in shared.markers.lock().unwrap().iter_mut().filter(|m| m.t >= start && m.t <= end) {
+        m.saved_in.push(clip.to_string_lossy().into_owned());
+        inside.push(serde_json::json!({ "t": ((m.t - start) * 100.0).round() / 100.0, "label": m.label, "at": m.at }));
+    }
+    if inside.is_empty() {
+        return;
+    }
+    shared.persist_markers();
+    let doc = serde_json::json!({ "capture_markers": 1, "clip": clip.file_name().map(|n| n.to_string_lossy().into_owned()), "markers": inside });
+    let mut side = clip.as_os_str().to_owned();
+    side.push(".markers.json");
+    let _ = std::fs::write(std::path::PathBuf::from(side), serde_json::to_vec_pretty(&doc).unwrap());
+}
+
 fn do_save(shared: &Shared, t_end: f64, secs: f64, save_id: u64) -> Result<SavedClip, String> {
     let sel = {
         let mut ring = shared.ring.lock().unwrap();
@@ -393,6 +510,7 @@ fn do_save(shared: &Shared, t_end: f64, secs: f64, save_id: u64) -> Result<Saved
         let name = storage::clip_file_name(&storage::local_stamp(), &shared.game_name, "Clip");
         let path = storage::reserve_unique_path(&dir, &name).map_err(|e| format!("Cannot create the clip file: {e}"))?;
         let clip = save::remux(&segs, sel.start, sel.end, &shared.track_names, &path)?;
+        record_markers_in_clip(shared, &clip.path, sel.start, sel.end);
         Ok(SavedClip {
             save_id,
             path: clip.path.to_string_lossy().into_owned(),

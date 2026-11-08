@@ -39,12 +39,15 @@ pub enum SourceSpec {
     Process { pid: u32, label: String },
     /// Whole output device mix. `None` = default output.
     EndpointLoopback { device_id: Option<String>, label: String },
+    /// Everything every app plays *except* CAPTURE's own processes (so CAPTURE's confirmation
+    /// sounds can never be recorded). Process loopback in exclude mode, Windows build ≥ 20348.
+    AllExceptCapture { label: String },
 }
 
 impl SourceSpec {
     pub fn label(&self) -> &str {
         match self {
-            SourceSpec::Process { label, .. } | SourceSpec::EndpointLoopback { label, .. } => label,
+            SourceSpec::Process { label, .. } | SourceSpec::EndpointLoopback { label, .. } | SourceSpec::AllExceptCapture { label } => label,
         }
     }
 }
@@ -411,8 +414,14 @@ fn capture_source(spec: &SourceSpec, buf: &Mutex<TrackBuf>, t0_qpc: u64, stop: &
     let base = AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
     let (client, flags, mode, source): (IAudioClient, _, _, _) = unsafe {
         match spec {
+            SourceSpec::AllExceptCapture { .. } => (
+                process_loopback_client(std::process::id(), false).map_err(|e| format!("Could not capture computer audio ({e})"))?,
+                base | AUDCLNT_STREAMFLAGS_LOOPBACK,
+                "process-loopback-exclude",
+                "everything you hear, except CAPTURE's own sounds".to_string(),
+            ),
             SourceSpec::Process { pid, .. } => (
-                process_loopback_client(*pid).map_err(|e| format!("Could not capture this app's audio ({e})"))?,
+                process_loopback_client(*pid, true).map_err(|e| format!("Could not capture this app's audio ({e})"))?,
                 base | AUDCLNT_STREAMFLAGS_LOOPBACK,
                 "process-loopback",
                 format!("process {pid} and its child processes"),
@@ -496,13 +505,18 @@ struct BlobPropVariant {
     data: *const u8,
 }
 
-fn process_loopback_client(pid: u32) -> windows::core::Result<IAudioClient> {
+/// `include = true`: the process tree's audio only. `false`: everything except that tree.
+fn process_loopback_client(pid: u32, include: bool) -> windows::core::Result<IAudioClient> {
     let params = AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
         Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
             ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
                 TargetProcessId: pid,
-                ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+                ProcessLoopbackMode: if include {
+                    PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE
+                } else {
+                    PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE
+                },
             },
         },
     };

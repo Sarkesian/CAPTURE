@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/capture-protocol", "crates/capture-engine", "app/src-tauri"]
+exclude = ["spikes/audio_spike", "spikes/libav_spike"]
 
 [workspace.package]
 version = "0.1.0"

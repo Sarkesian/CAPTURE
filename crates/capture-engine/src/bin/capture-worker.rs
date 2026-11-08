@@ -27,6 +27,15 @@ fn main() {
         ffmpeg_sys_next::av_log_set_level(ffmpeg_sys_next::AV_LOG_ERROR);
     }
 
+    // Diagnostics: `capture-worker --chime [volume]` plays the confirmation sound and exits.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--chime") {
+        let v = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(0.6);
+        capture_engine::sound::play_chime(v);
+        std::thread::sleep(Duration::from_millis(600));
+        return;
+    }
+
     let out = Arc::new(Mutex::new(std::io::stdout()));
     let emit = {
         let out = out.clone();
@@ -46,13 +55,22 @@ fn main() {
     let hk_tx = tx.clone();
     let hk_emit = emit.clone();
     engine.attach_hotkey(HotkeyService::start(
-        "",
-        move || {
-            let _ = hk_tx.send(Input::Req(None, Command::SaveReplay));
+        vec![],
+        move |action| {
+            let cmd = match action {
+                HotkeyAction::SaveReplay => Some(Command::SaveReplay),
+                HotkeyAction::AddMarker => Some(Command::AddMarker { label: None }),
+                _ => None,
+            };
+            match cmd {
+                Some(cmd) => {
+                    let _ = hk_tx.send(Input::Req(None, cmd));
+                }
+                // UI-owned actions (overlay) go straight to the UI process.
+                None => hk_emit(Message::new(None, Event::HotkeyPressed { action })),
+            }
         },
-        move |_st| {
-            let _ = &hk_emit; // state is published with the next State event
-        },
+        |_states| {}, // published with the next State event
     ));
 
     {

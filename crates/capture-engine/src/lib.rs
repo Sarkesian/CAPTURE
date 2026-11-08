@@ -12,6 +12,7 @@ pub mod overlay;
 pub mod pipeline;
 pub mod ring;
 pub mod save;
+pub mod sound;
 pub mod storage;
 pub mod targets;
 pub mod video;
@@ -120,6 +121,17 @@ impl Engine {
                 }
             }
             Command::SaveReplay => self.save(re),
+            Command::AddMarker { label } => self.add_marker(re, label),
+            Command::RenameMarker { id, label } => {
+                if !self.pipeline.as_ref().is_some_and(|p| p.shared.rename_marker(id, label)) {
+                    self.send(re, Event::Error { message: "That marker no longer exists.".into() });
+                }
+            }
+            Command::RemoveMarker { id } => {
+                if !self.pipeline.as_ref().is_some_and(|p| p.shared.remove_marker(id)) {
+                    self.send(re, Event::Error { message: "That marker no longer exists.".into() });
+                }
+            }
             Command::ListTargets => {
                 let windows = targets::windows();
                 let displays = targets::monitors().into_iter().map(|m| m.target).collect();
@@ -141,7 +153,7 @@ impl Engine {
 
     fn configure(&mut self, cfg: EngineConfig) {
         if let Some(h) = &self.hotkey {
-            h.set(&cfg.save_hotkey);
+            h.set(bindings(&cfg));
         }
         let restart = match &self.cfg {
             Some(old) => {
@@ -211,6 +223,29 @@ impl Engine {
             }
             Err(e) => self.start_error = Some(failed(e)),
         }
+    }
+
+    fn add_marker(&mut self, re: Option<u64>, label: Option<String>) {
+        let mcfg = self.cfg.as_ref().map(|c| c.markers.clone()).unwrap_or_default();
+        let Some(p) = self.pipeline.as_ref().filter(|p| !p.target_gone()) else {
+            self.notice(Kind::Failed, "Marker not added".into(), "Nothing is being recorded right now.".into());
+            self.send(re, Event::Error { message: "Nothing is being recorded right now, so there is nothing to mark.".into() });
+            return;
+        };
+        let m = p.shared.add_marker(label, &mcfg);
+        if mcfg.sound {
+            sound::play_chime(mcfg.sound_volume);
+        }
+        let detail = match (&m.note, m.footage) {
+            (Some(n), _) => n.clone(),
+            (None, MarkerFootage::Protected) => format!(
+                "{} · footage {}s before to {}s after is kept",
+                p.shared.game_name, mcfg.protect_before_secs, mcfg.protect_after_secs
+            ),
+            _ => format!("{} · temporary until you save it", p.shared.game_name),
+        };
+        self.notice(Kind::Saved, format!("Marker added · {}", m.at), detail);
+        self.send(re, Event::MarkerAdded(m));
     }
 
     fn save(&mut self, re: Option<u64>) {
@@ -311,7 +346,8 @@ impl Engine {
     }
 
     fn state(&mut self) -> EngineState {
-        let hotkey = self.hotkey.as_ref().map(|h| h.state.lock().unwrap().clone()).unwrap_or_default();
+        let hotkeys = self.hotkey.as_ref().map(|h| h.state.lock().unwrap().clone()).unwrap_or_default();
+        let hotkey = self.hotkey.as_ref().map(|h| h.state_for(HotkeyAction::SaveReplay)).unwrap_or_default();
         let root = self.cfg.as_ref().map(|c| PathBuf::from(&c.capture_root));
         let free_bytes = root.as_deref().and_then(storage::free_bytes);
         let leftover_buffer_bytes = root.as_deref().map(|r| self.leftover_bytes(r)).unwrap_or(0);
@@ -329,6 +365,9 @@ impl Engine {
             tracks: vec![],
             saves_in_progress: 0,
             hotkey,
+            hotkeys,
+            markers: vec![],
+            now_secs: 0.0,
             leftover_buffer_bytes,
             free_bytes,
         };
@@ -354,6 +393,8 @@ impl Engine {
             (ring.available_secs(sh.now()).min(live.replay_secs as f64), ring.total_bytes(), !ring.segments().is_empty())
         };
         let attention = sh.attention.lock().unwrap().clone();
+        st.markers = sh.markers_now();
+        st.now_secs = (sh.now() * 10.0).round() / 10.0;
         st.target_name = Some(sh.game_name.clone());
         st.target_exe = Some(sh.target_exe.clone());
         st.detected_by = sh.detected_by.clone();
@@ -435,6 +476,16 @@ impl Engine {
     }
 }
 
+/// Hotkey bindings handled by the worker. Session/screenshot keys are added when those
+/// features exist, so no key is ever registered for an action that does nothing.
+pub fn bindings(cfg: &EngineConfig) -> hotkey::Bindings {
+    vec![
+        (HotkeyAction::SaveReplay, cfg.save_hotkey.clone()),
+        (HotkeyAction::AddMarker, cfg.hotkeys.marker.clone()),
+        (HotkeyAction::ToggleOverlay, cfg.hotkeys.overlay.clone()),
+    ]
+}
+
 fn live_of(cfg: &EngineConfig) -> Live {
     Live { replay_secs: cfg.replay_secs.clamp(5, 3600), cap_bytes: cfg.buffer_cap_bytes, min_free_bytes: cfg.min_free_bytes }
 }
@@ -501,7 +552,7 @@ fn resolve(cfg: &EngineConfig) -> Result<Settings, Unresolved> {
             let mons = targets::monitors();
             let m = mons.iter().find(|m| m.target.index == *index).ok_or_else(|| failed("That display is not connected."))?;
             let audio = if cfg.audio.game_audio {
-                vec![SourceSpec::EndpointLoopback { device_id: None, label: "System Audio".into() }]
+                vec![SourceSpec::AllExceptCapture { label: "System Audio".into() }]
             } else {
                 vec![]
             };
