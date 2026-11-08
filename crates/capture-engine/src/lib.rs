@@ -120,7 +120,25 @@ impl Engine {
                     self.start_error = None;
                 }
             }
-            Command::SaveReplay => self.save(re),
+            Command::SaveReplay => self.save(re, None),
+            Command::SaveRange { start, end } => self.save(re, Some((start, end))),
+            Command::PrepareReview => match &self.pipeline {
+                Some(p) => {
+                    let emit = self.emit.clone();
+                    p.prepare_review(move |r| {
+                        emit(Message::new(re, match r {
+                            Ok(rv) => Event::ReviewReady(rv),
+                            Err(message) => Event::ReviewFailed { message },
+                        }))
+                    });
+                }
+                None => self.send(re, Event::ReviewFailed { message: "Nothing is being recorded right now.".into() }),
+            },
+            Command::ReleaseReview => {
+                if let Some(p) = &self.pipeline {
+                    p.shared.release_review();
+                }
+            }
             Command::AddMarker { label } => self.add_marker(re, label),
             Command::RenameMarker { id, label } => {
                 if !self.pipeline.as_ref().is_some_and(|p| p.shared.rename_marker(id, label)) {
@@ -248,7 +266,7 @@ impl Engine {
         self.send(re, Event::MarkerAdded(m));
     }
 
-    fn save(&mut self, re: Option<u64>) {
+    fn save(&mut self, re: Option<u64>, range: Option<(f64, f64)>) {
         let Some(p) = &self.pipeline else {
             let msg = if self.replay_on {
                 "Nothing is being recorded right now, so there is nothing to save."
@@ -265,6 +283,7 @@ impl Engine {
         let overlay = self.overlay.clone().filter(|_| self.cfg.as_ref().is_some_and(|c| c.overlay));
         let game = p.shared.game_name.clone();
         let requested = p.request_save(
+            range,
             move |r| {
                 let (ev, notice) = match r {
                     Ok((clip, requested)) => {

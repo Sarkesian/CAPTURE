@@ -6,7 +6,7 @@ use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use capture_protocol::{EncoderInfo, Marker, MarkerConfig, MarkerFootage, Quality, SavedClip};
+use capture_protocol::{EncoderInfo, Marker, MarkerConfig, MarkerFootage, Quality, Review, SavedClip};
 
 use crate::audio::{AudioPipeline, SourceSpec};
 use crate::av::Packet;
@@ -67,6 +67,9 @@ pub struct Shared {
     /// Markers of this session. Lock order: `ring` before `markers`.
     pub markers: Mutex<Vec<Marker>>,
     pub next_marker: AtomicU64,
+    /// Segments + file held by the current review snapshot.
+    review: Mutex<Option<(Vec<u64>, PathBuf)>>,
+    review_seq: AtomicU64,
 }
 
 /// Pins may hold at most this share of the buffer cap; older marker protection is released
@@ -157,6 +160,15 @@ impl Shared {
         }
     }
 
+    /// Drop the current review snapshot: unprotect its segments and delete its file (if a
+    /// player still has it open, it goes with the session folder later).
+    pub fn release_review(&self) {
+        if let Some((seqs, path)) = self.review.lock().unwrap().take() {
+            self.ring.lock().unwrap().unprotect(&seqs);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     /// Crash-safe copy of this session's markers next to its buffer segments.
     fn persist_markers(&self) {
         let ms = self.markers.lock().unwrap().clone();
@@ -186,6 +198,11 @@ impl Shared {
             }
             let _ = std::fs::remove_file(self.session_dir.join("session.json"));
             let _ = std::fs::remove_file(self.session_dir.join("markers.json"));
+            if let Ok(rd) = std::fs::read_dir(&self.session_dir) {
+                for e in rd.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("review_")) {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
             let _ = std::fs::remove_dir(&self.session_dir);
         }
     }
@@ -266,6 +283,8 @@ impl Pipeline {
             track_names,
             markers: Mutex::new(Vec::new()),
             next_marker: AtomicU64::new(1),
+            review: Mutex::new(None),
+            review_seq: AtomicU64::new(1),
         });
 
         let mux_thread = {
@@ -310,10 +329,20 @@ impl Pipeline {
 
     /// Start an asynchronous replay save ending now. `done` receives the verified clip or a
     /// plain-language failure.
-    pub fn request_save(&self, done: impl FnOnce(Result<(SavedClip, f64), String>) + Send + 'static, save_id: u64) -> f64 {
+    /// Start an asynchronous save. `range = None`: replay ending now with the configured
+    /// length. `Some((start, end))`: exactly that timeline range (from the review timeline).
+    /// `done` receives the verified clip and the requested length, or a plain-language failure.
+    pub fn request_save(
+        &self,
+        range: Option<(f64, f64)>,
+        done: impl FnOnce(Result<(SavedClip, f64), String>) + Send + 'static,
+        save_id: u64,
+    ) -> f64 {
         let shared = self.shared.clone();
-        let t_end = shared.now();
-        let secs = shared.live.lock().unwrap().replay_secs as f64;
+        let (t_end, secs) = match range {
+            Some((a, b)) => (b.min(shared.now()), (b - a).max(1.0)),
+            None => (shared.now(), shared.live.lock().unwrap().replay_secs as f64),
+        };
         shared.saves_in_progress.fetch_add(1, Ordering::SeqCst);
         std::thread::Builder::new()
             .name(format!("save-{save_id}"))
@@ -325,6 +354,48 @@ impl Pipeline {
             })
             .unwrap();
         secs
+    }
+
+    /// Build a playable snapshot of all closed buffer segments (stream copy, no re-encode) on a
+    /// background thread. Its segments stay protected until `release_review` or the next review.
+    pub fn prepare_review(&self, done: impl FnOnce(Result<Review, String>) + Send + 'static) {
+        let shared = self.shared.clone();
+        std::thread::Builder::new()
+            .name("review".into())
+            .spawn(move || done(build_review(&shared)))
+            .unwrap();
+    }
+}
+
+fn build_review(shared: &Shared) -> Result<Review, String> {
+    let (seqs, segs, start, end) = {
+        let mut ring = shared.ring.lock().unwrap();
+        let closed: Vec<_> = ring.segments().iter().filter(|s| s.end.is_some()).cloned().collect();
+        let (first, last) = match (closed.first(), closed.last()) {
+            (Some(f), Some(l)) => (f.start, l.end.unwrap()),
+            _ => return Err("Nothing has been recorded yet. Give it a few seconds.".into()),
+        };
+        let seqs: Vec<u64> = closed.iter().map(|s| s.seq).collect();
+        ring.protect(&seqs);
+        (seqs, closed.iter().map(|s| (s.path.clone(), s.start)).collect::<Vec<_>>(), first, last)
+    };
+    let n = shared.review_seq.fetch_add(1, Ordering::SeqCst);
+    let path = shared.session_dir.join(format!("review_{n:03}.mp4"));
+    match save::remux(&segs, start, start, end, &shared.track_names, &path) {
+        Ok((clip, actual_start)) => {
+            shared.release_review(); // the previous snapshot
+            *shared.review.lock().unwrap() = Some((seqs, path.clone()));
+            Ok(Review {
+                path: path.to_string_lossy().into_owned(),
+                start: actual_start,
+                end: actual_start + clip.duration_secs,
+                game: shared.game_name.clone(),
+            })
+        }
+        Err(e) => {
+            shared.ring.lock().unwrap().unprotect(&seqs);
+            Err(format!("Could not open the recording for review: {e}"))
+        }
     }
 }
 
@@ -509,8 +580,8 @@ fn do_save(shared: &Shared, t_end: f64, secs: f64, save_id: u64) -> Result<Saved
         std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create the clips folder: {e}"))?;
         let name = storage::clip_file_name(&storage::local_stamp(), &shared.game_name, "Clip");
         let path = storage::reserve_unique_path(&dir, &name).map_err(|e| format!("Cannot create the clip file: {e}"))?;
-        let clip = save::remux(&segs, sel.start, sel.end, &shared.track_names, &path)?;
-        record_markers_in_clip(shared, &clip.path, sel.start, sel.end);
+        let (clip, actual_start) = save::remux(&segs, sel.start, sel.end - secs, sel.end, &shared.track_names, &path)?;
+        record_markers_in_clip(shared, &clip.path, actual_start, sel.end);
         Ok(SavedClip {
             save_id,
             path: clip.path.to_string_lossy().into_owned(),

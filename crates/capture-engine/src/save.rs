@@ -36,21 +36,33 @@ unsafe fn open_input(p: &Path) -> Result<Input, String> {
     Ok(ic)
 }
 
-/// `segments`: (path, timeline start secs) in order; the first starts on a keyframe at
-/// `clip_start`. Packets after `clip_end` (timeline secs) are dropped.
-pub fn remux(segments: &[(PathBuf, f64)], clip_start: f64, clip_end: f64, track_names: &[String], final_path: &Path) -> Result<ClipResult, String> {
+/// `segments`: (path, timeline start secs) in order; the first starts on a keyframe at timeline
+/// time `seg0_start`. The clip starts at the last keyframe at or before `want_start` (keyframes
+/// are 1 s apart) and packets after `clip_end` (timeline secs) are dropped.
+/// Returns the clip and the timeline time its first frame corresponds to.
+pub fn remux(
+    segments: &[(PathBuf, f64)],
+    seg0_start: f64,
+    want_start: f64,
+    clip_end: f64,
+    track_names: &[String],
+    final_path: &Path,
+) -> Result<(ClipResult, f64), String> {
     let partial = storage::partial_path(final_path);
-    let r = unsafe { remux_inner(segments, clip_start, clip_end, track_names, &partial) };
-    if let Err(e) = r {
-        let _ = std::fs::remove_file(&partial);
-        return Err(e);
-    }
+    let r = unsafe { remux_inner(segments, seg0_start, want_start, clip_end, track_names, &partial) };
+    let actual_start = match r {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = std::fs::remove_file(&partial);
+            return Err(e);
+        }
+    };
     let verified = verify(&partial, track_names.len() as u32);
     let res = match verified {
         Ok(mut v) => {
             std::fs::rename(&partial, final_path).map_err(|e| format!("Could not finalize clip: {e}"))?;
             v.path = final_path.to_path_buf();
-            Ok(v)
+            Ok((v, actual_start))
         }
         Err(e) => {
             let _ = std::fs::remove_file(&partial);
@@ -60,7 +72,29 @@ pub fn remux(segments: &[(PathBuf, f64)], clip_start: f64, clip_end: f64, track_
     res
 }
 
-unsafe fn remux_inner(segments: &[(PathBuf, f64)], clip_start: f64, clip_end: f64, names: &[String], out: &Path) -> Result<(), String> {
+/// Video keyframe pts (stream tb) in a segment, in order.
+unsafe fn keyframes(path: &Path, video_idx: usize) -> Vec<i64> {
+    let Ok(ic) = open_input(path) else { return vec![] };
+    let pkt = ff::av_packet_alloc();
+    let mut out = Vec::new();
+    while ff::av_read_frame(ic.0, pkt) >= 0 {
+        if (*pkt).stream_index as usize == video_idx && (*pkt).flags & ff::AV_PKT_FLAG_KEY != 0 && (*pkt).pts != ff::AV_NOPTS_VALUE {
+            out.push((*pkt).pts);
+        }
+        ff::av_packet_unref(pkt);
+    }
+    let mut p = pkt;
+    ff::av_packet_free(&mut p);
+    out
+}
+
+/// Pure choice of the cut point (unit-tested): the last keyframe at or before `want`, else the
+/// first keyframe.
+pub fn pick_origin(keys: &[i64], want: i64) -> Option<i64> {
+    keys.iter().copied().filter(|&k| k <= want).max().or_else(|| keys.first().copied())
+}
+
+unsafe fn remux_inner(segments: &[(PathBuf, f64)], seg0_start: f64, want_start: f64, clip_end: f64, names: &[String], out: &Path) -> Result<f64, String> {
     let first = segments.first().ok_or("No footage in the buffer yet")?;
     let ic0 = open_input(&first.0)?;
     let n = (*ic0.0).nb_streams as usize;
@@ -111,7 +145,14 @@ unsafe fn remux_inner(segments: &[(PathBuf, f64)], clip_start: f64, clip_end: f6
         .ok_or("Buffer has no video stream")?;
     let vtb = (*(*(*ic0.0).streams.add(video_idx))).time_base;
     drop(ic0);
-    let mut origin: Option<i64> = None; // in video stream tb
+    let secs_to_tb = |s: f64| (s * vtb.den as f64 / vtb.num as f64).round() as i64;
+    let keys = keyframes(&first.0, video_idx);
+    let p0 = *keys.first().ok_or("Buffer contained no video frames")?;
+    let want_pts = p0 + secs_to_tb((want_start - seg0_start).max(0.0));
+    let origin_pts = pick_origin(&keys, want_pts).unwrap_or(p0);
+    let actual_start = seg0_start + (origin_pts - p0) as f64 * vtb.num as f64 / vtb.den as f64;
+    let end_pts = p0 + secs_to_tb(clip_end - seg0_start);
+    let mut origin: Option<i64> = Some(origin_pts); // in video stream tb
     let mut last_dts = vec![i64::MIN; n];
     let pkt = ff::av_packet_alloc();
     struct PktGuard(*mut ff::AVPacket);
@@ -121,7 +162,7 @@ unsafe fn remux_inner(segments: &[(PathBuf, f64)], clip_start: f64, clip_end: f6
         }
     }
     let _pg = PktGuard(pkt);
-    let span = clip_end - clip_start;
+    let span = (end_pts - origin_pts) as f64 * vtb.num as f64 / vtb.den as f64;
     for (path, _) in segments {
         let ic = match open_input(path) {
             Ok(ic) => ic,
@@ -136,9 +177,6 @@ unsafe fn remux_inner(segments: &[(PathBuf, f64)], clip_start: f64, clip_end: f6
             if (*pkt).pts == ff::AV_NOPTS_VALUE {
                 ff::av_packet_unref(pkt);
                 continue;
-            }
-            if origin.is_none() && si == video_idx {
-                origin = Some((*pkt).pts);
             }
             let Some(o) = origin else {
                 ff::av_packet_unref(pkt);
@@ -167,11 +205,21 @@ unsafe fn remux_inner(segments: &[(PathBuf, f64)], clip_start: f64, clip_end: f6
             check(ff::av_interleaved_write_frame(oc.0, pkt), "write clip")?;
         }
     }
-    if origin.is_none() {
-        return Err("Buffer contained no video frames".into());
-    }
+    origin.take();
     check(ff::av_write_trailer(oc.0), "finish clip")?;
-    Ok(())
+    Ok(actual_start)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cut_is_the_last_keyframe_not_after_the_request() {
+        let keys = [1000, 91000, 181000];
+        assert_eq!(super::pick_origin(&keys, 100000), Some(91000));
+        assert_eq!(super::pick_origin(&keys, 91000), Some(91000));
+        assert_eq!(super::pick_origin(&keys, 500), Some(1000));
+        assert_eq!(super::pick_origin(&[], 5), None);
+    }
 }
 
 /// Independent re-open of the written file: stream layout, labels, duration, and that the

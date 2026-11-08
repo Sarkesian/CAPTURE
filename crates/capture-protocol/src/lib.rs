@@ -40,6 +40,12 @@ pub enum Command {
     AddMarker { #[serde(default)] label: Option<String> },
     RenameMarker { id: u64, label: String },
     RemoveMarker { id: u64 },
+    /// Make the buffered footage playable for the review timeline (stream copy into a
+    /// temporary MP4). Footage used by the review is protected until released.
+    PrepareReview,
+    ReleaseReview,
+    /// Save a clip of an exact timeline range (seconds), e.g. from the review timeline.
+    SaveRange { start: f64, end: f64 },
     ListTargets,
     GetState,
     /// Delete leftover temporary buffer footage that is not part of the running session.
@@ -61,6 +67,18 @@ pub enum Event {
     /// A global hotkey whose action belongs to the UI (e.g. opening the overlay).
     HotkeyPressed { action: HotkeyAction },
     MarkerAdded(Marker),
+    ReviewReady(Review),
+    ReviewFailed { message: String },
+}
+
+/// A playable snapshot of the buffer. `start`/`end` are session-timeline seconds of its first
+/// and last frame (marker `t` values map to `t - start` in the file).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Review {
+    pub path: String,
+    pub start: f64,
+    pub end: f64,
+    pub game: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
