@@ -14,6 +14,7 @@ pub mod overlay;
 pub mod pipeline;
 pub mod ring;
 pub mod save;
+pub mod shot;
 pub mod sound;
 pub mod stems;
 pub mod storage;
@@ -176,6 +177,7 @@ impl Engine {
                     });
                 });
             }
+            Command::Screenshot => self.screenshot(re),
             Command::ExportStems { path } => {
                 let emit = self.emit.clone();
                 std::thread::spawn(move || {
@@ -372,6 +374,24 @@ impl Engine {
         );
         if let Some(secs) = requested {
             self.send(re, Event::SaveStarted { save_id: id, requested_secs: secs });
+        }
+    }
+
+    fn screenshot(&mut self, re: Option<u64>) {
+        let Some(p) = self.pipeline.as_ref().filter(|p| !p.target_gone()) else {
+            self.send(re, Event::Error { message: "Nothing is being captured right now, so there is nothing to screenshot.".into() });
+            return;
+        };
+        match shot::save(&p.gpu, &p.capture, &p.shared.root, &p.shared.game_name) {
+            Ok(path) => {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                self.notice(Kind::Saved, "Screenshot saved".into(), name);
+                self.send(re, Event::ScreenshotSaved { path: path.to_string_lossy().into_owned() });
+            }
+            Err(e) => {
+                self.notice(Kind::Failed, "Screenshot not saved".into(), e.clone());
+                self.send(re, Event::Error { message: format!("Screenshot not saved: {e}") });
+            }
         }
     }
 
@@ -649,14 +669,14 @@ impl Engine {
     }
 }
 
-/// Hotkey bindings handled by the worker. The screenshot key is added when that feature
-/// exists, so no key is ever registered for an action that does nothing.
+/// Hotkey bindings handled by the worker (every action has a working implementation).
 pub fn bindings(cfg: &EngineConfig) -> hotkey::Bindings {
     vec![
         (HotkeyAction::SaveReplay, cfg.save_hotkey.clone()),
         (HotkeyAction::AddMarker, cfg.hotkeys.marker.clone()),
         (HotkeyAction::ToggleOverlay, cfg.hotkeys.overlay.clone()),
         (HotkeyAction::ToggleSession, cfg.hotkeys.session.clone()),
+        (HotkeyAction::Screenshot, cfg.hotkeys.screenshot.clone()),
     ]
 }
 

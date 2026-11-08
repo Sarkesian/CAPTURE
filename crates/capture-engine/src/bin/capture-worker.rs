@@ -61,6 +61,7 @@ fn main() {
                 HotkeyAction::SaveReplay => Some(Command::SaveReplay),
                 HotkeyAction::AddMarker => Some(Command::AddMarker { label: None }),
                 HotkeyAction::ToggleSession => Some(Command::StartSession), // engine toggles
+                HotkeyAction::Screenshot => Some(Command::Screenshot),
                 _ => None,
             };
             match cmd {

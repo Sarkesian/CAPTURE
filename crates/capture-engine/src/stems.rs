@@ -28,7 +28,6 @@ struct Out {
     dec: *mut ff::AVCodecContext,
     swr: *mut ff::SwrContext,
     in_index: usize,
-    in_tb: ff::AVRational,
     /// Samples written so far (output timeline, 48 kHz).
     written: i64,
     lead: i64,
@@ -118,7 +117,7 @@ unsafe fn export_inner(clip: &Path, folder: &Path) -> Result<StemResult, String>
         let start = if (*st).start_time == ff::AV_NOPTS_VALUE { 0 } else { (*st).start_time };
         let lead = ff::av_rescale_q(start, (*st).time_base, ff::AVRational { num: 1, den: 48_000 }).max(0);
         manifest_tracks.push(serde_json::json!({ "file": file_name_for(&label), "track": label, "stream_index": i }));
-        outs.push(Out { oc, enc, dec, swr, in_index: i, in_tb: (*st).time_base, written: 0, lead, path });
+        outs.push(Out { oc, enc, dec, swr, in_index: i, written: 0, lead, path });
     }
     if outs.is_empty() {
         return Err("This clip has no separate audio tracks to export.".into());

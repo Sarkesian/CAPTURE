@@ -230,7 +230,7 @@ pub struct Pipeline {
     stop: Arc<AtomicBool>,
     video_thread: Option<std::thread::JoinHandle<()>>,
     mux_thread: Option<std::thread::JoinHandle<()>>,
-    _gpu: Arc<Gpu>,
+    pub(crate) gpu: Arc<Gpu>,
 }
 
 impl Pipeline {
@@ -323,7 +323,7 @@ impl Pipeline {
             stop,
             video_thread: Some(video_thread),
             mux_thread: Some(mux_thread),
-            _gpu: gpu,
+            gpu,
         })
     }
 
