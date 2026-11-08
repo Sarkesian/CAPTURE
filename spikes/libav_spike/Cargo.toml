@@ -1,0 +1,9 @@
+[package]
+name = "libav_spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Phase 0 spike: in-process LGPL libav encode of D3D11 GPU textures with a probed encoder list, muxed to MP4"
+
+[dependencies]
+ffmpeg-sys-next = "9.0.1"

@@ -1,0 +1,22 @@
+[package]
+name = "audio_spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Phase 0 spike: WASAPI mic, endpoint loopback and per-process loopback capture on one QPC timeline"
+
+[dependencies]
+hound = "3.5.1"
+windows-core = "0.62"
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Media_Audio",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Threading",
+  "Win32_Security",
+  "Win32_System_Performance",
+  "Win32_System_Variant",
+  "Win32_Devices_FunctionDiscovery",
+  "Win32_UI_Shell_PropertiesSystem",
+] }
