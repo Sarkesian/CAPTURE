@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use capture_protocol::{AudioConfig, CaptureTarget, EngineConfig, Hotkeys, MarkerConfig, Quality, Volumes};
+use capture_protocol::{AudioConfig, CaptureTarget, EngineConfig, GameRule, Hotkeys, MarkerConfig, Quality, Volumes};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -52,6 +52,12 @@ pub struct AppSettings {
     pub voice_app: Option<String>,
     pub other_enabled: bool,
     pub volumes: Volumes,
+    /// Per-game overrides by exe name.
+    pub per_game: Vec<GameRule>,
+    /// The welcome card has been dismissed.
+    pub first_run_done: bool,
+    /// Start CAPTURE (in the tray) when you sign in to Windows.
+    pub start_with_windows: bool,
 }
 
 impl Default for AppSettings {
@@ -82,6 +88,9 @@ impl Default for AppSettings {
             voice_app: None,
             other_enabled: false,
             volumes: Volumes::default(),
+            per_game: vec![],
+            first_run_done: false,
+            start_with_windows: false,
         }
     }
 }
@@ -123,6 +132,7 @@ impl AppSettings {
             overlay: self.notify_on_save,
             hotkeys: self.hotkeys.clone(),
             markers: self.markers.clone(),
+            per_game: self.per_game.clone(),
             buffer_cap_bytes: (self.buffer_cap_gb.max(1.0) * 1e9) as u64,
             min_free_bytes: (self.min_free_gb.max(1.0) * 1e9) as u64,
         }
@@ -152,6 +162,10 @@ impl AppSettings {
         };
         dedup(&mut self.games);
         dedup(&mut self.ignored);
+        self.per_game.retain(|r| !r.exe.trim().is_empty() && (r.replay_secs.is_some() || r.quality.is_some() || r.game_audio.is_some()));
+        for r in &mut self.per_game {
+            r.replay_secs = r.replay_secs.map(|s| s.clamp(10, 3600));
+        }
         self
     }
 }

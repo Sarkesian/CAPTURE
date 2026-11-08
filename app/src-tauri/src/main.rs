@@ -92,6 +92,39 @@ fn allow_media(app: &AppHandle, root: &str) {
 
 /// Any engine command from either window; the answer arrives as an `engine` event whose
 /// `re` equals the returned id.
+/// Start with Windows: a per-user Run entry that starts CAPTURE in the tray. Removing it
+/// leaves nothing behind.
+#[tauri::command]
+fn set_start_with_windows(app: AppHandle, state: State<AppState>, enabled: bool) -> Result<(), String> {
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::System::Registry::*;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let value = format!("\"{}\" --tray", exe.display());
+    unsafe {
+        let mut key = HKEY::default();
+        RegCreateKeyExW(HKEY_CURRENT_USER, w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run"), None, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, None, &mut key, None)
+            .ok()
+            .map_err(|e| format!("Could not change startup setting: {e}"))?;
+        let r = if enabled {
+            let wide: Vec<u16> = value.encode_utf16().chain(Some(0)).collect();
+            RegSetValueExW(key, w!("CAPTURE"), None, REG_SZ, Some(std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2)))
+        } else {
+            let r = RegDeleteValueW(key, w!("CAPTURE"));
+            if r == windows::Win32::Foundation::ERROR_FILE_NOT_FOUND { windows::Win32::Foundation::ERROR_SUCCESS } else { r }
+        };
+        let _ = RegCloseKey(key);
+        r.ok().map_err(|e| format!("Could not change startup setting: {e}"))?;
+    }
+    let s = {
+        let mut g = state.settings.lock().unwrap();
+        g.start_with_windows = enabled;
+        g.clone()
+    };
+    persist(&state, &s)?;
+    let _ = app.emit("settings", &s);
+    Ok(())
+}
+
 #[tauri::command]
 fn engine_command(state: State<AppState>, command: Command) -> Result<u64, String> {
     if matches!(command, Command::Configure(_) | Command::Shutdown) {
@@ -128,8 +161,8 @@ fn delete_clip(state: State<AppState>, path: String) -> Result<(), String> {
     use windows::core::PCWSTR;
     use windows::Win32::UI::Shell::*;
     let p = inside_root(&state, &path)?;
-    if !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp4")) {
-        return Err("Only video files can be deleted from here.".into());
+    if !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp4") || e.eq_ignore_ascii_case("png")) {
+        return Err("Only clips, sessions and screenshots can be deleted from here.".into());
     }
     let mut from: Vec<u16> = p.as_os_str().to_string_lossy().encode_utf16().collect();
     from.extend([0, 0]);
@@ -205,9 +238,15 @@ fn clear_temp_cache(state: State<AppState>) -> Result<u64, String> {
 }
 
 #[tauri::command]
-fn list_clips(state: State<AppState>) -> Vec<library::ClipEntry> {
+fn list_clips(state: State<AppState>, kind: Option<String>) -> Vec<library::ClipEntry> {
     let root = PathBuf::from(&state.settings.lock().unwrap().capture_root);
-    library::list_clips(&root, 500)
+    library::list(&root, kind.as_deref().unwrap_or("clips"), 1000)
+}
+
+#[tauri::command]
+fn rename_clip(state: State<AppState>, path: String, name: String) -> Result<String, String> {
+    let p = inside_root(&state, &path)?;
+    library::rename(&p, &name).map(|t| t.to_string_lossy().into_owned())
 }
 
 /// Only paths inside the capture folder may be opened from the UI.
@@ -412,11 +451,16 @@ fn main() {
             toggle_overlay,
             hide_overlay,
             show_main,
-            delete_clip
+            delete_clip,
+            rename_clip,
+            set_start_with_windows
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
+            // Started from Windows sign-in: stay in the tray until opened.
+            let start_hidden = std::env::args().any(|a| a == "--tray");
             let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+                .visible(!start_hidden)
                 .title("CAPTURE")
                 .inner_size(1000.0, 760.0)
                 .min_inner_size(760.0, 600.0)

@@ -35,7 +35,12 @@ export interface Settings {
   voice_app: string | null;
   other_enabled: boolean;
   volumes: { game: number; mic: number; voice: number };
+  per_game: GameRule[];
+  first_run_done: boolean;
+  start_with_windows: boolean;
 }
+
+export interface GameRule { exe: string; replay_secs: number | null; quality: Quality | null; game_audio: boolean | null }
 
 export interface AudioDevice { id: string; name: string; is_default: boolean; is_virtual: boolean }
 export interface AudioApp { exe: string; name: string }
@@ -87,7 +92,7 @@ export interface SavedClip {
 
 export interface Review { path: string; start: number; end: number; game: string }
 
-export interface ClipEntry { path: string; name: string; game: string; bytes: number; modified_ms: number }
+export interface ClipEntry { path: string; name: string; game: string; bytes: number; modified_ms: number; kind: 'clip' | 'session' | 'screenshot'; has_stems: boolean; has_markers: boolean }
 
 export type EngineMessage = { v: number; re?: number } & (
   | { event: 'hello'; data: { worker_version: string } }
@@ -103,5 +108,8 @@ export type EngineMessage = { v: number; re?: number } & (
   | { event: 'review_failed'; data: { message: string } }
   | { event: 'clip_info'; data: { path: string; thumb: string | null; duration_secs: number | null; error: string | null } }
   | { event: 'audio_devices'; data: { inputs: AudioDevice[]; outputs: AudioDevice[]; apps: AudioApp[] } }
+  | { event: 'stems_done'; data: { path: string; folder: string | null; files: string[]; error: string | null } }
+  | { event: 'screenshot_saved'; data: { path: string } }
+  | { event: 'recovered'; data: { clips: string[]; failed: string[] } }
   | { event: 'mic_test'; data: { phase: 'recording' | 'playing' | 'done' | 'failed'; peak: number; message: string | null } }
 );

@@ -3,8 +3,26 @@
   import Toggle from '../components/Toggle.svelte';
   import Segmented from '../components/Segmented.svelte';
   import HotkeyField from '../components/HotkeyField.svelte';
-  import { app, updateSettings, clearTempCache, openCaptureFolder, fmtBytes } from '../lib/store.svelte';
-  import type { Quality } from '../lib/types';
+  import { invoke } from '@tauri-apps/api/core';
+  import { app, updateSettings, clearTempCache, openCaptureFolder, fmtBytes, fmtDuration, engine, toast } from '../lib/store.svelte';
+  import type { GameRule, Quality } from '../lib/types';
+
+  // Games that can have their own settings: your games list, existing rules, and the current game.
+  const ruleGames = $derived.by(() => {
+    const set = new Map<string, string>();
+    for (const g of s.games) set.set(g.toLowerCase(), g);
+    for (const r of s.per_game) set.set(r.exe.toLowerCase(), r.exe);
+    if (e?.target_exe) set.set(e.target_exe.toLowerCase(), e.target_exe);
+    return [...set.values()].sort((a, b) => a.localeCompare(b));
+  });
+  const ruleFor = (exe: string): GameRule => s.per_game.find(r => r.exe.toLowerCase() === exe.toLowerCase()) ?? { exe, replay_secs: null, quality: null, game_audio: null };
+  function setRule(exe: string, patch: Partial<GameRule>) {
+    const next = { ...ruleFor(exe), ...patch };
+    updateSettings({ per_game: [...s.per_game.filter(r => r.exe.toLowerCase() !== exe.toLowerCase()), next] });
+  }
+  async function startup(v: boolean) {
+    try { await invoke('set_start_with_windows', { enabled: v }); } catch (err) { toast(String(err), 'error'); }
+  }
 
   const s = $derived(app.settings!);
   const e = $derived(app.engine);
@@ -28,11 +46,11 @@
       {e.hotkey.registered ? `✓ ${e.hotkey.combo} is active.` : e.hotkey.message}
     </p>
   {/if}
-  {#each [['add_marker', 'Add marker', 'Bookmarks the moment without saving a clip.', 'marker'], ['toggle_overlay', 'Open overlay', 'Shows CAPTURE on top of your game.', 'overlay'], ['toggle_session', 'Start/stop recording', 'Records a full session of any length (optional).', 'session']] as [action, title, hint, key] (action)}
+  {#each [['add_marker', 'Add marker', 'Bookmarks the moment without saving a clip.', 'marker'], ['toggle_overlay', 'Open overlay', 'Shows CAPTURE on top of your game.', 'overlay'], ['toggle_session', 'Start/stop recording', 'Records a full session of any length (optional).', 'session'], ['screenshot', 'Screenshot', 'Saves the game picture as PNG in Screenshots.', 'screenshot']] as [action, title, hint, key] (action)}
     {@const hs = e?.hotkeys.find(h => h.action === action)}
     <div class="field">
       <div class="grow"><div>{title}</div><div class="muted small">{hint}</div></div>
-      <HotkeyField value={s.hotkeys[key as 'marker' | 'overlay' | 'session']} onchange={v => updateSettings({ hotkeys: { ...s.hotkeys, [key]: v } })} />
+      <HotkeyField value={s.hotkeys[key as 'marker' | 'overlay' | 'session' | 'screenshot']} onchange={v => updateSettings({ hotkeys: { ...s.hotkeys, [key]: v } })} />
     </div>
     {#if hs && hs.combo && !hs.registered && hs.message}<p class="small warn">{hs.message}</p>{/if}
   {/each}
@@ -81,6 +99,27 @@
       {:else}<span class="muted small">None. Add one from “Missed a game?” on the Capture tab.</span>{/each}
     </div>
   </div>
+  {#if ruleGames.length}
+    <div class="field col">
+      <div><div>Per-game settings</div><div class="muted small">Leave on “Default” to use your normal settings.</div></div>
+      {#each ruleGames as g (g)}
+        {@const r = ruleFor(g)}
+        <div class="rule">
+          <span class="grow ellipsis">{g}</span>
+          <select aria-label="{g} replay length" value={r.replay_secs == null ? '' : String(r.replay_secs)} onchange={ev => { const v = (ev.target as HTMLSelectElement).value; setRule(g, { replay_secs: v ? Number(v) : null }); }}>
+            <option value="">Length: default</option>
+            {#each [30, 60, 120, 300, 600, 1200] as d (d)}<option value={String(d)}>{fmtDuration(d)}</option>{/each}
+          </select>
+          <select aria-label="{g} quality" value={r.quality ?? ''} onchange={ev => { const v = (ev.target as HTMLSelectElement).value; setRule(g, { quality: (v || null) as Quality | null }); }}>
+            <option value="">Quality: default</option><option value="balanced">Balanced</option><option value="high">High</option><option value="maximum">Maximum</option>
+          </select>
+          <select aria-label="{g} game sound" value={r.game_audio == null ? '' : String(r.game_audio)} onchange={ev => { const v = (ev.target as HTMLSelectElement).value; setRule(g, { game_audio: v === '' ? null : v === 'true' }); }}>
+            <option value="">Sound: default</option><option value="true">Record sound</option><option value="false">No sound</option>
+          </select>
+        </div>
+      {/each}
+    </div>
+  {/if}
   <div class="field">
     <div class="grow">Never record</div>
     <div class="chips">
@@ -123,7 +162,12 @@
       <div class="muted small">From earlier sessions that did not close normally. Saved clips are never touched.</div>
     </div>
     <span class="muted">{fmtBytes(e?.leftover_buffer_bytes ?? 0)}</span>
-    <button disabled={!e || e.leftover_buffer_bytes === 0} onclick={clearTempCache}>Delete temporary footage</button>
+    <button disabled={!e || e.leftover_buffer_bytes === 0} onclick={() => engine('recover_leftovers')}>Save as clip</button>
+    <button disabled={!e || e.leftover_buffer_bytes === 0} onclick={clearTempCache}>Delete</button>
+  </div>
+  <div class="field">
+    <div class="grow"><div>Start CAPTURE when I sign in to Windows</div><div class="muted small">Starts in the tray, ready to record.</div></div>
+    <Toggle checked={s.start_with_windows} label="Start with Windows" onchange={startup} />
   </div>
   <div class="field">
     <div class="grow"><div>Keep running in the tray when the window is closed</div><div class="muted small">Off: closing the window stops recording and quits.</div></div>
@@ -164,6 +208,9 @@
   dl { display: grid; grid-template-columns: 240px 1fr; gap: 6px 16px; margin: 12px 0 0; }
   dt { color: var(--muted); }
   dd { margin: 0; }
+  .col { flex-direction: column; align-items: stretch; }
+  .rule { display: flex; gap: 8px; align-items: center; }
+  .rule select { font-size: 13px; padding: 4px 8px; }
   .chips { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
   .chip { background: var(--panel-2); border: 1px solid var(--line); border-radius: 999px; padding: 2px 4px 2px 10px; font-size: 13px; }
   .chip .link { padding: 0 6px; }

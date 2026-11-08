@@ -22,6 +22,9 @@ export const app = $state({
   inputs: [] as AudioDevice[],
   apps: [] as AudioApp[],
   micTest: null as { phase: string; peak: number; message: string | null } | null,
+  /** Bumped whenever files in the capture folder change (saves, stems, screenshots). */
+  libraryVersion: 0,
+  stemsBusy: {} as Record<string, boolean>,
 });
 
 let toastId = 0;
@@ -72,6 +75,7 @@ function onEngine(m: EngineMessage) {
       break;
     case 'save_finished':
       app.lastClip = m.data;
+      app.libraryVersion++;
       toast(
         m.data.duration_secs + 1 < m.data.requested_secs
           ? `Saved ${fmtDuration(m.data.duration_secs)} — only that much was buffered (you asked for ${fmtDuration(m.data.requested_secs)})`
@@ -101,6 +105,21 @@ function onEngine(m: EngineMessage) {
     case 'audio_devices':
       app.inputs = m.data.inputs;
       app.apps = m.data.apps;
+      break;
+    case 'stems_done':
+      app.stemsBusy[m.data.path] = false;
+      if (m.data.error) toast(`Editor audio files not made: ${m.data.error}`, 'error', 8000);
+      else toast(`Editor audio files saved (${m.data.files.length} WAV) next to the clip`, 'ok');
+      app.libraryVersion++;
+      break;
+    case 'recovered':
+      if (m.data.clips.length) toast(`Recovered ${m.data.clips.length} clip${m.data.clips.length > 1 ? 's' : ''} into your Clips folder`, 'ok', 6000);
+      if (m.data.failed.length) toast(`Some footage could not be recovered: ${m.data.failed.join('; ')}`, 'error', 10000);
+      app.libraryVersion++;
+      break;
+    case 'screenshot_saved':
+      toast('Screenshot saved', 'ok', 2500);
+      app.libraryVersion++;
       break;
     case 'mic_test':
       app.micTest = m.data;

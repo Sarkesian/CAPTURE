@@ -231,6 +231,24 @@ impl Engine {
                 self.send(re, Event::Targets { windows, displays });
             }
             Command::GetState => {}
+            Command::RecoverLeftovers => {
+                let Some(root) = self.cfg.as_ref().map(|c| PathBuf::from(&c.capture_root)) else { return true };
+                let dirs = self.leftover_dirs(&root);
+                let emit = self.emit.clone();
+                std::thread::spawn(move || {
+                    let (mut clips, mut failed) = (vec![], vec![]);
+                    for d in dirs {
+                        match recover_session(&root, &d) {
+                            Ok(p) => {
+                                let _ = std::fs::remove_dir_all(&d);
+                                clips.push(p.to_string_lossy().into_owned());
+                            }
+                            Err(e) => failed.push(format!("{}: {e}", d.display())),
+                        }
+                    }
+                    emit(Message::new(re, Event::Recovered { clips, failed }));
+                });
+            }
             Command::ClearTempCache => {
                 let freed = self.clear_leftovers();
                 self.send(re, Event::Error { message: format!("Deleted {:.1} GB of temporary footage.", freed as f64 / 1e9) });
@@ -256,6 +274,10 @@ impl Engine {
                     || old.capture_cursor != cfg.capture_cursor
                     || !old.audio.same_sources(&cfg.audio)
                     || old.capture_root != cfg.capture_root
+                    || self.pipeline.as_ref().is_some_and(|p| {
+                        let (a, b) = (old.for_game(&p.shared.target_exe), cfg.for_game(&p.shared.target_exe));
+                        a.quality != b.quality || a.audio.game_audio != b.audio.game_audio
+                    })
             }
             None => true,
         };
@@ -272,9 +294,14 @@ impl Engine {
         };
         self.cfg = Some(cfg);
         if let Some(p) = &self.pipeline {
-            p.set_live(live);
-            if let (Some(a), Some(c)) = (&p.audio, &self.cfg) {
-                a.set_mix(mix_of(c));
+            let game_cfg = self.cfg.as_ref().map(|c| c.for_game(&p.shared.target_exe));
+            if let Some(c) = &game_cfg {
+                p.set_live(live_of(c));
+                if let Some(a) = &p.audio {
+                    a.set_mix(mix_of(c));
+                }
+            } else {
+                p.set_live(live);
             }
         }
         if !self.replay_on {
@@ -307,6 +334,7 @@ impl Engine {
     }
 
     fn launch(&mut self, cfg: &EngineConfig, s: Settings) {
+        let cfg = &cfg.for_game(&s.exe);
         self.stop_session(None);
         self.pipeline = None;
         let (name, display) = (s.game_name.clone(), matches!(s.source, SourceKind::Monitor(_)));
@@ -680,6 +708,33 @@ pub fn bindings(cfg: &EngineConfig) -> hotkey::Bindings {
     ]
 }
 
+/// Save a leftover session folder (crash / power loss) as `Clips\<Game>\..._Recovered.mp4`.
+/// Damaged segments are skipped; the folder is only deleted by the caller after success.
+fn recover_session(root: &Path, dir: &Path) -> Result<PathBuf, String> {
+    let manifest: serde_json::Value = std::fs::read(dir.join("session.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(serde_json::json!({}));
+    let game = manifest["game"].as_str().unwrap_or("Recovered").to_string();
+    let tracks: Vec<String> = manifest["audio_tracks"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+    let mut segs: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "ts") && std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false))
+        .collect();
+    segs.sort();
+    if segs.is_empty() {
+        return Err("no footage".into());
+    }
+    let list: Vec<(PathBuf, f64)> = segs.into_iter().map(|p| (p, 0.0)).collect();
+    let out_dir = storage::clips_dir(root, &game);
+    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+    let name = storage::clip_file_name(&storage::local_stamp(), &game, "Recovered");
+    let path = storage::reserve_unique_path(&out_dir, &name).map_err(|e| e.to_string())?;
+    save::remux(&list, 0.0, 0.0, 1e9, &tracks, &path).map(|(c, _)| c.path)
+}
+
 fn live_of(cfg: &EngineConfig) -> Live {
     Live { replay_secs: cfg.replay_secs.clamp(5, 3600), cap_bytes: cfg.buffer_cap_bytes, min_free_bytes: cfg.min_free_bytes }
 }
@@ -724,6 +779,7 @@ pub fn mix_of(cfg: &EngineConfig) -> MixParams {
 }
 
 fn settings_for_window(cfg: &EngineConfig, w: &WindowTarget, detected_by: Option<&str>) -> Result<Settings, Unresolved> {
+    let cfg = &cfg.for_game(&w.exe);
     let root = base_settings(cfg)?;
     let audio = audio_sources(cfg, Some((w.pid, &w.exe)));
     Ok(Settings {

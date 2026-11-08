@@ -65,6 +65,8 @@ pub enum Command {
     GetState,
     /// Delete leftover temporary buffer footage that is not part of the running session.
     ClearTempCache,
+    /// Save leftover buffer footage (from a crash or power loss) as clips, then remove it.
+    RecoverLeftovers,
     Shutdown,
 }
 
@@ -88,6 +90,8 @@ pub enum Event {
     AudioDevices { inputs: Vec<AudioDevice>, outputs: Vec<AudioDevice>, apps: Vec<AudioApp> },
     StemsDone { path: String, folder: Option<String>, files: Vec<String>, error: Option<String> },
     ScreenshotSaved { path: String },
+    /// Result of RecoverLeftovers: saved clip paths and any folders that could not be recovered.
+    Recovered { clips: Vec<String>, failed: Vec<String> },
     /// Mic test progress: phase "recording" | "playing" | "done" | "failed".
     MicTest { phase: String, peak: f32, message: Option<String> },
 }
@@ -127,6 +131,34 @@ impl Default for Hotkeys {
     fn default() -> Self {
         // Avoids NVIDIA's overlay defaults (Alt+Z, Alt+F9).
         Self { marker: "Alt+F8".into(), overlay: "Alt+F11".into(), session: String::new(), screenshot: "Alt+F12".into() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct GameRule {
+    pub exe: String,
+    pub replay_secs: Option<u32>,
+    pub quality: Option<Quality>,
+    pub game_audio: Option<bool>,
+}
+
+impl EngineConfig {
+    /// This configuration with the rule for `exe` (if any) applied.
+    pub fn for_game(&self, exe: &str) -> EngineConfig {
+        let mut c = self.clone();
+        if let Some(r) = self.per_game.iter().find(|r| r.exe.eq_ignore_ascii_case(exe)) {
+            if let Some(s) = r.replay_secs {
+                c.replay_secs = s;
+            }
+            if let Some(q) = r.quality {
+                c.quality = q;
+            }
+            if let Some(a) = r.game_audio {
+                c.audio.game_audio = a;
+            }
+        }
+        c
     }
 }
 
@@ -191,6 +223,9 @@ pub struct EngineConfig {
     pub hotkeys: Hotkeys,
     #[serde(default)]
     pub markers: MarkerConfig,
+    /// Per-game overrides (matched by executable name); unset fields use the defaults above.
+    #[serde(default)]
+    pub per_game: Vec<GameRule>,
     /// Show a small on-screen notice (excluded from recordings) when recording starts and
     /// when a clip is saved or fails.
     #[serde(default = "yes")]
@@ -471,7 +506,13 @@ mod tests {
 
     #[test]
     fn request_roundtrip_is_tagged_and_versioned() {
-        let r = Request::new(7, Command::SetReplay { enabled: true });
+        let cfg: EngineConfig = serde_json::from_str(r#"{"capture_root":"x","replay_secs":60,"target":{"kind":"none"},"quality":"high","fps":60,"capture_cursor":true,
+        "audio":{"game_audio":true},"save_hotkey":"","buffer_cap_bytes":1,"min_free_bytes":1,
+        "per_game":[{"exe":"Game.exe","replay_secs":300,"quality":"maximum"}]}"#).unwrap();
+    assert_eq!(cfg.for_game("game.EXE").replay_secs, 300);
+    assert_eq!(cfg.for_game("game.exe").quality, Quality::Maximum);
+    assert_eq!(cfg.for_game("other.exe").replay_secs, 60);
+    let r = Request::new(7, Command::SetReplay { enabled: true });
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(s, r#"{"v":1,"id":7,"cmd":"set_replay","args":{"enabled":true}}"#);
         assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), r);

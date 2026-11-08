@@ -8,7 +8,7 @@
   import AudioSources from '../components/AudioSources.svelte';
   import {
     app, setReplay, saveReplay, updateSettings, refreshTargets, openPath, revealPath, copyPath,
-    openCaptureFolder, fmtDuration, fmtBytes,
+    openCaptureFolder, fmtDuration, fmtBytes, engine, clearTempCache,
   } from '../lib/store.svelte';
   import type { Quality } from '../lib/types';
 
@@ -16,6 +16,13 @@
   const e = $derived(app.engine);
 
   const durations = [30, 60, 120, 180, 300, 600, 900, 1200];
+  let custom = $state(false);
+  const isPreset = $derived(durations.includes(s.replay_secs));
+  function pickDuration(v: string) {
+    if (v === 'custom') { custom = true; return; }
+    custom = false;
+    updateSettings({ replay_secs: Number(v) });
+  }
 
   const view = $derived.by(() => {
     if (app.engineDown) return { label: 'Needs attention', tone: 'warn', detail: app.engineDown };
@@ -75,6 +82,30 @@
   }
 </script>
 
+{#if !s.first_run_done}
+  <section class="card welcome">
+    <h2>Welcome to CAPTURE</h2>
+    <ol>
+      <li>Clips are saved to <span class="mono">{s.capture_root}</span> <button class="link" onclick={changeFolder}>Change…</button></li>
+      <li>Turn on <b>Instant replay</b> below. CAPTURE finds your games by itself.</li>
+      <li>While playing: <kbd>{s.save_hotkey || '—'}</kbd> saves the last {fmtDuration(s.replay_secs)}, <kbd>{s.hotkeys.marker || '—'}</kbd> adds a marker, <kbd>{s.hotkeys.overlay || '—'}</kbd> opens the overlay.</li>
+    </ol>
+    <p class="muted small">Your microphone stays off unless you turn it on under Audio. Nothing is uploaded anywhere.</p>
+    <button class="primary" onclick={() => updateSettings({ first_run_done: true })}>Got it</button>
+  </section>
+{/if}
+
+{#if (e?.leftover_buffer_bytes ?? 0) > 0}
+  <section class="card recover row">
+    <div class="grow">
+      <div><b>Footage from a session that didn’t close normally</b> ({fmtBytes(e!.leftover_buffer_bytes)})</div>
+      <div class="muted small">CAPTURE or Windows stopped unexpectedly. You can keep it as a clip or delete it.</div>
+    </div>
+    <button class="primary" onclick={() => engine('recover_leftovers')}>Save as clip</button>
+    <button onclick={clearTempCache}>Delete it</button>
+  </section>
+{/if}
+
 <section class="status card tone-{view.tone}" aria-live="polite">
   <div class="row">
     <span class="pill">{view.label}</span>
@@ -99,9 +130,16 @@
     </div>
     <label class="row small">
       <span class="muted">Save last</span>
-      <select value={s.replay_secs} onchange={ev => updateSettings({ replay_secs: Number((ev.target as HTMLSelectElement).value) })}>
-        {#each durations as d (d)}<option value={d}>{fmtDuration(d)}</option>{/each}
+      <select value={custom ? 'custom' : String(s.replay_secs)} onchange={ev => pickDuration((ev.target as HTMLSelectElement).value)}>
+        {#each durations as d (d)}<option value={String(d)}>{fmtDuration(d)}</option>{/each}
+        {#if !isPreset}<option value={String(s.replay_secs)}>{fmtDuration(s.replay_secs)}</option>{/if}
+        <option value="custom">Custom…</option>
       </select>
+      {#if custom}
+        <input type="number" min="0.5" max="60" step="0.5" aria-label="Minutes" placeholder="min" style="width:80px"
+          onchange={ev => { const m = Number((ev.target as HTMLInputElement).value); if (m > 0) { updateSettings({ replay_secs: Math.round(m * 60) }); custom = false; } }} />
+        <span class="muted small">minutes</span>
+      {/if}
     </label>
   </div>
   <div class="row save-row">
@@ -225,6 +263,9 @@
   kbd { font-family: "Cascadia Mono", Consolas, monospace; background: var(--panel-2); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; }
   .warn { color: var(--warn); }
   .audio { grid-column: 1 / -1; }
+  .welcome { margin-bottom: 14px; border-color: #3b4252; }
+  .welcome ol { margin: 4px 0 8px; padding-left: 20px; line-height: 1.9; }
+  .recover { margin-bottom: 14px; border-color: #5c4a1c; gap: 10px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
   .grid p { margin: 10px 0 0; }
   .last { margin-top: 14px; }
