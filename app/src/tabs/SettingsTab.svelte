@@ -39,6 +39,25 @@
 </section>
 
 <section class="card">
+  <h2>Games</h2>
+  <p class="muted small">Auto mode records games it recognises. These lists override it.</p>
+  <div class="field">
+    <div class="grow">Always treat as a game</div>
+    <div class="chips">
+      {#each s.games as g (g)}<span class="chip">{g} <button class="link" aria-label="Remove {g}" onclick={() => updateSettings({ games: s.games.filter(x => x !== g) })}>✕</button></span>
+      {:else}<span class="muted small">None. Add one from “Missed a game?” on the Capture tab.</span>{/each}
+    </div>
+  </div>
+  <div class="field">
+    <div class="grow">Never record</div>
+    <div class="chips">
+      {#each s.ignored as g (g)}<span class="chip">{g} <button class="link" aria-label="Remove {g}" onclick={() => updateSettings({ ignored: s.ignored.filter(x => x !== g) })}>✕</button></span>
+      {:else}<span class="muted small">None</span>{/each}
+    </div>
+  </div>
+</section>
+
+<section class="card">
   <h2>Video quality</h2>
   <div class="field">
     <div class="grow">Quality preset</div>
@@ -78,8 +97,8 @@
     <Toggle checked={s.close_to_tray} label="Keep running in the tray" onchange={v => updateSettings({ close_to_tray: v })} />
   </div>
   <div class="field">
-    <div class="grow">Show a notification when a clip is saved</div>
-    <Toggle checked={s.notify_on_save} label="Notify on save" onchange={v => updateSettings({ notify_on_save: v })} />
+    <div class="grow"><div>Show a small on-screen notice</div><div class="muted small">When recording starts and when a clip is saved. It never appears in your recordings.</div></div>
+    <Toggle checked={s.notify_on_save} label="Show on-screen notices" onchange={v => updateSettings({ notify_on_save: v })} />
   </div>
 </section>
 
@@ -112,4 +131,7 @@
   dl { display: grid; grid-template-columns: 240px 1fr; gap: 6px 16px; margin: 12px 0 0; }
   dt { color: var(--muted); }
   dd { margin: 0; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
+  .chip { background: var(--panel-2); border: 1px solid var(--line); border-radius: 999px; padding: 2px 4px 2px 10px; font-size: 13px; }
+  .chip .link { padding: 0 6px; }
 </style>

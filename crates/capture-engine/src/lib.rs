@@ -4,9 +4,11 @@
 pub mod audio;
 pub mod av;
 pub mod clock;
+pub mod detect;
 pub mod gpu;
 pub mod hotkey;
 pub mod mux;
+pub mod overlay;
 pub mod pipeline;
 pub mod ring;
 pub mod save;
@@ -23,22 +25,47 @@ use std::time::Instant;
 use capture_protocol::*;
 
 use audio::SourceSpec;
+use overlay::{Kind, Notice, Overlay};
 use pipeline::{Live, Pipeline, Settings, SourceKind};
 
 pub type Emit = Arc<dyn Fn(Message) + Send + Sync>;
+
+/// Why a replay could not start. `waiting` means "nothing to record yet" (not an error).
+#[derive(Debug, Clone)]
+struct Unresolved {
+    waiting: bool,
+    message: String,
+}
+
+fn waiting(m: impl Into<String>) -> Unresolved {
+    Unresolved { waiting: true, message: m.into() }
+}
+fn failed(m: impl Into<String>) -> Unresolved {
+    Unresolved { waiting: false, message: m.into() }
+}
 
 pub struct Engine {
     cfg: Option<EngineConfig>,
     replay_on: bool,
     pipeline: Option<Pipeline>,
-    start_error: Option<String>,
+    start_error: Option<Unresolved>,
     hotkey: Option<hotkey::HotkeyService>,
+    overlay: Option<Arc<Overlay>>,
     emit: Emit,
     next_save_id: u64,
     fps_sample: (Instant, u64),
     capture_fps: f64,
     last_state: Option<EngineState>,
     last_retry: Instant,
+}
+
+pub fn fmt_secs(s: f64) -> String {
+    let s = s.round() as u64;
+    match (s / 60, s % 60) {
+        (0, r) => format!("{r}s"),
+        (m, 0) => format!("{m} min"),
+        (m, r) => format!("{m}m {r:02}s"),
+    }
 }
 
 impl Engine {
@@ -49,6 +76,7 @@ impl Engine {
             pipeline: None,
             start_error: None,
             hotkey: None,
+            overlay: None,
             emit,
             next_save_id: 1,
             fps_sample: (Instant::now(), 0),
@@ -63,8 +91,20 @@ impl Engine {
         self.hotkey = Some(svc);
     }
 
+    pub fn attach_overlay(&mut self, o: Arc<Overlay>) {
+        self.overlay = Some(o);
+    }
+
     fn send(&self, re: Option<u64>, event: Event) {
         (self.emit)(Message::new(re, event));
+    }
+
+    fn notice(&self, kind: Kind, title: String, detail: String) {
+        if self.cfg.as_ref().is_some_and(|c| c.overlay) {
+            if let Some(o) = &self.overlay {
+                o.show(Notice { title, detail, kind });
+            }
+        }
     }
 
     pub fn handle(&mut self, re: Option<u64>, cmd: Command) -> bool {
@@ -114,12 +154,32 @@ impl Engine {
             }
             None => true,
         };
+        // In Auto mode, editing the games/ignore lists must not interrupt a running recording
+        // unless the current game was just ignored.
+        let auto_lists_only = matches!((&self.cfg, &cfg), (Some(old), new)
+            if matches!(old.target, CaptureTarget::Auto { .. }) && matches!(new.target, CaptureTarget::Auto { .. })
+            && old.fps == new.fps && old.quality == new.quality && old.capture_cursor == new.capture_cursor
+            && old.audio == new.audio && old.capture_root == new.capture_root);
         let live = live_of(&cfg);
+        let now_ignored = match (&cfg.target, &self.pipeline) {
+            (CaptureTarget::Auto { ignore, .. }, Some(p)) => ignore.iter().any(|i| i.eq_ignore_ascii_case(&p.shared.target_exe)),
+            _ => false,
+        };
         self.cfg = Some(cfg);
         if let Some(p) = &self.pipeline {
             p.set_live(live);
         }
-        if self.replay_on && (restart || self.pipeline.is_none()) {
+        if !self.replay_on {
+            return;
+        }
+        if auto_lists_only {
+            if now_ignored {
+                self.pipeline = None;
+                self.start_error = Some(waiting("Watching for games."));
+            }
+            self.last_retry = Instant::now() - std::time::Duration::from_secs(10); // re-detect now
+            self.tick();
+        } else if restart || self.pipeline.is_none() {
             self.start_pipeline();
         }
     }
@@ -128,37 +188,68 @@ impl Engine {
         self.pipeline = None; // finalize any previous session first
         self.start_error = None;
         let Some(cfg) = self.cfg.clone() else {
-            self.start_error = Some("Settings have not been loaded yet.".into());
+            self.start_error = Some(failed("Settings have not been loaded yet."));
             return;
         };
-        match resolve(&cfg).and_then(|s| Pipeline::start(s, live_of(&cfg))) {
+        match resolve(&cfg) {
+            Ok(s) => self.launch(&cfg, s),
+            Err(u) => self.start_error = Some(u),
+        }
+    }
+
+    fn launch(&mut self, cfg: &EngineConfig, s: Settings) {
+        self.pipeline = None;
+        let (name, display) = (s.game_name.clone(), matches!(s.source, SourceKind::Monitor(_)));
+        match Pipeline::start(s, live_of(cfg)) {
             Ok(p) => {
+                self.start_error = None;
                 self.fps_sample = (Instant::now(), 0);
                 self.pipeline = Some(p);
+                let hk = if cfg.save_hotkey.is_empty() { "Save clip in CAPTURE".to_string() } else { cfg.save_hotkey.clone() };
+                let title = if display { "Recording your display".to_string() } else { format!("Recording {name}") };
+                self.notice(Kind::Recording, title, format!("{hk} saves the last {}", fmt_secs(live_of(cfg).replay_secs as f64)));
             }
-            Err(e) => self.start_error = Some(e),
+            Err(e) => self.start_error = Some(failed(e)),
         }
     }
 
     fn save(&mut self, re: Option<u64>) {
         let Some(p) = &self.pipeline else {
             let msg = if self.replay_on {
-                "Replay is not recording right now, so there is nothing to save."
+                "Nothing is being recorded right now, so there is nothing to save."
             } else {
                 "Instant replay is off. Turn it on to save clips."
             };
+            self.notice(Kind::Failed, "Clip not saved".into(), msg.into());
             self.send(re, Event::SaveFailed { save_id: 0, message: msg.into() });
             return;
         };
         let id = self.next_save_id;
         self.next_save_id += 1;
         let emit = self.emit.clone();
+        let overlay = self.overlay.clone().filter(|_| self.cfg.as_ref().is_some_and(|c| c.overlay));
+        let game = p.shared.game_name.clone();
         let requested = p.request_save(
             move |r| {
-                let ev = match r {
-                    Ok((clip, _)) => Event::SaveFinished(clip),
-                    Err(message) => Event::SaveFailed { save_id: id, message },
+                let (ev, notice) = match r {
+                    Ok((clip, requested)) => {
+                        let short = clip.duration_secs + 1.0 < requested;
+                        let detail = if short {
+                            format!("{game} · only {} was buffered", fmt_secs(clip.duration_secs))
+                        } else {
+                            game.clone()
+                        };
+                        let n = Notice { kind: Kind::Saved, title: format!("Clip saved · {}", fmt_secs(clip.duration_secs)), detail };
+                        (Event::SaveFinished(clip), n)
+                    }
+                    Err(message) => {
+                        let n = Notice { kind: Kind::Failed, title: "Clip not saved".into(), detail: message.clone() };
+                        (Event::SaveFailed { save_id: id, message }, n)
+                    }
                 };
+                if let Some(o) = overlay {
+                    o.show(notice);
+                }
                 emit(Message::new(None, ev));
             },
             id,
@@ -166,30 +257,46 @@ impl Engine {
         self.send(re, Event::SaveStarted { save_id: id, requested_secs: requested });
     }
 
-    /// Periodic housekeeping: retry a replay that is waiting for its target, and move to a
-    /// relaunched game after the captured window closed (the old session stays saveable until
-    /// the new one starts).
+    /// Periodic housekeeping (every ~0.5 s):
+    /// - Auto mode: follow the foreground game (start on it, switch to a different game).
+    /// - Other modes: retry a target that is not running yet, or was closed and reopened.
+    /// A session whose window closed stays saveable until a new one starts.
     pub fn tick(&mut self) {
-        if !self.replay_on || self.cfg.is_none() {
+        if !self.replay_on {
             return;
         }
-        let closed = self.pipeline.as_ref().is_some_and(|p| p.capture.closed.load(Ordering::Relaxed));
-        let waiting = self.pipeline.is_none();
-        if !(closed || waiting) || self.last_retry.elapsed().as_secs_f64() < 3.0 {
+        let Some(cfg) = self.cfg.clone() else { return };
+        let closed = self.pipeline.as_ref().is_some_and(|p| p.target_gone());
+        if let CaptureTarget::Auto { games, ignore } = &cfg.target {
+            if self.last_retry.elapsed().as_secs_f64() < 1.0 {
+                return;
+            }
+            self.last_retry = Instant::now();
+            // Recording something: switch only when the user focuses a *different* game.
+            // Nothing recording: take the focused game, else any open game window.
+            let running = self.pipeline.is_some() && !closed;
+            let found = if running { detect::foreground_game(games, ignore) } else { detect::current_game(games, ignore) };
+            let Some((w, reason)) = found else {
+                if self.pipeline.is_none() || closed {
+                    self.start_error.get_or_insert_with(|| waiting("Watching for games."));
+                }
+                return;
+            };
+            let same = self.pipeline.as_ref().is_some_and(|p| p.shared.target_pid == w.pid && !closed);
+            if !same {
+                match settings_for_window(&cfg, &w, Some(reason.label())) {
+                    Ok(s) => self.launch(&cfg, s),
+                    Err(u) => self.start_error = Some(u),
+                }
+            }
+            return;
+        }
+        if !(closed || self.pipeline.is_none()) || self.last_retry.elapsed().as_secs_f64() < 3.0 {
             return;
         }
         self.last_retry = Instant::now();
-        let cfg = self.cfg.clone().unwrap();
         if let Ok(s) = resolve(&cfg) {
-            self.pipeline = None;
-            match Pipeline::start(s, live_of(&cfg)) {
-                Ok(p) => {
-                    self.start_error = None;
-                    self.fps_sample = (Instant::now(), 0);
-                    self.pipeline = Some(p);
-                }
-                Err(e) => self.start_error = Some(e),
-            }
+            self.launch(&cfg, s);
         }
     }
 
@@ -212,6 +319,8 @@ impl Engine {
             status: Status::Ready,
             attention: None,
             target_name: None,
+            target_exe: None,
+            detected_by: None,
             encoder: None,
             buffered_secs: 0.0,
             buffer_bytes: 0,
@@ -227,8 +336,9 @@ impl Engine {
             return st;
         }
         let Some(p) = &self.pipeline else {
-            st.status = Status::NeedsAttention;
-            st.attention = Some(self.start_error.clone().unwrap_or_else(|| "Replay could not start.".into()));
+            let u = self.start_error.clone().unwrap_or_else(|| failed("Replay could not start."));
+            st.status = if u.waiting { Status::Waiting } else { Status::NeedsAttention };
+            st.attention = Some(u.message);
             return st;
         };
         let frames = p.capture.frames.load(Ordering::Relaxed);
@@ -245,6 +355,8 @@ impl Engine {
         };
         let attention = sh.attention.lock().unwrap().clone();
         st.target_name = Some(sh.game_name.clone());
+        st.target_exe = Some(sh.target_exe.clone());
+        st.detected_by = sh.detected_by.clone();
         st.encoder = Some(p.encoder.clone());
         st.buffered_secs = (buffered * 10.0).round() / 10.0;
         st.buffer_bytes = bytes;
@@ -255,6 +367,15 @@ impl Engine {
             t.peak = (t.peak * 100.0).round() / 100.0;
         }
         st.saves_in_progress = sh.saves_in_progress.load(Ordering::Relaxed);
+        if p.target_gone() {
+            st.status = Status::Waiting;
+            st.attention = Some(format!(
+                "{} closed. Its last {} can still be saved until a new game starts.",
+                sh.game_name,
+                fmt_secs(buffered)
+            ));
+            return st;
+        }
         st.status = if attention.is_some() {
             Status::NeedsAttention
         } else if frames > 0 && has_segments && sh.frames_encoded.load(Ordering::Relaxed) > 0 {
@@ -264,7 +385,7 @@ impl Engine {
         };
         st.attention = attention.or_else(|| {
             (st.status == Status::Starting && sh.now() > 5.0 && frames == 0)
-                .then(|| "No frames received yet. The target may be minimized, protected, or using exclusive fullscreen. Try borderless mode or Display capture.".into())
+                .then(|| "No frames received yet. The game may be minimized, protected, or in exclusive fullscreen. Try borderless mode or Whole display.".into())
         });
         st
     }
@@ -318,62 +439,94 @@ fn live_of(cfg: &EngineConfig) -> Live {
     Live { replay_secs: cfg.replay_secs.clamp(5, 3600), cap_bytes: cfg.buffer_cap_bytes, min_free_bytes: cfg.min_free_bytes }
 }
 
+fn base_settings(cfg: &EngineConfig) -> Result<PathBuf, Unresolved> {
+    if cfg.capture_root.trim().is_empty() {
+        return Err(failed("Choose a folder for your captures first."));
+    }
+    Ok(PathBuf::from(&cfg.capture_root))
+}
+
+fn settings_for_window(cfg: &EngineConfig, w: &WindowTarget, detected_by: Option<&str>) -> Result<Settings, Unresolved> {
+    let root = base_settings(cfg)?;
+    let audio = if cfg.audio.game_audio {
+        vec![SourceSpec::Process { pid: w.pid, label: "Game Audio".into() }]
+    } else {
+        vec![]
+    };
+    Ok(Settings {
+        root,
+        game_name: w.app_name.clone(),
+        exe: w.exe.clone(),
+        pid: w.pid,
+        detected_by: detected_by.map(str::to_string),
+        source: SourceKind::Window(w.hwnd as isize),
+        fps: cfg.fps.clamp(10, 240),
+        quality: cfg.quality,
+        cursor: cfg.capture_cursor,
+        audio,
+    })
+}
+
 /// Turn the configured target into concrete capture settings, verifying it still exists.
-fn resolve(cfg: &EngineConfig) -> Result<Settings, String> {
+fn resolve(cfg: &EngineConfig) -> Result<Settings, Unresolved> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsWindow};
-    let root = PathBuf::from(&cfg.capture_root);
-    if cfg.capture_root.trim().is_empty() {
-        return Err("Choose a folder for your captures first.".into());
-    }
-    let (source, game_name, audio) = match &cfg.target {
-        CaptureTarget::None => return Err("Choose a window or display to capture.".into()),
+    let root = base_settings(cfg)?;
+    match &cfg.target {
+        CaptureTarget::None => Err(failed("Choose what to record: Auto, a game or app, or your whole display.")),
+        CaptureTarget::Auto { games, ignore } => match detect::current_game(games, ignore) {
+            Some((w, reason)) => settings_for_window(cfg, &w, Some(reason.label())),
+            None => Err(waiting("Watching for games.")),
+        },
         CaptureTarget::App { exe } => {
             let w = targets::windows()
                 .into_iter()
                 .filter(|w| w.exe.eq_ignore_ascii_case(exe))
                 .max_by_key(|w| w.width as u64 * w.height as u64)
-                .ok_or_else(|| format!("Waiting for {exe} to start. Replay begins automatically when it opens."))?;
-            let audio = if cfg.audio.game_audio {
-                vec![SourceSpec::Process { pid: w.pid, label: "Game Audio".into() }]
-            } else {
-                vec![]
-            };
-            (SourceKind::Window(w.hwnd as isize), w.app_name, audio)
+                .ok_or_else(|| waiting(format!("Waiting for {exe} to start. Recording begins automatically when it opens.")))?;
+            settings_for_window(cfg, &w, None)
         }
         CaptureTarget::Window { hwnd, pid, exe, title } => {
             let h = HWND(*hwnd as *mut _);
             let mut actual = 0u32;
             unsafe { GetWindowThreadProcessId(h, Some(&mut actual)) };
             if !unsafe { IsWindow(Some(h)) }.as_bool() || actual != *pid {
-                return Err(format!("\"{title}\" is no longer open. Pick it again from the list."));
+                return Err(failed(format!("\"{title}\" is no longer open. Pick it again from the list.")));
             }
-            let name = targets::app_name(&targets::process_path(*pid).unwrap_or_default(), exe, title);
-            let audio = if cfg.audio.game_audio {
-                vec![SourceSpec::Process { pid: *pid, label: "Game Audio".into() }]
-            } else {
-                vec![]
-            };
-            (SourceKind::Window(*hwnd as isize), name, audio)
+            let app_name = targets::app_name(&targets::process_path(*pid).unwrap_or_default(), exe, title);
+            let w = WindowTarget { hwnd: *hwnd, pid: *pid, exe: exe.clone(), title: title.clone(), app_name, width: 0, height: 0 };
+            settings_for_window(cfg, &w, None)
         }
         CaptureTarget::Display { index } => {
             let mons = targets::monitors();
-            let m = mons.iter().find(|m| m.target.index == *index).ok_or("That display is not connected.")?;
+            let m = mons.iter().find(|m| m.target.index == *index).ok_or_else(|| failed("That display is not connected."))?;
             let audio = if cfg.audio.game_audio {
                 vec![SourceSpec::EndpointLoopback { device_id: None, label: "System Audio".into() }]
             } else {
                 vec![]
             };
-            (SourceKind::Monitor(m.handle), "Desktop".to_string(), audio)
+            Ok(Settings {
+                root,
+                game_name: "Desktop".into(),
+                exe: String::new(),
+                pid: 0,
+                detected_by: None,
+                source: SourceKind::Monitor(m.handle),
+                fps: cfg.fps.clamp(10, 240),
+                quality: cfg.quality,
+                cursor: cfg.capture_cursor,
+                audio,
+            })
         }
-    };
-    Ok(Settings {
-        root,
-        game_name,
-        source,
-        fps: cfg.fps.clamp(10, 240),
-        quality: cfg.quality,
-        cursor: cfg.capture_cursor,
-        audio,
-    })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn durations_read_naturally() {
+        assert_eq!(super::fmt_secs(42.4), "42s");
+        assert_eq!(super::fmt_secs(120.0), "2 min");
+        assert_eq!(super::fmt_secs(102.0), "1m 42s");
+    }
 }

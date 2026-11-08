@@ -42,6 +42,7 @@ fn main() {
     let (tx, rx) = mpsc::channel::<Input>();
     let mut engine = Engine::new(emit.clone());
 
+    engine.attach_overlay(capture_engine::overlay::Overlay::start());
     let hk_tx = tx.clone();
     let hk_emit = emit.clone();
     engine.attach_hotkey(HotkeyService::start(

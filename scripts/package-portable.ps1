@@ -26,7 +26,10 @@ try {
 
     $version = (Get-Content app\src-tauri\tauri.conf.json -Raw | ConvertFrom-Json).version
     $out = "$root\dist\CAPTURE-$version"
-    if (Test-Path $out) { Remove-Item -Recurse -Force $out }
+    # Replace program files only. The user's .\data folder (settings, WebView2 profile) is kept.
+    if (Test-Path $out) {
+        Get-ChildItem $out | Where-Object { $_.Name -ne 'data' } | Remove-Item -Recurse -Force
+    }
     New-Item -ItemType Directory -Force "$out\licenses" | Out-Null
     Copy-Item target\release\CAPTURE.exe, target\release\capture-worker.exe $out
     foreach ($dll in 'avcodec-62', 'avformat-62', 'avutil-60', 'swresample-6', 'swscale-9') {

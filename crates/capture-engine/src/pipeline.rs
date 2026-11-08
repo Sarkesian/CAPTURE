@@ -23,6 +23,9 @@ const KEEP_SLACK_SECS: f64 = 6.0;
 pub struct Settings {
     pub root: PathBuf,
     pub game_name: String,
+    pub exe: String,
+    pub pid: u32,
+    pub detected_by: Option<String>,
     pub source: SourceKind,
     pub fps: u32,
     pub quality: Quality,
@@ -48,6 +51,11 @@ pub struct Shared {
     pub session_dir: PathBuf,
     pub root: PathBuf,
     pub game_name: String,
+    pub target_exe: String,
+    pub target_pid: u32,
+    /// Window being captured (0 for a display).
+    pub target_hwnd: isize,
+    pub detected_by: Option<String>,
     pub t0: u64,
     pub live: Mutex<Live>,
     pub attention: Mutex<Option<String>>,
@@ -145,6 +153,13 @@ impl Pipeline {
             session_dir,
             root: s.root.clone(),
             game_name: s.game_name.clone(),
+            target_exe: s.exe.clone(),
+            target_pid: s.pid,
+            target_hwnd: match s.source {
+                SourceKind::Window(h) => h,
+                SourceKind::Monitor(_) => 0,
+            },
+            detected_by: s.detected_by.clone(),
             t0,
             live: Mutex::new(live),
             attention: Mutex::new(None),
@@ -177,6 +192,18 @@ impl Pipeline {
             mux_thread: Some(mux_thread),
             _gpu: gpu,
         })
+    }
+
+    /// True once the captured window is gone. WGC's `Closed` event is not always raised (for
+    /// example when the game process is killed), so the window handle is checked directly too.
+    pub fn target_gone(&self) -> bool {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+        let h = self.shared.target_hwnd;
+        if h != 0 && !unsafe { IsWindow(Some(HWND(h as *mut _))) }.as_bool() {
+            self.capture.closed.store(true, Ordering::Relaxed);
+        }
+        self.capture.closed.load(Ordering::Relaxed)
     }
 
     pub fn set_live(&self, live: Live) {
@@ -238,8 +265,7 @@ fn run_video(shared: Arc<Shared>, capture: Arc<wgc::Capture>, mut enc: VideoEnco
             n += behind;
         }
         if capture.closed.load(Ordering::Relaxed) {
-            shared.set_attention(Some("The captured window closed. Choose another window or display.".into()));
-            break;
+            break; // reported as "Waiting" by the engine; footage stays saveable
         }
         let latest = capture.latest.lock().unwrap();
         if latest.has_frame {

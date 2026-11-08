@@ -14,7 +14,20 @@
     e.preventDefault();
     if (e.key === 'Escape') { recording = false; return; }
     let key: string | null = null;
-    if (/^F([1-9]|1\d|2[0-4])$/.test(e.key)) key = e.key;
+    // Numpad first, by physical code: with NumLock off the browser reports Numpad1 as "End".
+    const pad: Record<string, string> = {
+      NumpadAdd: 'NumAdd', NumpadSubtract: 'NumSubtract', NumpadMultiply: 'NumMultiply',
+      NumpadDivide: 'NumDivide', NumpadDecimal: 'NumDecimal',
+    };
+    const sym: Record<string, string> = {
+      Minus: 'Minus', Equal: 'Equal', BracketLeft: 'BracketLeft', BracketRight: 'BracketRight',
+      Backslash: 'Backslash', Semicolon: 'Semicolon', Quote: 'Quote', Comma: 'Comma',
+      Period: 'Period', Slash: 'Slash', Backquote: 'Backquote',
+    };
+    if (/^Numpad\d$/.test(e.code)) key = 'Num' + e.code.slice(6);
+    else if (pad[e.code]) key = pad[e.code];
+    else if (sym[e.code]) key = sym[e.code];
+    else if (/^F([1-9]|1\d|2[0-4])$/.test(e.key)) key = e.key;
     else if (/^Key[A-Z]$/.test(e.code)) key = e.code.slice(3);
     else if (/^Digit\d$/.test(e.code)) key = e.code.slice(5);
     else if (named[e.key]) key = named[e.key];

@@ -19,7 +19,6 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_clipboard_manager::ClipboardExt;
-use tauri_plugin_notification::NotificationExt;
 use worker::Worker;
 
 struct Tray {
@@ -207,6 +206,7 @@ fn refresh_tray(app: &AppHandle) {
         (None, Some(s)) => match s.status {
             Status::Ready => ("Ready · replay is off".to_string(), false),
             Status::Starting => ("Starting…".to_string(), false),
+            Status::Waiting => (s.attention.clone().unwrap_or_else(|| "Watching for games".into()), false),
             Status::Buffering => (
                 format!("Buffering · {} · {}", s.target_name.clone().unwrap_or_default(), fmt_secs(s.buffered_secs)),
                 true,
@@ -238,18 +238,6 @@ fn on_message(app: &AppHandle, m: Message) {
             *state.last_state.lock().unwrap() = Some(s.clone());
             *state.engine_down.lock().unwrap() = None;
             refresh_tray(app);
-        }
-        Event::SaveFinished(c) if state.settings.lock().unwrap().notify_on_save => {
-            let name = Path::new(&c.path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let _ = app
-                .notification()
-                .builder()
-                .title(format!("Clip saved · {}", fmt_secs(c.duration_secs)))
-                .body(name)
-                .show();
-        }
-        Event::SaveFailed { message, .. } if state.settings.lock().unwrap().notify_on_save => {
-            let _ = app.notification().builder().title("Clip not saved").body(message).show();
         }
         _ => {}
     }
@@ -303,7 +291,6 @@ fn main() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_window(app)))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
-        .plugin(tauri_plugin_notification::init())
         .manage(AppState {
             worker: worker.clone(),
             settings: Mutex::new(loaded),

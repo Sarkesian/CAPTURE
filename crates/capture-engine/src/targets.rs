@@ -22,7 +22,7 @@ pub fn windows() -> Vec<WindowTarget> {
     hwnds.into_iter().filter_map(|h| describe(h, me)).collect()
 }
 
-fn describe(h: HWND, own_pid: u32) -> Option<WindowTarget> {
+pub fn describe(h: HWND, own_pid: u32) -> Option<WindowTarget> {
     unsafe {
         if !IsWindowVisible(h).as_bool() {
             return None;

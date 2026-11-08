@@ -1,13 +1,15 @@
 # CAPTURE quick start (v0.1, Phase 1 playtest)
 
 1. **Start** `CAPTURE.exe`. No installer is needed. Its own settings live in the `data` folder next to it.
-2. **Capture tab → What to record**: pick your game from *Game or app* (start the game first and press
-   **Refresh**), or choose *Whole display*. CAPTURE remembers the game, so next time it begins buffering
-   by itself whenever that game is open.
+2. **Capture tab → What to record** is set to **Auto (games)**. Start a game and CAPTURE finds it by itself
+   (Steam, Epic, GOG, itch, Xbox, EA, Ubisoft, Riot, Battle.net, any `Games` folder, or anything fullscreen).
+   If it misses one, choose it under **Missed a game?**. If it records something that isn't a game, press **Not a game**.
+   You can also use **Pick an app** or **Whole display**.
 3. Turn on **Instant replay** and choose **Save last** (default 2 minutes).
 4. Wait until the status says **Buffering**, then play.
-5. Press **Alt+F10** (or click **Save clip**). Then:
-   - a notification says **Clip saved**, but only after the file has been written *and* checked;
+5. A small notice in the corner says **Recording <game>**. It never appears in your clips.
+6. Press **Alt+F10** (or click **Save clip**). Then:
+   - a small notice says **Clip saved**, but only after the file has been written *and* checked;
    - the clip is in `D:\Captures\Clips\<Game Name>\YYYY-MM-DD_HH-MM-SS_<Game>_Clip.mp4`;
    - **Open file**, **Show in folder** and **Copy path** take you straight to it.
 
@@ -21,6 +23,10 @@ A normal MP4 (H.264 video, AAC audio) that plays anywhere and drops into any edi
 Editors that show every audio track: mute **Preview Mix**, or you will hear the game twice.
 
 ## Good to know
+
+- Any hotkey can be changed in Settings, including numpad keys (`Num1`, `NumAdd`…). Numpad keys work with NumLock
+  on or off and never take over the normal End/Home/arrow keys. Shift can't be combined with numpad digits
+  (Windows turns those into arrow keys).
 
 - If less than the chosen length has been buffered, the clip is shorter. The notification shows the real length.
 - A clip can start up to 2 s earlier than requested, because clips start on a keyframe.

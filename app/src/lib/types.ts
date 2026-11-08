@@ -1,10 +1,11 @@
 // Mirrors crates/capture-protocol (v1) and app/src-tauri/src/settings.rs.
 
 export type Quality = 'balanced' | 'high' | 'maximum';
-export type Status = 'ready' | 'starting' | 'buffering' | 'needs_attention';
+export type Status = 'ready' | 'starting' | 'waiting' | 'buffering' | 'needs_attention';
 
 export type TargetPref =
   | { kind: 'none' }
+  | { kind: 'auto' }
   | { kind: 'app'; exe: string; label: string }
   | { kind: 'display'; index: number; label: string };
 
@@ -23,6 +24,8 @@ export interface Settings {
   min_free_gb: number;
   close_to_tray: boolean;
   notify_on_save: boolean;
+  games: string[];
+  ignored: string[];
 }
 
 export interface EncoderInfo { name: string; hardware: boolean; width: number; height: number; fps: number; rejected: string[] }
@@ -33,6 +36,8 @@ export interface EngineState {
   status: Status;
   attention: string | null;
   target_name: string | null;
+  target_exe: string | null;
+  detected_by: string | null;
   encoder: EncoderInfo | null;
   buffered_secs: number;
   buffer_bytes: number;

@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TargetPref {
     None,
+    /// Detect games automatically (default).
+    Auto,
     /// Remembered by executable name; `label` is what the user saw when choosing it.
     App { exe: String, label: String },
     Display { index: u32, label: String },
@@ -34,7 +36,11 @@ pub struct AppSettings {
     pub buffer_cap_gb: f64,
     pub min_free_gb: f64,
     pub close_to_tray: bool,
+    /// Small on-screen notices (recording started, clip saved). Excluded from recordings.
     pub notify_on_save: bool,
+    /// Auto mode: apps the user marked as games / as not games (exe names).
+    pub games: Vec<String>,
+    pub ignored: Vec<String>,
 }
 
 impl Default for AppSettings {
@@ -44,7 +50,7 @@ impl Default for AppSettings {
             capture_root: default_root(),
             replay_enabled: false,
             replay_secs: 120,
-            target: TargetPref::None,
+            target: TargetPref::Auto,
             quality: Quality::High,
             fps: 60,
             capture_cursor: true,
@@ -54,6 +60,8 @@ impl Default for AppSettings {
             min_free_gb: 10.0,
             close_to_tray: false,
             notify_on_save: true,
+            games: vec![],
+            ignored: vec![],
         }
     }
 }
@@ -74,6 +82,7 @@ impl AppSettings {
             replay_secs: self.replay_secs,
             target: match &self.target {
                 TargetPref::None => CaptureTarget::None,
+                TargetPref::Auto => CaptureTarget::Auto { games: self.games.clone(), ignore: self.ignored.clone() },
                 TargetPref::App { exe, .. } => CaptureTarget::App { exe: exe.clone() },
                 TargetPref::Display { index, .. } => CaptureTarget::Display { index: *index },
             },
@@ -82,6 +91,7 @@ impl AppSettings {
             capture_cursor: self.capture_cursor,
             audio: AudioConfig { game_audio: self.game_audio },
             save_hotkey: self.save_hotkey.clone(),
+            overlay: self.notify_on_save,
             buffer_cap_bytes: (self.buffer_cap_gb.max(1.0) * 1e9) as u64,
             min_free_bytes: (self.min_free_gb.max(1.0) * 1e9) as u64,
         }
@@ -95,6 +105,16 @@ impl AppSettings {
         };
         self.buffer_cap_gb = self.buffer_cap_gb.clamp(1.0, 2000.0);
         self.min_free_gb = self.min_free_gb.clamp(1.0, 2000.0);
+        // "Nothing chosen" from older builds becomes Auto: there is always something sensible to do.
+        if self.target == TargetPref::None {
+            self.target = TargetPref::Auto;
+        }
+        let dedup = |v: &mut Vec<String>| {
+            let mut seen = std::collections::HashSet::new();
+            v.retain(|x| !x.trim().is_empty() && seen.insert(x.to_ascii_lowercase()));
+        };
+        dedup(&mut self.games);
+        dedup(&mut self.ignored);
         self
     }
 }

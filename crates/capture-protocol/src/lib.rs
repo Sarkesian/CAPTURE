@@ -68,10 +68,18 @@ pub struct EngineConfig {
     pub audio: AudioConfig,
     /// e.g. "Alt+F10". Empty disables the hotkey.
     pub save_hotkey: String,
+    /// Show a small on-screen notice (excluded from recordings) when recording starts and
+    /// when a clip is saved or fails.
+    #[serde(default = "yes")]
+    pub overlay: bool,
     /// Strict cap for temporary buffer footage, bytes.
     pub buffer_cap_bytes: u64,
     /// Buffering pauses when free space on the capture drive falls below this.
     pub min_free_bytes: u64,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -85,6 +93,14 @@ pub struct AudioConfig {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CaptureTarget {
     None,
+    /// Detect games automatically: the foreground window is recorded when it belongs to a
+    /// game library folder, is listed in `games`, or covers its whole monitor. `ignore` wins.
+    Auto {
+        #[serde(default)]
+        games: Vec<String>,
+        #[serde(default)]
+        ignore: Vec<String>,
+    },
     /// A specific live window (not persisted: handles change between launches).
     Window { hwnd: u64, pid: u32, exe: String, title: String },
     /// Whatever main window the named executable currently has. Persistable. While the app
@@ -129,6 +145,8 @@ pub enum Status {
     Ready,
     /// Pipeline is starting; no frames confirmed yet.
     Starting,
+    /// Replay is on and waiting for a game / the chosen app to appear. Not an error.
+    Waiting,
     /// Frames confirmed and segments being written.
     Buffering,
     /// Buffering paused for a reason the user must act on (see `attention`).
@@ -141,6 +159,12 @@ pub struct EngineState {
     /// Plain-language reason when status is NeedsAttention.
     pub attention: Option<String>,
     pub target_name: Option<String>,
+    /// Executable of the current target, and why it was chosen in Auto mode
+    /// ("game library folder", "your games list", "fullscreen").
+    #[serde(default)]
+    pub target_exe: Option<String>,
+    #[serde(default)]
+    pub detected_by: Option<String>,
     pub encoder: Option<EncoderInfo>,
     /// Seconds of footage currently available for a replay save.
     pub buffered_secs: f64,
