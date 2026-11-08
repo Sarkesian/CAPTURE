@@ -134,6 +134,15 @@ impl Default for Hotkeys {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EncoderChoice {
+    #[default]
+    Auto,
+    /// Microsoft's software H.264 encoder: works on any PC, uses the CPU.
+    Software,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct GameRule {
@@ -226,6 +235,9 @@ pub struct EngineConfig {
     /// Per-game overrides (matched by executable name); unset fields use the defaults above.
     #[serde(default)]
     pub per_game: Vec<GameRule>,
+    /// Encoder selection: automatic (GPU first) or software only (troubleshooting).
+    #[serde(default)]
+    pub encoder: EncoderChoice,
     /// Show a small on-screen notice (excluded from recordings) when recording starts and
     /// when a clip is saved or fails.
     #[serde(default = "yes")]

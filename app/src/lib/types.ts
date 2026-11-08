@@ -38,6 +38,7 @@ export interface Settings {
   per_game: GameRule[];
   first_run_done: boolean;
   start_with_windows: boolean;
+  encoder: 'auto' | 'software';
 }
 
 export interface GameRule { exe: string; replay_secs: number | null; quality: Quality | null; game_audio: boolean | null }

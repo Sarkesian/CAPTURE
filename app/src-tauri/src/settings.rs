@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use capture_protocol::{AudioConfig, CaptureTarget, EngineConfig, GameRule, Hotkeys, MarkerConfig, Quality, Volumes};
+use capture_protocol::{AudioConfig, CaptureTarget, EncoderChoice, EngineConfig, GameRule, Hotkeys, MarkerConfig, Quality, Volumes};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -58,6 +58,7 @@ pub struct AppSettings {
     pub first_run_done: bool,
     /// Start CAPTURE (in the tray) when you sign in to Windows.
     pub start_with_windows: bool,
+    pub encoder: EncoderChoice,
 }
 
 impl Default for AppSettings {
@@ -91,6 +92,7 @@ impl Default for AppSettings {
             per_game: vec![],
             first_run_done: false,
             start_with_windows: false,
+            encoder: EncoderChoice::Auto,
         }
     }
 }
@@ -133,6 +135,7 @@ impl AppSettings {
             hotkeys: self.hotkeys.clone(),
             markers: self.markers.clone(),
             per_game: self.per_game.clone(),
+            encoder: self.encoder,
             buffer_cap_bytes: (self.buffer_cap_gb.max(1.0) * 1e9) as u64,
             min_free_bytes: (self.min_free_gb.max(1.0) * 1e9) as u64,
         }

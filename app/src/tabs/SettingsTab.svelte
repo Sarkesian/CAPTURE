@@ -183,6 +183,13 @@
   <button class="link" aria-expanded={advanced} onclick={() => (advanced = !advanced)}>{advanced ? '▾' : '▸'} Advanced details</button>
   {#if advanced}
     <dl>
+      <dt>Encoder choice</dt>
+      <dd>
+        <Segmented label="Encoder choice" value={s.encoder}
+          options={[{ value: 'auto', label: 'Automatic (GPU first)' }, { value: 'software', label: 'Software (CPU)' }] as { value: 'auto' | 'software'; label: string }[]}
+          onchange={v => updateSettings({ encoder: v })} />
+        <div class="muted small">Software works on any PC but uses the processor; use it only if the GPU encoder causes problems.</div>
+      </dd>
       <dt>Encoder</dt>
       <dd>{e?.encoder ? `${e.encoder.name} (${e.encoder.hardware ? 'hardware' : 'software'})` : 'Chosen when replay starts'}</dd>
       {#if e?.encoder?.rejected.length}

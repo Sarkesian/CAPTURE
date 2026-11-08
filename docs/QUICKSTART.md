@@ -1,54 +1,58 @@
-# CAPTURE quick start (v0.2)
+# CAPTURE quick start (v0.3)
 
-1. **Start** `CAPTURE.exe`. No installer is needed. Its own settings live in the `data` folder next to it.
-2. **Capture tab → What to record** is set to **Auto (games)**. Start a game and CAPTURE finds it by itself
-   (Steam, Epic, GOG, itch, Xbox, EA, Ubisoft, Riot, Battle.net, any `Games` folder, or anything fullscreen).
-   If it misses one, choose it under **Missed a game?**. If it records something that isn't a game, press **Not a game**.
-   You can also use **Pick an app** or **Whole display**.
-3. Turn on **Instant replay** and choose **Save last** (default 2 minutes).
-4. Wait until the status says **Buffering**, then play.
-5. A small notice in the corner says **Recording <game>**. It never appears in your clips.
-6. Press **Alt+F10** (or click **Save clip**). Then:
-   - a small notice says **Clip saved**, but only after the file has been written *and* checked;
-   - the clip is in `D:\Captures\Clips\<Game Name>\YYYY-MM-DD_HH-MM-SS_<Game>_Clip.mp4`;
-   - **Open file**, **Show in folder** and **Copy path** take you straight to it.
+1. **Start** `CAPTURE.exe`. No installer is needed; its own settings live in the `data` folder next to it.
+   (Windows may warn that the app is unrecognised because it isn't code-signed. Choose *More info → Run anyway*.)
+2. Turn on **Instant replay**. **What to record** is set to **Auto (games)**: start a game and CAPTURE
+   finds it (Steam, Epic, GOG, itch, Xbox, EA, Ubisoft, Riot, Battle.net, any `Games` folder, or anything
+   fullscreen). If it misses one, use **Missed a game?**. If it records something that isn't a game, press
+   **Not a game**. You can also use *Pick an app* or *Whole display*.
+3. A small corner notice says **Recording <game>**. It never appears in your recordings.
 
-## In-game overlay (Alt+F11)
+## While playing (default keys; change any of them in Settings, numpad keys work too)
+| Key | Does |
+|---|---|
+| **Alt+F10** | Save the last 2 minutes (or your length) as a clip |
+| **Alt+F8** | Add a marker: bookmarks the moment, with a short sound that is never recorded |
+| **Alt+F11** | Open the overlay (Esc closes it) |
+| **Alt+F12** | Screenshot (PNG) |
+| *(optional)* | Start/stop a full-length session recording |
 
-Press **Alt+F11** while playing (Esc closes it). Recording keeps running the whole time.
-- **Save Replay**: same as Alt+F10.
-- **Add Marker**: bookmark this moment (also **Alt+F8**, with a short sound that is never recorded).
-- **Review Recording**: watch your recent gameplay, click a marker, press **Create clip**, drag the two handles, **Save clip**.
-  **Save around** on a marker saves the moments around it in one click.
-- **Start Recording**: a full session of any length, saved to `Sessions\<Game>\` when you stop.
-- Recent clips with thumbnails, quick settings, and a shortcut to the full settings.
+## The overlay (Alt+F11)
+Save Replay · Add Marker · **Review Recording** (watch recent gameplay, click a marker, **Create clip**,
+drag the two handles, **Save clip**; or **Save around** a marker in one click) · Start/Stop Recording ·
+audio rows with live meters and mic mute · recent clips · quick settings · full settings.
+Recording never stops while the overlay is open. Over *exclusive fullscreen* games Windows can't show
+the overlay without leaving the game. Use borderless, or just the keys, which always work.
 
-Over **exclusive fullscreen** games Windows can't show the overlay without leaving the game. Use borderless, or just use
-the hotkeys, which always work.
+## Audio (Capture tab → Audio)
+- **Game sound**: only the game's own sound (*Whole display*: everything you hear except CAPTURE).
+- **Your microphone**: **off until you turn it on.** Pick the device, watch the meter, **Test**
+  (records 3 s and plays it back) and **Mute**. If your chosen mic is unplugged, CAPTURE says so and never
+  switches to another one.
+- **Voice chat**: pick the app (e.g. Discord). It's recorded from that app only. Voices in a game's
+  *built-in* chat are part of the game sound and can't be separated.
+- **Other computer audio**: optional extra track of everything; it is not added to Preview Mix.
+- Sliders change the Preview Mix only. Every source is also saved untouched as its own track.
 
-## What is in a clip
+## Your files
+```
+D:\Captures\Clips\<Game>\…_Clip.mp4         saved replays (never deleted automatically)
+D:\Captures\Sessions\<Game>\…_Session.mp4   full-length recordings
+D:\Captures\Screenshots\<Game>\….png
+D:\Captures\Buffer\                          temporary footage (size-capped, removed on exit)
+```
+A clip is a normal MP4: **Preview Mix** (default, sounds normal anywhere) plus Game Audio / Microphone /
+Voice Chat tracks for editing. In an editor that shows all tracks, mute *Preview Mix*. For editors that
+can't use MP4 audio tracks: Library → **Editor audio files** writes synced WAVs to `<clip>_Audio\`.
 
-A normal MP4 (H.264 video, AAC audio) that plays anywhere and drops into any editor. It has:
-- **Preview Mix**: the default track, which sounds normal when you double-click the file;
-- **Game Audio**: only the game's own sound, isolated per app. With *Whole display* this track is
-  **System Audio**, meaning everything you hear.
-
-Editors that show every audio track: mute **Preview Mix**, or you will hear the game twice.
+## Library
+Clips · Sessions · Screenshots, grouped by game, with search, Play, Show in folder, Copy path, Editor
+audio files, Rename, and Delete (to the Recycle Bin, after confirmation).
 
 ## Good to know
-
-- Any hotkey can be changed in Settings, including numpad keys (`Num1`, `NumAdd`…). Numpad keys work with NumLock
-  on or off and never take over the normal End/Home/arrow keys. Shift can't be combined with numpad digits
-  (Windows turns those into arrow keys).
-
-- If less than the chosen length has been buffered, the clip is shorter. The notification shows the real length.
-- A clip can start up to 2 s earlier than requested, because clips start on a keyframe.
-- Temporary footage lives in `D:\Captures\Buffer` under a size cap (Settings). It is removed when CAPTURE closes.
-  **Saved clips are never deleted automatically.**
-- Closing the window quits CAPTURE and stops recording, unless you turn on *Keep running in the tray* in Settings.
-- Exclusive-fullscreen games may show no frames. Switch the game to borderless/windowed fullscreen or use *Whole display*.
-  CAPTURE never injects into games.
-
-## Not in this build yet
-
-Microphone and voice-chat tracks, the WAV "Editor audio files" export, screenshots, per-game settings, and an installer.
+- If CAPTURE or Windows stops unexpectedly, the next start offers to **save the last footage as a clip**.
+- Settings → Games: per-game replay length, quality and sound.
+- Settings → Storage: temporary-buffer limit and free-space reserve. When space runs low, buffering
+  pauses with a message instead of filling the drive. Saved files are never touched.
+- *Start with Windows* starts CAPTURE in the tray. *Keep running in the tray* keeps it recording when the
+  window is closed.

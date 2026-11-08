@@ -40,5 +40,10 @@ try {
     Copy-Item docs\QUICKSTART.md "$out\QUICKSTART.md"
     $size = (Get-ChildItem -Recurse $out | Measure-Object Length -Sum).Sum / 1MB
     Write-Host ("Portable build: {0} ({1:N0} MB)" -f $out, $size)
+    # Distributable zip: program files only (never the user's .\data folder).
+    $zip = "$root\dist\CAPTURE-$version-portable.zip"
+    Remove-Item $zip -ErrorAction SilentlyContinue
+    Compress-Archive -Path (Get-ChildItem $out | Where-Object { $_.Name -ne 'data' }).FullName -DestinationPath $zip -CompressionLevel Optimal
+    Write-Host ("Portable zip:   {0} ({1:N0} MB)" -f $zip, ((Get-Item $zip).Length / 1MB))
 }
 finally { Pop-Location }

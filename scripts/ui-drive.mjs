@@ -14,7 +14,7 @@ async function connect() {
   for (let i = 0; i < 60; i++) {
     try {
       const list = await (await fetch('http://127.0.0.1:9333/json')).json();
-      const page = list.find(t => t.type === 'page');
+      const page = list.find(t => t.type === 'page' && !t.url.includes('#overlay'));
       if (page) return page.webSocketDebuggerUrl;
     } catch {}
     await sleep(500);

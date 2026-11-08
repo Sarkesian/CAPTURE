@@ -70,6 +70,9 @@ fn bootstrap(state: State<AppState>) -> Bootstrap {
 #[tauri::command]
 fn update_settings(app: AppHandle, state: State<AppState>, settings: AppSettings) -> Result<AppSettings, String> {
     let s = settings.sanitized();
+    if s.capture_root != state.settings.lock().unwrap().capture_root {
+        validate_destination(&s.capture_root)?;
+    }
     persist(&state, &s)?;
     let replay_changed = state.settings.lock().unwrap().replay_enabled != s.replay_enabled;
     *state.settings.lock().unwrap() = s.clone();
@@ -81,6 +84,20 @@ fn update_settings(app: AppHandle, state: State<AppState>, settings: AppSettings
     allow_media(&app, &s.capture_root);
     let _ = app.emit("settings", &s); // keep every window (main + overlay) in sync
     Ok(s)
+}
+
+/// A new capture folder must be creatable and writable before it is used. Existing recordings
+/// stay where they are; nothing is moved.
+fn validate_destination(root: &str) -> Result<(), String> {
+    let p = PathBuf::from(root);
+    if !p.is_absolute() {
+        return Err(r"Choose a full folder path (for example D:\Captures).".into());
+    }
+    std::fs::create_dir_all(&p).map_err(|e| format!("CAPTURE can't use {root}: {e}"))?;
+    let probe = p.join(".capture-write-test");
+    std::fs::write(&probe, b"ok").map_err(|e| format!("CAPTURE can't save files in {root}: {e}"))?;
+    let _ = std::fs::remove_file(probe);
+    Ok(())
 }
 
 /// Let the webviews play/view files inside the capture folder only (reviews, clips, thumbs).

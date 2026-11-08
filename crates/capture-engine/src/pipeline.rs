@@ -29,6 +29,7 @@ pub struct Settings {
     pub source: SourceKind,
     pub fps: u32,
     pub quality: Quality,
+    pub software_encoder: bool,
     pub cursor: bool,
     pub audio: Vec<Source>,
     pub mix: MixParams,
@@ -241,7 +242,7 @@ impl Pipeline {
             SourceKind::Monitor(h) => wgc::Source::Monitor(h),
         };
         let capture = Arc::new(wgc::Capture::start(&gpu, source, s.cursor)?);
-        let encoder = VideoEncoder::open(gpu.clone(), capture.width, capture.height, s.fps, s.quality)?;
+        let encoder = VideoEncoder::open(gpu.clone(), capture.width, capture.height, s.fps, s.quality, s.software_encoder)?;
         let info = encoder.info.clone();
 
         let buffer = storage::buffer_dir(&s.root);

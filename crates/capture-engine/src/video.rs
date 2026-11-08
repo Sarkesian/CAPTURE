@@ -51,10 +51,17 @@ fn rate(q: Quality, w: u32, h: u32, fps: u32) -> Rate {
 }
 
 impl VideoEncoder {
-    pub fn open(gpu: Arc<Gpu>, w: u32, h: u32, fps: u32, q: Quality) -> Result<Self, String> {
+    /// `software_only`: skip GPU encoders and use Microsoft's software H.264 encoder.
+    pub fn open(gpu: Arc<Gpu>, w: u32, h: u32, fps: u32, q: Quality, software_only: bool) -> Result<Self, String> {
         let mut rejected = Vec::new();
-        for (name, hardware_input) in [("h264_nvenc", true), ("h264_amf", true), ("h264_mf", false)] {
-            match unsafe { Self::try_open(&gpu, name, hardware_input, w, h, fps, q) } {
+        let candidates: &[(&str, bool)] = if software_only {
+            rejected.push("GPU encoders: skipped (Software encoder chosen in Settings)".into());
+            &[("h264_mf", false)]
+        } else {
+            &[("h264_nvenc", true), ("h264_amf", true), ("h264_mf", false)]
+        };
+        for &(name, hardware_input) in candidates {
+            match unsafe { Self::try_open(&gpu, name, hardware_input, w, h, fps, q, software_only) } {
                 Ok((ctx, input, hardware)) => {
                     let info = EncoderInfo { name: name.into(), hardware, width: w, height: h, fps, rejected };
                     return Ok(Self { ctx, input, gpu, pkt: unsafe { ff::av_packet_alloc() }, info });
@@ -62,10 +69,13 @@ impl VideoEncoder {
                 Err(e) => rejected.push(format!("{name}: {e}")),
             }
         }
-        rejected.push("h264_qsv: not implemented in this build".into());
+        if !software_only {
+            rejected.push("h264_qsv: not implemented in this build".into());
+        }
         Err(format!("No H.264 encoder could be started. {}", rejected.join("; ")))
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn try_open(
         gpu: &Gpu,
         name: &str,
@@ -74,13 +84,20 @@ impl VideoEncoder {
         h: u32,
         fps: u32,
         q: Quality,
+        software_only: bool,
     ) -> Result<(*mut ff::AVCodecContext, Input, bool), String> {
         let codec = ff::avcodec_find_encoder_by_name(av::cstr(name).as_ptr());
         if codec.is_null() {
             return Err("not available in this FFmpeg build".into());
         }
         // For MF try the hardware MFT first, then Microsoft's software encoder.
-        let attempts: &[bool] = if gpu_input { &[true] } else { &[true, false] };
+        let attempts: &[bool] = if gpu_input {
+            &[true]
+        } else if software_only {
+            &[false]
+        } else {
+            &[true, false]
+        };
         let mut last = String::new();
         for &hw in attempts {
             let mut ctx = ff::avcodec_alloc_context3(codec);

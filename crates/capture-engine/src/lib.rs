@@ -271,6 +271,7 @@ impl Engine {
                 old.target != cfg.target
                     || old.fps != cfg.fps
                     || old.quality != cfg.quality
+                    || old.encoder != cfg.encoder
                     || old.capture_cursor != cfg.capture_cursor
                     || !old.audio.same_sources(&cfg.audio)
                     || old.capture_root != cfg.capture_root
@@ -791,6 +792,7 @@ fn settings_for_window(cfg: &EngineConfig, w: &WindowTarget, detected_by: Option
         source: SourceKind::Window(w.hwnd as isize),
         fps: cfg.fps.clamp(10, 240),
         quality: cfg.quality,
+        software_encoder: cfg.encoder == EncoderChoice::Software,
         cursor: cfg.capture_cursor,
         audio,
         mix: mix_of(cfg),
@@ -840,6 +842,7 @@ fn resolve(cfg: &EngineConfig) -> Result<Settings, Unresolved> {
                 source: SourceKind::Monitor(m.handle),
                 fps: cfg.fps.clamp(10, 240),
                 quality: cfg.quality,
+                software_encoder: cfg.encoder == EncoderChoice::Software,
                 cursor: cfg.capture_cursor,
                 audio,
                 mix: mix_of(cfg),

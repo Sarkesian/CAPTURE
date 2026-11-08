@@ -16,7 +16,7 @@ const check = (ok, what) => { console.log(`${ok ? 'PASS' : 'FAIL'}  ${what}`); i
 async function connect() {
   for (let i = 0; i < 60; i++) {
     try {
-      const page = (await (await fetch('http://127.0.0.1:9333/json')).json()).find(t => t.type === 'page');
+      const page = (await (await fetch('http://127.0.0.1:9333/json')).json()).find(t => t.type === 'page' && !t.url.includes('#overlay'));
       if (page) return page.webSocketDebuggerUrl;
     } catch {}
     await sleep(500);
