@@ -17,7 +17,7 @@ use settings::AppSettings;
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use worker::Worker;
 
@@ -78,7 +78,97 @@ fn update_settings(app: AppHandle, state: State<AppState>, settings: AppSettings
         state.worker.send(Command::SetReplay { enabled: s.replay_enabled })?;
     }
     refresh_tray(&app);
+    allow_media(&app, &s.capture_root);
+    let _ = app.emit("settings", &s); // keep every window (main + overlay) in sync
     Ok(s)
+}
+
+/// Let the webviews play/view files inside the capture folder only (reviews, clips, thumbs).
+fn allow_media(app: &AppHandle, root: &str) {
+    if !root.trim().is_empty() {
+        let _ = app.asset_protocol_scope().allow_directory(root, true);
+    }
+}
+
+/// Any engine command from either window; the answer arrives as an `engine` event whose
+/// `re` equals the returned id.
+#[tauri::command]
+fn engine_command(state: State<AppState>, command: Command) -> Result<u64, String> {
+    if matches!(command, Command::Configure(_) | Command::Shutdown) {
+        return Err("Not allowed from the UI".into());
+    }
+    state.worker.send(command)
+}
+
+#[tauri::command]
+fn toggle_overlay(app: AppHandle) {
+    toggle_overlay_window(&app);
+}
+
+#[tauri::command]
+fn hide_overlay(app: AppHandle) {
+    if let Some(w) = app.get_webview_window("overlay") {
+        let _ = w.hide();
+    }
+}
+
+/// Bring the full settings window forward, optionally on a given tab.
+#[tauri::command]
+fn show_main(app: AppHandle, tab: Option<String>) {
+    hide_overlay(app.clone());
+    show_window(&app);
+    if let Some(t) = tab {
+        let _ = app.emit_to("main", "goto", t);
+    }
+}
+
+/// Move a clip to the Recycle Bin (recoverable). Only files inside the capture folder.
+#[tauri::command]
+fn delete_clip(state: State<AppState>, path: String) -> Result<(), String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::*;
+    let p = inside_root(&state, &path)?;
+    if !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp4")) {
+        return Err("Only video files can be deleted from here.".into());
+    }
+    let mut from: Vec<u16> = p.as_os_str().to_string_lossy().encode_utf16().collect();
+    from.extend([0, 0]);
+    let mut op = SHFILEOPSTRUCTW {
+        wFunc: FO_DELETE,
+        pFrom: PCWSTR(from.as_ptr()),
+        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI).0 as u16,
+        ..Default::default()
+    };
+    let r = unsafe { SHFileOperationW(&mut op) };
+    if r != 0 || op.fAnyOperationsAborted.as_bool() {
+        return Err(format!("Could not move the clip to the Recycle Bin (code {r})."));
+    }
+    let mut side = p.as_os_str().to_owned();
+    side.push(".markers.json");
+    let _ = std::fs::remove_file(side);
+    Ok(())
+}
+
+fn toggle_overlay_window(app: &AppHandle) {
+    let Some(w) = app.get_webview_window("overlay") else { return };
+    if w.is_visible().unwrap_or(false) {
+        let _ = w.hide();
+        return;
+    }
+    // Centre on the monitor under the mouse (the one being played on).
+    if let Ok(cursor) = app.cursor_position() {
+        if let Ok(Some(mon)) = app.monitor_from_point(cursor.x, cursor.y) {
+            if let Ok(size) = w.outer_size() {
+                let (mp, ms) = (mon.position(), mon.size());
+                let x = mp.x + (ms.width as i32 - size.width as i32) / 2;
+                let y = mp.y + (ms.height as i32 - size.height as i32) / 2;
+                let _ = w.set_position(PhysicalPosition::new(x, y));
+            }
+        }
+    }
+    let _ = w.show();
+    let _ = w.set_focus();
+    let _ = app.emit_to("overlay", "overlay_shown", ());
 }
 
 #[tauri::command]
@@ -234,6 +324,10 @@ fn refresh_tray(app: &AppHandle) {
 fn on_message(app: &AppHandle, m: Message) {
     let state = app.state::<AppState>();
     match &m.event {
+        Event::HotkeyPressed { action: capture_protocol::HotkeyAction::ToggleOverlay } => {
+            let a = app.clone();
+            let _ = app.run_on_main_thread(move || toggle_overlay_window(&a));
+        }
         Event::State(s) => {
             *state.last_state.lock().unwrap() = Some(s.clone());
             *state.engine_down.lock().unwrap() = None;
@@ -249,10 +343,11 @@ fn build_tray(app: &AppHandle) -> tauri::Result<Tray> {
     let save = MenuItem::with_id(app, "save", "Save replay", false, None::<&str>)?;
     let toggle = MenuItem::with_id(app, "toggle", "Turn instant replay on", true, None::<&str>)?;
     let show = MenuItem::with_id(app, "show", "Show CAPTURE", true, None::<&str>)?;
+    let overlay = MenuItem::with_id(app, "overlay", "Open overlay", true, None::<&str>)?;
     let quit_i = MenuItem::with_id(app, "quit", "Quit CAPTURE", true, None::<&str>)?;
     let sep1 = PredefinedMenuItem::separator(app)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(app, &[&status, &sep1, &save, &toggle, &show, &sep2, &quit_i])?;
+    let menu = Menu::with_items(app, &[&status, &sep1, &save, &toggle, &overlay, &show, &sep2, &quit_i])?;
     let icon = TrayIconBuilder::with_id("main")
         .icon(Image::from_bytes(include_bytes!("../icons/tray-idle.png"))?)
         .tooltip("CAPTURE")
@@ -269,6 +364,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<Tray> {
                     let _ = set_replay_inner(app, &state, !on);
                 }
                 "show" => show_window(app),
+                "overlay" => toggle_overlay_window(app),
                 "quit" => quit(app),
                 _ => {}
             }
@@ -311,7 +407,12 @@ fn main() {
             reveal_path,
             open_capture_folder,
             copy_text,
-            quit_app
+            quit_app,
+            engine_command,
+            toggle_overlay,
+            hide_overlay,
+            show_main,
+            delete_clip
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -321,6 +422,24 @@ fn main() {
                 .min_inner_size(760.0, 600.0)
                 .data_directory(data_dir.join("webview"))
                 .build()?;
+            // The in-game overlay: created once, hidden until its hotkey. A hidden WebView2 does
+            // not render, so it costs nothing while you play.
+            let overlay = WebviewWindowBuilder::new(app, "overlay", WebviewUrl::App("index.html#overlay".into()))
+                .title("CAPTURE overlay")
+                .inner_size(1120.0, 720.0)
+                .decorations(false)
+                .always_on_top(true)
+                .skip_taskbar(true)
+                .resizable(false)
+                .visible(false)
+                .data_directory(data_dir.join("webview"))
+                .build()?;
+            overlay.on_window_event(|e| {
+                if let WindowEvent::CloseRequested { api, .. } = e {
+                    api.prevent_close();
+                }
+            });
+            allow_media(&handle, &app.state::<AppState>().settings.lock().unwrap().capture_root.clone());
             {
                 let handle = handle.clone();
                 window.on_window_event(move |e| {

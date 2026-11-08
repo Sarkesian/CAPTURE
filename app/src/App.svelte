@@ -6,7 +6,7 @@
   import SettingsTab from './tabs/SettingsTab.svelte';
 
   type Tab = 'capture' | 'library' | 'settings';
-  let tab = $state<Tab>('capture');
+  const tab = $derived(app.tab);
   let failed = $state<string | null>(null);
   const tabs: { id: Tab; label: string }[] = [
     { id: 'capture', label: 'Capture' },
@@ -17,7 +17,7 @@
   onMount(() => { init().catch(e => (failed = String(e))); });
 
   function select(t: Tab) {
-    tab = t;
+    app.tab = t;
     if (t === 'library') refreshClips();
   }
 

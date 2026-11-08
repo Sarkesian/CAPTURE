@@ -55,6 +55,7 @@ export interface EngineState {
   hotkeys: HotkeyState[];
   markers: Marker[];
   now_secs: number;
+  session_secs: number | null;
   leftover_buffer_bytes: number;
   free_bytes: number | null;
 }
@@ -72,6 +73,8 @@ export interface SavedClip {
   audio_tracks: string[];
 }
 
+export interface Review { path: string; start: number; end: number; game: string }
+
 export interface ClipEntry { path: string; name: string; game: string; bytes: number; modified_ms: number }
 
 export type EngineMessage = { v: number; re?: number } & (
@@ -84,4 +87,7 @@ export type EngineMessage = { v: number; re?: number } & (
   | { event: 'error'; data: { message: string } }
   | { event: 'hotkey_pressed'; data: { action: HotkeyAction } }
   | { event: 'marker_added'; data: Marker }
+  | { event: 'review_ready'; data: Review }
+  | { event: 'review_failed'; data: { message: string } }
+  | { event: 'clip_info'; data: { path: string; thumb: string | null; duration_secs: number | null; error: string | null } }
 );

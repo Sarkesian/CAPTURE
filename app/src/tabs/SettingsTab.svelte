@@ -28,11 +28,11 @@
       {e.hotkey.registered ? `✓ ${e.hotkey.combo} is active.` : e.hotkey.message}
     </p>
   {/if}
-  {#each [['add_marker', 'Add marker', 'Bookmarks the moment without saving a clip.', 'marker'], ['toggle_overlay', 'Open overlay', 'Shows CAPTURE on top of your game.', 'overlay']] as [action, title, hint, key] (action)}
+  {#each [['add_marker', 'Add marker', 'Bookmarks the moment without saving a clip.', 'marker'], ['toggle_overlay', 'Open overlay', 'Shows CAPTURE on top of your game.', 'overlay'], ['toggle_session', 'Start/stop recording', 'Records a full session of any length (optional).', 'session']] as [action, title, hint, key] (action)}
     {@const hs = e?.hotkeys.find(h => h.action === action)}
     <div class="field">
       <div class="grow"><div>{title}</div><div class="muted small">{hint}</div></div>
-      <HotkeyField value={s.hotkeys[key as 'marker' | 'overlay']} onchange={v => updateSettings({ hotkeys: { ...s.hotkeys, [key]: v } })} />
+      <HotkeyField value={s.hotkeys[key as 'marker' | 'overlay' | 'session']} onchange={v => updateSettings({ hotkeys: { ...s.hotkeys, [key]: v } })} />
     </div>
     {#if hs && hs.combo && !hs.registered && hs.message}<p class="small warn">{hs.message}</p>{/if}
   {/each}

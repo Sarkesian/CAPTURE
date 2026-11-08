@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { ClipEntry, DisplayTarget, EngineMessage, EngineState, SavedClip, Settings, WindowTarget } from './types';
+import type { ClipEntry, DisplayTarget, EngineMessage, EngineState, Review, SavedClip, Settings, WindowTarget } from './types';
 
 interface Toast { id: number; text: string; kind: 'ok' | 'error' | 'info' }
 
@@ -14,6 +14,11 @@ export const app = $state({
   clips: [] as ClipEntry[],
   toasts: [] as Toast[],
   dataDir: '',
+  review: null as Review | null,
+  reviewLoading: false,
+  reviewError: null as string | null,
+  clipInfo: {} as Record<string, { thumb: string | null; duration: number | null }>,
+  tab: 'capture' as 'capture' | 'library' | 'settings',
 });
 
 let toastId = 0;
@@ -41,6 +46,7 @@ export async function init() {
   await listen<EngineMessage>('engine', e => onEngine(e.payload));
   await listen<Settings>('settings', e => { app.settings = e.payload; });
   await listen<string>('engine_down', e => { app.engineDown = e.payload; });
+  await listen<string>('goto', e => { app.tab = e.payload as typeof app.tab; refreshClips(); });
   refreshTargets();
   refreshClips();
 }
@@ -77,6 +83,21 @@ function onEngine(m: EngineMessage) {
     case 'error':
       toast(m.data.message, 'info', 7000);
       break;
+    case 'marker_added':
+      toast(`Marker added at ${m.data.at}`, 'ok', 2500);
+      break;
+    case 'review_ready':
+      app.review = m.data;
+      app.reviewLoading = false;
+      app.reviewError = null;
+      break;
+    case 'review_failed':
+      app.reviewLoading = false;
+      app.reviewError = m.data.message;
+      break;
+    case 'clip_info':
+      app.clipInfo[m.data.path] = { thumb: m.data.thumb, duration: m.data.duration_secs };
+      break;
   }
 }
 
@@ -85,6 +106,32 @@ export async function updateSettings(patch: Partial<Settings>) {
   const next = await call<Settings>('update_settings', { settings: { ...app.settings, ...patch } });
   if (next) app.settings = next;
 }
+
+/** Send any engine command; the reply arrives as an engine event with `re` = returned id. */
+export function engine(cmd: string, args?: Record<string, unknown>) {
+  return call<number>('engine_command', { command: args === undefined ? { cmd } : { cmd, args } });
+}
+export const addMarker = () => engine('add_marker', {});
+export const toggleSession = () => engine(app.engine?.session_secs != null ? 'stop_session' : 'start_session');
+export function prepareReview() {
+  app.reviewLoading = true;
+  app.reviewError = null;
+  return engine('prepare_review');
+}
+export const releaseReview = () => { app.review = null; return engine('release_review'); };
+export const saveRange = (start: number, end: number) => engine('save_range', { start, end });
+export function requestClipInfo(path: string) {
+  if (!(path in app.clipInfo)) {
+    app.clipInfo[path] = { thumb: null, duration: null };
+    engine('clip_info', { path });
+  }
+}
+export async function deleteClip(path: string) {
+  const ok = await call('delete_clip', { path });
+  if (ok !== undefined) { toast('Moved to the Recycle Bin', 'ok', 3000); refreshClips(); }
+}
+export const showMain = (tab?: string) => call('show_main', { tab });
+export const hideOverlay = () => call('hide_overlay');
 
 export const setReplay = (enabled: boolean) => call('set_replay', { enabled }).then(() => { if (app.settings) app.settings.replay_enabled = enabled; });
 export const saveReplay = () => call('save_replay');

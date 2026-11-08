@@ -16,7 +16,8 @@ tauri-build = { version = "2.7.4", features = [] }
 capture-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tauri = { version = "2.12.5", features = ["tray-icon", "image-png"] }
+tauri = { version = "2.12.5", features = ["tray-icon", "image-png", "protocol-asset"] }
 tauri-plugin-dialog = "2.8.4"
 tauri-plugin-clipboard-manager = "2.5.0"
 tauri-plugin-single-instance = "2.5.5"
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_UI_Shell"] }

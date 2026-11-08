@@ -58,6 +58,32 @@ fn even(v: i32) -> u32 {
     (v.max(2) as u32) & !1
 }
 
+/// The game's client area inside what WGC captures for a window (WGC includes the title bar
+/// and borders of windowed apps): (x, y, width, height) in captured pixels. `None` when the
+/// window is minimized or the information is unavailable.
+pub fn client_crop(hwnd: isize) -> Option<(i32, i32, i32, i32)> {
+    use windows::Win32::Foundation::{POINT, RECT};
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+    let h = HWND(hwnd as *mut _);
+    unsafe {
+        let mut frame = RECT::default();
+        DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &mut frame as *mut _ as *mut _, std::mem::size_of::<RECT>() as u32).ok()?;
+        let mut client = RECT::default();
+        GetClientRect(h, &mut client).ok()?;
+        let mut origin = POINT { x: 0, y: 0 };
+        if !ClientToScreen(h, &mut origin).as_bool() {
+            return None;
+        }
+        let (cw, ch) = (client.right - client.left, client.bottom - client.top);
+        if cw < 16 || ch < 16 {
+            return None;
+        }
+        Some(((origin.x - frame.left).max(0), (origin.y - frame.top).max(0), cw, ch))
+    }
+}
+
 impl Capture {
     pub fn start(gpu: &Gpu, source: Source, cursor: bool) -> Result<Self, String> {
         let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
@@ -70,7 +96,16 @@ impl Capture {
         }
         .map_err(|e| format!("This window or display cannot be captured ({e}). Try Display capture."))?;
         let size = item.Size().map_err(|e| e.to_string())?;
-        let (width, height) = (even(size.Width), even(size.Height));
+        // Windows: record only the game's client area (no title bar / borders).
+        let window = match source {
+            Source::Window(h) => Some(h),
+            Source::Monitor(_) => None,
+        };
+        let crop0 = window.and_then(client_crop);
+        let (width, height) = match crop0 {
+            Some((_, _, w, h)) => (even(w.min(size.Width)), even(h.min(size.Height))),
+            None => (even(size.Width), even(size.Height)),
+        };
 
         let winrt_device: IDirect3DDevice = unsafe {
             let dxgi: IDXGIDevice = gpu.device.cast().map_err(|e| e.to_string())?;
@@ -113,15 +148,19 @@ impl Capture {
                         l.last_size = content;
                         let _ = pool.Recreate(dev, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, content);
                     }
+                    let (cx, cy) = match window.and_then(client_crop) {
+                        Some((x, y, _, _)) => (x.max(0) as u32, y.max(0) as u32),
+                        None => (0, 0),
+                    };
                     let b = D3D11_BOX {
-                        left: 0,
-                        top: 0,
+                        left: cx,
+                        top: cy,
                         front: 0,
-                        right: (content.Width.max(0) as u32).min(width),
-                        bottom: (content.Height.max(0) as u32).min(height),
+                        right: (content.Width.max(0) as u32).min(cx + width),
+                        bottom: (content.Height.max(0) as u32).min(cy + height),
                         back: 1,
                     };
-                    if b.right > 0 && b.bottom > 0 {
+                    if b.right > b.left && b.bottom > b.top {
                         unsafe { context.CopySubresourceRegion(&l.texture, 0, 0, 0, 0, &tex, 0, Some(&b)) };
                         l.has_frame = true;
                         frames.fetch_add(1, Ordering::Relaxed);

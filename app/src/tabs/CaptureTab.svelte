@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { invoke } from '@tauri-apps/api/core';
   import { open } from '@tauri-apps/plugin-dialog';
   import Toggle from '../components/Toggle.svelte';
   import Segmented from '../components/Segmented.svelte';
@@ -104,6 +105,7 @@
   </div>
   <div class="row save-row">
     <button class="primary big" disabled={e?.status !== 'buffering'} onclick={saveReplay}>Save clip</button>
+    <button onclick={() => invoke('toggle_overlay')}>Open overlay{s.hotkeys.overlay ? ` (${s.hotkeys.overlay})` : ''}</button>
     <span class="muted small">
       or press <kbd>{s.save_hotkey || 'no hotkey set'}</kbd>
       {#if e?.hotkey && !e.hotkey.registered && e.hotkey.message}

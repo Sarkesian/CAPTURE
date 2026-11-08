@@ -1,4 +1,4 @@
-# CAPTURE quick start (v0.1, Phase 1 playtest)
+# CAPTURE quick start (v0.2)
 
 1. **Start** `CAPTURE.exe`. No installer is needed. Its own settings live in the `data` folder next to it.
 2. **Capture tab → What to record** is set to **Auto (games)**. Start a game and CAPTURE finds it by itself
@@ -12,6 +12,19 @@
    - a small notice says **Clip saved**, but only after the file has been written *and* checked;
    - the clip is in `D:\Captures\Clips\<Game Name>\YYYY-MM-DD_HH-MM-SS_<Game>_Clip.mp4`;
    - **Open file**, **Show in folder** and **Copy path** take you straight to it.
+
+## In-game overlay (Alt+F11)
+
+Press **Alt+F11** while playing (Esc closes it). Recording keeps running the whole time.
+- **Save Replay**: same as Alt+F10.
+- **Add Marker**: bookmark this moment (also **Alt+F8**, with a short sound that is never recorded).
+- **Review Recording**: watch your recent gameplay, click a marker, press **Create clip**, drag the two handles, **Save clip**.
+  **Save around** on a marker saves the moments around it in one click.
+- **Start Recording**: a full session of any length, saved to `Sessions\<Game>\` when you stop.
+- Recent clips with thumbnails, quick settings, and a shortcut to the full settings.
+
+Over **exclusive fullscreen** games Windows can't show the overlay without leaving the game. Use borderless, or just use
+the hotkeys, which always work.
 
 ## What is in a clip
 
@@ -38,5 +51,4 @@ Editors that show every audio track: mute **Preview Mix**, or you will hear the 
 
 ## Not in this build yet
 
-Microphone and voice-chat tracks, the WAV "Editor audio files" export, automatic game detection,
-thumbnails, and an installer.
+Microphone and voice-chat tracks, the WAV "Editor audio files" export, screenshots, per-game settings, and an installer.
