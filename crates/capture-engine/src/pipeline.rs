@@ -70,6 +70,19 @@ pub struct Shared {
     /// Segments + file held by the current review snapshot.
     review: Mutex<Option<(Vec<u64>, PathBuf)>>,
     review_seq: AtomicU64,
+    /// Start of the full-session recording in progress (timeline secs).
+    pub session_start: Mutex<Option<f64>>,
+    /// Set by the mux thread when low disk space forces the session to end.
+    pub session_must_stop: AtomicBool,
+}
+
+/// Pin id reserved for full-session recording (never released by the marker budget).
+pub const SESSION_PIN: u64 = u64::MAX;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SaveKind {
+    Clip,
+    Session,
 }
 
 /// Pins may hold at most this share of the buffer cap; older marker protection is released
@@ -146,8 +159,8 @@ impl Shared {
         let budget = (cap as f64 * PIN_BUDGET_SHARE) as u64;
         let mut ring = self.ring.lock().unwrap();
         let mut released = Vec::new();
-        while ring.pinned_bytes() > budget {
-            let Some(id) = ring.oldest_pin() else { break };
+        while ring.marker_pinned_bytes(SESSION_PIN) > budget {
+            let Some(id) = ring.oldest_pin_except(SESSION_PIN) else { break };
             ring.unpin(id);
             released.push(id);
         }
@@ -285,6 +298,8 @@ impl Pipeline {
             next_marker: AtomicU64::new(1),
             review: Mutex::new(None),
             review_seq: AtomicU64::new(1),
+            session_start: Mutex::new(None),
+            session_must_stop: AtomicBool::new(false),
         });
 
         let mux_thread = {
@@ -335,6 +350,7 @@ impl Pipeline {
     pub fn request_save(
         &self,
         range: Option<(f64, f64)>,
+        kind: SaveKind,
         done: impl FnOnce(Result<(SavedClip, f64), String>) + Send + 'static,
         save_id: u64,
     ) -> f64 {
@@ -347,13 +363,44 @@ impl Pipeline {
         std::thread::Builder::new()
             .name(format!("save-{save_id}"))
             .spawn(move || {
-                let r = do_save(&shared, t_end, secs, save_id);
+                let r = do_save(&shared, t_end, secs, save_id, kind);
                 shared.saves_in_progress.fetch_sub(1, Ordering::SeqCst);
                 shared.cleanup_if_idle();
                 done(r.map(|c| (c, secs)));
             })
             .unwrap();
         secs
+    }
+
+    /// Begin a full-session recording from now. Returns false if one is already running.
+    pub fn start_session(&self) -> bool {
+        let mut s = self.shared.session_start.lock().unwrap();
+        if s.is_some() {
+            return false;
+        }
+        let t = self.shared.now();
+        *s = Some(t);
+        self.shared.session_must_stop.store(false, Ordering::SeqCst);
+        self.shared.ring.lock().unwrap().pin(SESSION_PIN, t, f64::INFINITY);
+        true
+    }
+
+    /// Finish the session: saves [start, now] to `Sessions\<Game>\`. The pin is released once
+    /// the save has protected its own segments.
+    pub fn stop_session(&self, done: impl FnOnce(Result<(SavedClip, f64), String>) + Send + 'static, save_id: u64) -> Option<f64> {
+        let start = self.shared.session_start.lock().unwrap().take()?;
+        let end = self.shared.now();
+        let shared = self.shared.clone();
+        let secs = self.request_save(
+            Some((start, end)),
+            SaveKind::Session,
+            move |r| {
+                shared.ring.lock().unwrap().unpin(SESSION_PIN);
+                done(r)
+            },
+            save_id,
+        );
+        Some(secs)
     }
 
     /// Build a playable snapshot of all closed buffer segments (stream copy, no re-encode) on a
@@ -489,6 +536,9 @@ fn run_mux(shared: Arc<Shared>, rx: Receiver<Packet>, streams: Vec<StreamDesc>) 
             }
             let free = storage::free_bytes(&shared.session_dir).unwrap_or(u64::MAX);
             if free < live.min_free_bytes {
+                if shared.session_start.lock().unwrap().is_some() {
+                    shared.session_must_stop.store(true, Ordering::SeqCst);
+                }
                 if !disk_paused {
                     disk_paused = true;
                     shared.set_attention(Some(format!(
@@ -547,7 +597,7 @@ fn record_markers_in_clip(shared: &Shared, clip: &std::path::Path, start: f64, e
     let _ = std::fs::write(std::path::PathBuf::from(side), serde_json::to_vec_pretty(&doc).unwrap());
 }
 
-fn do_save(shared: &Shared, t_end: f64, secs: f64, save_id: u64) -> Result<SavedClip, String> {
+fn do_save(shared: &Shared, t_end: f64, secs: f64, save_id: u64, kind: SaveKind) -> Result<SavedClip, String> {
     let sel = {
         let mut ring = shared.ring.lock().unwrap();
         let sel = ring.select(t_end, secs).ok_or("Nothing has been buffered yet. Wait a moment and try again.")?;
@@ -576,9 +626,12 @@ fn do_save(shared: &Shared, t_end: f64, secs: f64, save_id: u64) -> Result<Saved
         (all, segs.into_iter().map(|(_, p, st)| (p, st)).collect::<Vec<_>>())
     };
     let result = (|| {
-        let dir = storage::clips_dir(&shared.root, &shared.game_name);
-        std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create the clips folder: {e}"))?;
-        let name = storage::clip_file_name(&storage::local_stamp(), &shared.game_name, "Clip");
+        let (dir, label) = match kind {
+            SaveKind::Clip => (storage::clips_dir(&shared.root, &shared.game_name), "Clip"),
+            SaveKind::Session => (storage::sessions_dir(&shared.root, &shared.game_name), "Session"),
+        };
+        std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create the folder {}: {e}", dir.display()))?;
+        let name = storage::clip_file_name(&storage::local_stamp(), &shared.game_name, label);
         let path = storage::reserve_unique_path(&dir, &name).map_err(|e| format!("Cannot create the clip file: {e}"))?;
         let (clip, actual_start) = save::remux(&segs, sel.start, sel.end - secs, sel.end, &shared.track_names, &path)?;
         record_markers_in_clip(shared, &clip.path, actual_start, sel.end);

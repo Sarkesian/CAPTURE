@@ -17,6 +17,10 @@ pub fn clips_dir(root: &Path, game: &str) -> PathBuf {
     root.join("Clips").join(folder_name(game))
 }
 
+pub fn sessions_dir(root: &Path, game: &str) -> PathBuf {
+    root.join("Sessions").join(folder_name(game))
+}
+
 /// Folder-safe, human-readable name: keeps spaces and most punctuation, strips characters
 /// Windows forbids, trailing dots/spaces and reserved device names. Never empty.
 pub fn folder_name(name: &str) -> String {

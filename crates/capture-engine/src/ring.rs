@@ -132,6 +132,22 @@ impl Ring {
         self.pins.iter().min_by(|a, b| a.1.total_cmp(&b.1)).map(|p| p.0)
     }
 
+    pub fn oldest_pin_except(&self, keep: u64) -> Option<u64> {
+        self.pins.iter().filter(|p| p.0 != keep).min_by(|a, b| a.1.total_cmp(&b.1)).map(|p| p.0)
+    }
+
+    /// Bytes held by pins other than `except` (the session pin has no budget).
+    pub fn marker_pinned_bytes(&self, except: u64) -> u64 {
+        self.segments
+            .iter()
+            .filter(|s| {
+                let end = s.end.unwrap_or(f64::INFINITY);
+                self.pins.iter().any(|&(id, a, b)| id != except && s.start < b && end > a)
+            })
+            .map(|s| s.bytes)
+            .sum()
+    }
+
     /// Is footage for timeline time `t` still in the buffer?
     pub fn covers(&self, t: f64) -> bool {
         self.segments.iter().any(|s| s.start <= t && s.end.is_none_or(|e| t < e))

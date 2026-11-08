@@ -60,6 +60,7 @@ fn main() {
             let cmd = match action {
                 HotkeyAction::SaveReplay => Some(Command::SaveReplay),
                 HotkeyAction::AddMarker => Some(Command::AddMarker { label: None }),
+                HotkeyAction::ToggleSession => Some(Command::StartSession), // engine toggles
                 _ => None,
             };
             match cmd {
@@ -83,7 +84,7 @@ fn main() {
                 if line.trim().is_empty() {
                     continue;
                 }
-                match serde_json::from_str::<Request>(&line) {
+                match Request::parse(&line) {
                     Ok(r) if r.v == PROTOCOL_VERSION => {
                         let _ = tx.send(Input::Req(Some(r.id), r.cmd));
                     }

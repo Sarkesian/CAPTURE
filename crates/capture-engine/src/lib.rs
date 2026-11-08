@@ -28,7 +28,7 @@ use capture_protocol::*;
 
 use audio::SourceSpec;
 use overlay::{Kind, Notice, Overlay};
-use pipeline::{Live, Pipeline, Settings, SourceKind};
+use pipeline::{Live, Pipeline, SaveKind, Settings, SourceKind};
 
 pub type Emit = Arc<dyn Fn(Message) + Send + Sync>;
 
@@ -117,10 +117,14 @@ impl Engine {
                 if enabled {
                     self.start_pipeline();
                 } else {
+                    self.stop_session(None);
                     self.pipeline = None;
                     self.start_error = None;
                 }
             }
+            Command::StartSession if re.is_none() => self.toggle_session(re), // hotkey
+            Command::StartSession => self.start_session(re),
+            Command::StopSession => self.stop_session(re),
             Command::SaveReplay => self.save(re, None),
             Command::SaveRange { start, end } => self.save(re, Some((start, end))),
             Command::PrepareReview => match &self.pipeline {
@@ -232,6 +236,7 @@ impl Engine {
     }
 
     fn start_pipeline(&mut self) {
+        self.stop_session(None);
         self.pipeline = None; // finalize any previous session first
         self.start_error = None;
         let Some(cfg) = self.cfg.clone() else {
@@ -245,6 +250,7 @@ impl Engine {
     }
 
     fn launch(&mut self, cfg: &EngineConfig, s: Settings) {
+        self.stop_session(None);
         self.pipeline = None;
         let (name, display) = (s.game_name.clone(), matches!(s.source, SourceKind::Monitor(_)));
         match Pipeline::start(s, live_of(cfg)) {
@@ -257,6 +263,64 @@ impl Engine {
                 self.notice(Kind::Recording, title, format!("{hk} saves the last {}", fmt_secs(live_of(cfg).replay_secs as f64)));
             }
             Err(e) => self.start_error = Some(failed(e)),
+        }
+    }
+
+    fn start_session(&mut self, re: Option<u64>) {
+        let Some(p) = self.pipeline.as_ref().filter(|p| !p.target_gone()) else {
+            let msg = if self.replay_on { "Nothing is being captured right now." } else { "Turn on recording first." };
+            self.send(re, Event::Error { message: format!("Can't start a recording: {msg}") });
+            return;
+        };
+        if p.start_session() {
+            let game = p.shared.game_name.clone();
+            self.notice(Kind::Recording, format!("Recording session · {game}"), "Press the same key again to stop and save it".into());
+        }
+    }
+
+    /// Stops and saves a running session (no-op when none). Used by the command, the hotkey,
+    /// and automatically when the game closes, recording is turned off, disk runs low, or the
+    /// worker shuts down.
+    fn stop_session(&mut self, re: Option<u64>) {
+        let Some(p) = &self.pipeline else { return };
+        if p.shared.session_start.lock().unwrap().is_none() {
+            return;
+        }
+        let id = self.next_save_id;
+        self.next_save_id += 1;
+        let emit = self.emit.clone();
+        let overlay = self.overlay.clone().filter(|_| self.cfg.as_ref().is_some_and(|c| c.overlay));
+        let game = p.shared.game_name.clone();
+        let requested = p.stop_session(
+            move |r| {
+                let (ev, n) = match r {
+                    Ok((clip, _)) => {
+                        let n = Notice { kind: Kind::Saved, title: format!("Session saved · {}", fmt_secs(clip.duration_secs)), detail: game };
+                        (Event::SaveFinished(clip), n)
+                    }
+                    Err(message) => (
+                        Event::SaveFailed { save_id: id, message: message.clone() },
+                        Notice { kind: Kind::Failed, title: "Session not saved".into(), detail: message },
+                    ),
+                };
+                if let Some(o) = overlay {
+                    o.show(n);
+                }
+                emit(Message::new(None, ev));
+            },
+            id,
+        );
+        if let Some(secs) = requested {
+            self.send(re, Event::SaveStarted { save_id: id, requested_secs: secs });
+        }
+    }
+
+    fn toggle_session(&mut self, re: Option<u64>) {
+        let running = self.pipeline.as_ref().is_some_and(|p| p.shared.session_start.lock().unwrap().is_some());
+        if running {
+            self.stop_session(re)
+        } else {
+            self.start_session(re)
         }
     }
 
@@ -301,6 +365,7 @@ impl Engine {
         let game = p.shared.game_name.clone();
         let requested = p.request_save(
             range,
+            SaveKind::Clip,
             move |r| {
                 let (ev, notice) = match r {
                     Ok((clip, requested)) => {
@@ -338,6 +403,10 @@ impl Engine {
         }
         let Some(cfg) = self.cfg.clone() else { return };
         let closed = self.pipeline.as_ref().is_some_and(|p| p.target_gone());
+        let must_stop = self.pipeline.as_ref().is_some_and(|p| p.shared.session_must_stop.swap(false, Ordering::SeqCst));
+        if closed || must_stop {
+            self.stop_session(None);
+        }
         if let CaptureTarget::Auto { games, ignore } = &cfg.target {
             if self.last_retry.elapsed().as_secs_f64() < 1.0 {
                 return;
@@ -404,6 +473,7 @@ impl Engine {
             hotkeys,
             markers: vec![],
             now_secs: 0.0,
+            session_secs: None,
             leftover_buffer_bytes,
             free_bytes,
         };
@@ -430,6 +500,7 @@ impl Engine {
         };
         let attention = sh.attention.lock().unwrap().clone();
         st.markers = sh.markers_now();
+        st.session_secs = sh.session_start.lock().unwrap().map(|s| ((sh.now() - s) * 10.0).round() / 10.0);
         st.now_secs = (sh.now() * 10.0).round() / 10.0;
         st.target_name = Some(sh.game_name.clone());
         st.target_exe = Some(sh.target_exe.clone());
@@ -500,6 +571,7 @@ impl Engine {
     }
 
     pub fn shutdown(&mut self) {
+        self.stop_session(None);
         if let Some(p) = &self.pipeline {
             // Let in-flight saves finish (bounded) before tearing down the session.
             let until = Instant::now() + std::time::Duration::from_secs(30);
@@ -512,13 +584,14 @@ impl Engine {
     }
 }
 
-/// Hotkey bindings handled by the worker. Session/screenshot keys are added when those
-/// features exist, so no key is ever registered for an action that does nothing.
+/// Hotkey bindings handled by the worker. The screenshot key is added when that feature
+/// exists, so no key is ever registered for an action that does nothing.
 pub fn bindings(cfg: &EngineConfig) -> hotkey::Bindings {
     vec![
         (HotkeyAction::SaveReplay, cfg.save_hotkey.clone()),
         (HotkeyAction::AddMarker, cfg.hotkeys.marker.clone()),
         (HotkeyAction::ToggleOverlay, cfg.hotkeys.overlay.clone()),
+        (HotkeyAction::ToggleSession, cfg.hotkeys.session.clone()),
     ]
 }
 

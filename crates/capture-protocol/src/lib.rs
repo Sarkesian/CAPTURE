@@ -46,6 +46,9 @@ pub enum Command {
     ReleaseReview,
     /// Save a clip of an exact timeline range (seconds), e.g. from the review timeline.
     SaveRange { start: f64, end: f64 },
+    /// Full-session recording, independent of the replay length (uses the same capture).
+    StartSession,
+    StopSession,
     /// Thumbnail + duration for a saved clip (answered with `ClipInfo`).
     ClipInfo { path: String },
     ListTargets,
@@ -287,6 +290,9 @@ pub struct EngineState {
     /// Session timeline position "now", seconds (for placing markers on a timeline).
     #[serde(default)]
     pub now_secs: f64,
+    /// Full-session recording in progress: seconds recorded so far.
+    #[serde(default)]
+    pub session_secs: Option<f64>,
     pub leftover_buffer_bytes: u64,
     pub free_bytes: Option<u64>,
 }
@@ -339,6 +345,28 @@ impl Request {
     pub fn new(id: u64, cmd: Command) -> Self {
         Self { v: PROTOCOL_VERSION, id, cmd }
     }
+
+    /// Lenient parse: `"args": {}` and a missing `args` mean the same thing, so clients need
+    /// not know which commands carry fields.
+    pub fn parse(line: &str) -> Result<Self, serde_json::Error> {
+        let mut v: serde_json::Value = serde_json::from_str(line)?;
+        let first = serde_json::from_value::<Request>(v.clone());
+        if first.is_ok() {
+            return first;
+        }
+        if let Some(o) = v.as_object_mut() {
+            match o.get("args") {
+                Some(a) if a.as_object().is_some_and(|m| m.is_empty()) => {
+                    o.remove("args");
+                }
+                None => {
+                    o.insert("args".into(), serde_json::json!({}));
+                }
+                _ => return first,
+            }
+        }
+        serde_json::from_value::<Request>(v).or(first)
+    }
 }
 
 impl Message {
@@ -359,6 +387,17 @@ mod tests {
         assert_eq!(serde_json::from_str::<Request>(&s).unwrap(), r);
         let s = serde_json::to_string(&Request::new(8, Command::SaveReplay)).unwrap();
         assert_eq!(s, r#"{"v":1,"id":8,"cmd":"save_replay"}"#);
+    }
+
+    #[test]
+    fn args_may_be_omitted_or_empty_for_any_command() {
+        let a = Request::parse(r#"{"v":1,"id":1,"cmd":"start_session","args":{}}"#).unwrap();
+        assert_eq!(a.cmd, Command::StartSession);
+        let b = Request::parse(r#"{"v":1,"id":2,"cmd":"add_marker"}"#).unwrap();
+        assert_eq!(b.cmd, Command::AddMarker { label: None });
+        let c = Request::parse(r#"{"v":1,"id":3,"cmd":"add_marker","args":{"label":"boss"}}"#).unwrap();
+        assert_eq!(c.cmd, Command::AddMarker { label: Some("boss".into()) });
+        assert!(Request::parse(r#"{"v":1,"id":4,"cmd":"save_range"}"#).is_err());
     }
 
     #[test]
