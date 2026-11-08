@@ -127,6 +127,7 @@ pub fn action_label(a: HotkeyAction) -> &'static str {
         HotkeyAction::ToggleOverlay => "Open overlay",
         HotkeyAction::ToggleSession => "Start/stop recording",
         HotkeyAction::Screenshot => "Screenshot",
+        HotkeyAction::ToggleMicMute => "Mute microphone",
     }
 }
 

@@ -114,6 +114,8 @@ pub enum HotkeyAction {
     ToggleOverlay,
     ToggleSession,
     Screenshot,
+    /// Handled by the UI process (it owns settings): flips microphone mute.
+    ToggleMicMute,
 }
 
 /// Additional global hotkeys (the save hotkey stays in `EngineConfig::save_hotkey`).
@@ -125,12 +127,29 @@ pub struct Hotkeys {
     pub overlay: String,
     pub session: String,
     pub screenshot: String,
+    pub mic_mute: String,
 }
 
 impl Default for Hotkeys {
     fn default() -> Self {
         // Avoids NVIDIA's overlay defaults (Alt+Z, Alt+F9).
-        Self { marker: "Alt+F8".into(), overlay: "Alt+F11".into(), session: String::new(), screenshot: "Alt+F12".into() }
+        Self { marker: "Alt+F8".into(), overlay: "Alt+F11".into(), session: String::new(), screenshot: "Alt+F12".into(), mic_mute: String::new() }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Notices {
+    pub recording_started: bool,
+    pub saved: bool,
+    pub marker: bool,
+    /// Failures: clip not saved, mic problems, low disk, etc.
+    pub problems: bool,
+}
+
+impl Default for Notices {
+    fn default() -> Self {
+        Self { recording_started: true, saved: true, marker: true, problems: true }
     }
 }
 
@@ -235,6 +254,9 @@ pub struct EngineConfig {
     /// Per-game overrides (matched by executable name); unset fields use the defaults above.
     #[serde(default)]
     pub per_game: Vec<GameRule>,
+    /// Which on-screen notices to show (all also require `overlay`).
+    #[serde(default)]
+    pub notices: Notices,
     /// Encoder selection: automatic (GPU first) or software only (troubleshooting).
     #[serde(default)]
     pub encoder: EncoderChoice,

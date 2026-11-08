@@ -81,7 +81,7 @@
   const fmtDate = (ms: number) => new Date(ms).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 </script>
 
-<div class="ov">
+<div class="ov" style:zoom={(s?.overlay_scale ?? 100) / 100}>
   <header>
     <span class="dot tone-{status.tone}" aria-hidden="true"></span>
     <div class="grow">

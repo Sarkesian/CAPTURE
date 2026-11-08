@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use capture_protocol::{AudioConfig, CaptureTarget, EncoderChoice, EngineConfig, GameRule, Hotkeys, MarkerConfig, Quality, Volumes};
+use capture_protocol::{AudioConfig, CaptureTarget, EncoderChoice, EngineConfig, GameRule, Hotkeys, MarkerConfig, Notices, Quality, Volumes};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -59,6 +59,9 @@ pub struct AppSettings {
     /// Start CAPTURE (in the tray) when you sign in to Windows.
     pub start_with_windows: bool,
     pub encoder: EncoderChoice,
+    pub notices: Notices,
+    /// Overlay size in percent (90 / 100 / 115).
+    pub overlay_scale: u32,
 }
 
 impl Default for AppSettings {
@@ -93,6 +96,8 @@ impl Default for AppSettings {
             first_run_done: false,
             start_with_windows: false,
             encoder: EncoderChoice::Auto,
+            notices: Notices::default(),
+            overlay_scale: 100,
         }
     }
 }
@@ -136,6 +141,7 @@ impl AppSettings {
             markers: self.markers.clone(),
             per_game: self.per_game.clone(),
             encoder: self.encoder,
+            notices: self.notices,
             buffer_cap_bytes: (self.buffer_cap_gb.max(1.0) * 1e9) as u64,
             min_free_bytes: (self.min_free_gb.max(1.0) * 1e9) as u64,
         }
@@ -150,6 +156,7 @@ impl AppSettings {
         self.buffer_cap_gb = self.buffer_cap_gb.clamp(1.0, 2000.0);
         self.min_free_gb = self.min_free_gb.clamp(1.0, 2000.0);
         self.markers.sound_volume = self.markers.sound_volume.clamp(0.0, 1.0);
+        self.overlay_scale = self.overlay_scale.clamp(80, 130);
         for v in [&mut self.volumes.game, &mut self.volumes.mic, &mut self.volumes.voice] {
             *v = v.clamp(0.0, 2.0);
         }

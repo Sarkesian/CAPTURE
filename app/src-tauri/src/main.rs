@@ -380,6 +380,17 @@ fn refresh_tray(app: &AppHandle) {
 fn on_message(app: &AppHandle, m: Message) {
     let state = app.state::<AppState>();
     match &m.event {
+        Event::HotkeyPressed { action: capture_protocol::HotkeyAction::ToggleMicMute } => {
+            // Settings live here, so the UI process flips mute and pushes it to the engine.
+            let s = {
+                let mut g = state.settings.lock().unwrap();
+                g.mic_muted = !g.mic_muted;
+                g.clone()
+            };
+            let _ = persist(&state, &s);
+            let _ = state.worker.send(Command::Configure(s.engine_config()));
+            let _ = app.emit("settings", &s);
+        }
         Event::HotkeyPressed { action: capture_protocol::HotkeyAction::ToggleOverlay } => {
             let a = app.clone();
             let _ = app.run_on_main_thread(move || toggle_overlay_window(&a));

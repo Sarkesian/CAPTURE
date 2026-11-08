@@ -108,7 +108,16 @@ impl Engine {
     }
 
     fn notice(&self, kind: Kind, title: String, detail: String) {
-        if self.cfg.as_ref().is_some_and(|c| c.overlay) {
+        let allowed = self.cfg.as_ref().is_some_and(|c| {
+            c.overlay
+                && match kind {
+                    Kind::Recording => c.notices.recording_started,
+                    Kind::Saved if title.starts_with("Marker") => c.notices.marker,
+                    Kind::Saved => c.notices.saved,
+                    Kind::Failed => c.notices.problems,
+                }
+        });
+        if allowed {
             if let Some(o) = &self.overlay {
                 o.show(Notice { title, detail, kind });
             }
@@ -470,7 +479,8 @@ impl Engine {
         let id = self.next_save_id;
         self.next_save_id += 1;
         let emit = self.emit.clone();
-        let overlay = self.overlay.clone().filter(|_| self.cfg.as_ref().is_some_and(|c| c.overlay));
+        let flags = self.cfg.as_ref().map(|c| (c.overlay && c.notices.saved, c.overlay && c.notices.problems)).unwrap_or((false, false));
+        let overlay = self.overlay.clone();
         let game = p.shared.game_name.clone();
         let requested = p.request_save(
             range,
@@ -492,7 +502,8 @@ impl Engine {
                         (Event::SaveFailed { save_id: id, message }, n)
                     }
                 };
-                if let Some(o) = overlay {
+                let show = if notice.kind == Kind::Saved { flags.0 } else { flags.1 };
+                if let (true, Some(o)) = (show, overlay) {
                     o.show(notice);
                 }
                 emit(Message::new(None, ev));
@@ -706,6 +717,7 @@ pub fn bindings(cfg: &EngineConfig) -> hotkey::Bindings {
         (HotkeyAction::ToggleOverlay, cfg.hotkeys.overlay.clone()),
         (HotkeyAction::ToggleSession, cfg.hotkeys.session.clone()),
         (HotkeyAction::Screenshot, cfg.hotkeys.screenshot.clone()),
+        (HotkeyAction::ToggleMicMute, cfg.hotkeys.mic_mute.clone()),
     ]
 }
 

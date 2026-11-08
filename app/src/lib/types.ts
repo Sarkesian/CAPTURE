@@ -26,7 +26,7 @@ export interface Settings {
   notify_on_save: boolean;
   games: string[];
   ignored: string[];
-  hotkeys: { marker: string; overlay: string; session: string; screenshot: string };
+  hotkeys: { marker: string; overlay: string; session: string; screenshot: string; mic_mute: string };
   markers: MarkerConfig;
   mic_enabled: boolean;
   mic_device: string | null;
@@ -39,6 +39,8 @@ export interface Settings {
   first_run_done: boolean;
   start_with_windows: boolean;
   encoder: 'auto' | 'software';
+  notices: { recording_started: boolean; saved: boolean; marker: boolean; problems: boolean };
+  overlay_scale: number;
 }
 
 export interface GameRule { exe: string; replay_secs: number | null; quality: Quality | null; game_audio: boolean | null }
@@ -48,7 +50,7 @@ export interface AudioApp { exe: string; name: string }
 export interface MicLevel { device: string; peak: number; error: string | null }
 
 export interface MarkerConfig { sound: boolean; sound_volume: number; protect: boolean; protect_before_secs: number; protect_after_secs: number }
-export type HotkeyAction = 'save_replay' | 'add_marker' | 'toggle_overlay' | 'toggle_session' | 'screenshot';
+export type HotkeyAction = 'save_replay' | 'add_marker' | 'toggle_overlay' | 'toggle_session' | 'screenshot' | 'toggle_mic_mute';
 export interface Marker { id: number; t: number; at: string; label: string; footage: 'buffered' | 'protected' | 'expired'; note: string | null; saved_in: string[] }
 
 export interface EncoderInfo { name: string; hardware: boolean; width: number; height: number; fps: number; rejected: string[] }

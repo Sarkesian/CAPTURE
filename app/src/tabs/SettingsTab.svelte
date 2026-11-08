@@ -46,11 +46,11 @@
       {e.hotkey.registered ? `✓ ${e.hotkey.combo} is active.` : e.hotkey.message}
     </p>
   {/if}
-  {#each [['add_marker', 'Add marker', 'Bookmarks the moment without saving a clip.', 'marker'], ['toggle_overlay', 'Open overlay', 'Shows CAPTURE on top of your game.', 'overlay'], ['toggle_session', 'Start/stop recording', 'Records a full session of any length (optional).', 'session'], ['screenshot', 'Screenshot', 'Saves the game picture as PNG in Screenshots.', 'screenshot']] as [action, title, hint, key] (action)}
+  {#each [['add_marker', 'Add marker', 'Bookmarks the moment without saving a clip.', 'marker'], ['toggle_overlay', 'Open overlay', 'Shows CAPTURE on top of your game.', 'overlay'], ['toggle_session', 'Start/stop recording', 'Records a full session of any length (optional).', 'session'], ['screenshot', 'Screenshot', 'Saves the game picture as PNG in Screenshots.', 'screenshot'], ['toggle_mic_mute', 'Mute / unmute microphone', 'Works while you play.', 'mic_mute']] as [action, title, hint, key] (action)}
     {@const hs = e?.hotkeys.find(h => h.action === action)}
     <div class="field">
       <div class="grow"><div>{title}</div><div class="muted small">{hint}</div></div>
-      <HotkeyField value={s.hotkeys[key as 'marker' | 'overlay' | 'session' | 'screenshot']} onchange={v => updateSettings({ hotkeys: { ...s.hotkeys, [key]: v } })} />
+      <HotkeyField value={s.hotkeys[key as 'marker' | 'overlay' | 'session' | 'screenshot' | 'mic_mute']} onchange={v => updateSettings({ hotkeys: { ...s.hotkeys, [key]: v } })} />
     </div>
     {#if hs && hs.combo && !hs.registered && hs.message}<p class="small warn">{hs.message}</p>{/if}
   {/each}
@@ -174,8 +174,19 @@
     <Toggle checked={s.close_to_tray} label="Keep running in the tray" onchange={v => updateSettings({ close_to_tray: v })} />
   </div>
   <div class="field">
-    <div class="grow"><div>Show a small on-screen notice</div><div class="muted small">When recording starts and when a clip is saved. It never appears in your recordings.</div></div>
+    <div class="grow"><div>Show small on-screen notices</div><div class="muted small">Brief corner messages over your game. They never appear in your recordings.</div></div>
     <Toggle checked={s.notify_on_save} label="Show on-screen notices" onchange={v => updateSettings({ notify_on_save: v })} />
+  </div>
+  {#if s.notify_on_save}
+    <div class="field notices">
+      {#each [['recording_started', 'Recording started'], ['saved', 'Clip / session / screenshot saved'], ['marker', 'Marker added'], ['problems', 'Problems (not saved, low disk…)']] as [k, label] (k)}
+        <label class="row small"><input type="checkbox" checked={s.notices[k as keyof typeof s.notices]} onchange={ev => updateSettings({ notices: { ...s.notices, [k]: (ev.target as HTMLInputElement).checked } })} /> {label}</label>
+      {/each}
+    </div>
+  {/if}
+  <div class="field">
+    <span class="grow">Overlay size</span>
+    <Segmented label="Overlay size" value={s.overlay_scale} options={[{ value: 90, label: 'Small' }, { value: 100, label: 'Normal' }, { value: 115, label: 'Large' }]} onchange={v => updateSettings({ overlay_scale: v })} />
   </div>
 </section>
 
@@ -216,6 +227,7 @@
   dt { color: var(--muted); }
   dd { margin: 0; }
   .col { flex-direction: column; align-items: stretch; }
+  .notices { gap: 18px; padding-left: 4px; }
   .rule { display: flex; gap: 8px; align-items: center; }
   .rule select { font-size: 13px; padding: 4px 8px; }
   .chips { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }
