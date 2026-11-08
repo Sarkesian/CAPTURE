@@ -15,6 +15,7 @@ pub mod save;
 pub mod sound;
 pub mod storage;
 pub mod targets;
+pub mod thumb;
 pub mod video;
 pub mod wgc;
 
@@ -134,6 +135,22 @@ impl Engine {
                 }
                 None => self.send(re, Event::ReviewFailed { message: "Nothing is being recorded right now.".into() }),
             },
+            Command::ClipInfo { path } => {
+                let root = self.cfg.as_ref().map(|c| PathBuf::from(&c.capture_root)).unwrap_or_default();
+                let emit = self.emit.clone();
+                std::thread::spawn(move || {
+                    let ev = match thumb::clip_info(&root, Path::new(&path)) {
+                        Ok(i) => Event::ClipInfo {
+                            path,
+                            thumb: Some(i.thumb.to_string_lossy().into_owned()),
+                            duration_secs: Some(i.duration_secs),
+                            error: None,
+                        },
+                        Err(e) => Event::ClipInfo { path, thumb: None, duration_secs: None, error: Some(e) },
+                    };
+                    emit(Message::new(re, ev));
+                });
+            }
             Command::ReleaseReview => {
                 if let Some(p) = &self.pipeline {
                     p.shared.release_review();

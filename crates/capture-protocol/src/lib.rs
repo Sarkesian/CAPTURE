@@ -46,6 +46,8 @@ pub enum Command {
     ReleaseReview,
     /// Save a clip of an exact timeline range (seconds), e.g. from the review timeline.
     SaveRange { start: f64, end: f64 },
+    /// Thumbnail + duration for a saved clip (answered with `ClipInfo`).
+    ClipInfo { path: String },
     ListTargets,
     GetState,
     /// Delete leftover temporary buffer footage that is not part of the running session.
@@ -69,6 +71,7 @@ pub enum Event {
     MarkerAdded(Marker),
     ReviewReady(Review),
     ReviewFailed { message: String },
+    ClipInfo { path: String, thumb: Option<String>, duration_secs: Option<f64>, error: Option<String> },
 }
 
 /// A playable snapshot of the buffer. `start`/`end` are session-timeline seconds of its first
