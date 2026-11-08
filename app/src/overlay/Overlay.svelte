@@ -13,6 +13,7 @@
   import Toggle from '../components/Toggle.svelte';
   import Segmented from '../components/Segmented.svelte';
   import ReviewPanel from './ReviewPanel.svelte';
+  import AudioSources from '../components/AudioSources.svelte';
   import type { ClipEntry, Quality } from '../lib/types';
 
   type View = 'home' | 'review' | 'player' | 'quick';
@@ -122,7 +123,7 @@
           options={[{ value: 'balanced', label: 'Balanced' }, { value: 'high', label: 'High' }, { value: 'maximum', label: 'Maximum' }] as { value: Quality; label: string }[]}
           onchange={v => updateSettings({ quality: v })} />
       </div>
-      <div class="field"><span class="grow">Game sound</span><Toggle checked={s.game_audio} label="Game sound" onchange={v => updateSettings({ game_audio: v })} /></div>
+      <div class="field audio-full"><AudioSources /></div>
       <div class="field"><span class="grow">Marker sound</span><Toggle checked={s.markers.sound} label="Marker sound" onchange={v => updateSettings({ markers: { ...s.markers, sound: v } })} /></div>
       <div class="field"><span class="grow">On-screen notices</span><Toggle checked={s.notify_on_save} label="On-screen notices" onchange={v => updateSettings({ notify_on_save: v })} /></div>
       <div class="field">
@@ -161,6 +162,10 @@
         </div>
       {/if}
 
+      <section class="card audio-ov">
+        <AudioSources compact />
+      </section>
+
       <section class="card strip">
         <span class="muted small">Save Replay length</span>
         <div class="chips">
@@ -168,10 +173,6 @@
             <button class:on={s.replay_secs === p} onclick={() => updateSettings({ replay_secs: p })}>{fmtDuration(p)}</button>
           {/each}
         </div>
-        {#if gameTrack}
-          <span class="muted small" style="margin-left:auto">{gameTrack.name === 'System Audio' ? 'Computer sound' : 'Game sound'}</span>
-          <div style="width:160px"><Meter peak={gameTrack.peak} label="Game sound level" /></div>
-        {/if}
       </section>
 
       <section class="card recent">
@@ -241,15 +242,17 @@
   .act.primary .sub { color: #ffe4e4; }
   .act.rec { border-color: var(--accent); }
   .off { gap: 12px; }
+  .audio-ov { padding: 4px 16px; }
+  .audio-full { display: block; }
   .strip { display: flex; align-items: center; gap: 12px; padding: 10px 14px; flex-wrap: wrap; }
   .chips { display: flex; gap: 6px; }
   .chips button { padding: 4px 10px; font-size: 13px; }
   .chips button.on { border-color: var(--accent); color: var(--text); background: #3a1f22; }
-  .recent { flex: 1; min-height: 0; }
+  .recent { flex: 1; min-height: 0; overflow: hidden; }
   .recent h2 { margin: 0; }
   .clips { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 8px; }
   .clip { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
-  .thumb { position: relative; padding: 0; aspect-ratio: 16 / 9; overflow: hidden; display: grid; place-items: center; background: #000; }
+  .thumb { position: relative; padding: 0; height: 104px; overflow: hidden; display: grid; place-items: center; background: #000; }
   .thumb img { width: 100%; height: 100%; object-fit: cover; }
   .dur { position: absolute; right: 6px; bottom: 6px; background: #000c; font-size: 12px; padding: 1px 6px; border-radius: 4px; }
   .meta { min-width: 0; }

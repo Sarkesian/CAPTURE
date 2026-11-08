@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use capture_protocol::{AudioConfig, CaptureTarget, EngineConfig, Hotkeys, MarkerConfig, Quality};
+use capture_protocol::{AudioConfig, CaptureTarget, EngineConfig, Hotkeys, MarkerConfig, Quality, Volumes};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -44,6 +44,14 @@ pub struct AppSettings {
     /// Marker / overlay / session / screenshot hotkeys.
     pub hotkeys: Hotkeys,
     pub markers: MarkerConfig,
+    /// Microphone: off until explicitly enabled. `mic_device` None = Windows default input.
+    pub mic_enabled: bool,
+    pub mic_device: Option<String>,
+    pub mic_muted: bool,
+    pub voice_enabled: bool,
+    pub voice_app: Option<String>,
+    pub other_enabled: bool,
+    pub volumes: Volumes,
 }
 
 impl Default for AppSettings {
@@ -67,6 +75,13 @@ impl Default for AppSettings {
             ignored: vec![],
             hotkeys: Hotkeys::default(),
             markers: MarkerConfig::default(),
+            mic_enabled: false,
+            mic_device: None,
+            mic_muted: false,
+            voice_enabled: false,
+            voice_app: None,
+            other_enabled: false,
+            volumes: Volumes::default(),
         }
     }
 }
@@ -94,7 +109,16 @@ impl AppSettings {
             quality: self.quality,
             fps: self.fps,
             capture_cursor: self.capture_cursor,
-            audio: AudioConfig { game_audio: self.game_audio },
+            audio: AudioConfig {
+                game_audio: self.game_audio,
+                mic_enabled: self.mic_enabled,
+                mic_device: self.mic_device.clone(),
+                mic_muted: self.mic_muted,
+                voice_enabled: self.voice_enabled,
+                voice_app: self.voice_app.clone(),
+                other_enabled: self.other_enabled,
+                volumes: self.volumes.clone(),
+            },
             save_hotkey: self.save_hotkey.clone(),
             overlay: self.notify_on_save,
             hotkeys: self.hotkeys.clone(),
@@ -113,6 +137,9 @@ impl AppSettings {
         self.buffer_cap_gb = self.buffer_cap_gb.clamp(1.0, 2000.0);
         self.min_free_gb = self.min_free_gb.clamp(1.0, 2000.0);
         self.markers.sound_volume = self.markers.sound_volume.clamp(0.0, 1.0);
+        for v in [&mut self.volumes.game, &mut self.volumes.mic, &mut self.volumes.voice] {
+            *v = v.clamp(0.0, 2.0);
+        }
         self.markers.protect_before_secs = self.markers.protect_before_secs.min(600);
         self.markers.protect_after_secs = self.markers.protect_after_secs.min(600);
         // "Nothing chosen" from older builds becomes Auto: there is always something sensible to do.
@@ -195,6 +222,13 @@ mod tests {
         assert_eq!(load(&dir), AppSettings::default());
         assert!(dir.join("settings.json.bad").exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn microphone_is_off_unless_enabled() {
+        let s: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(!s.engine_config().audio.mic_enabled);
+        assert!(!s.engine_config().audio.voice_enabled);
     }
 
     #[test]

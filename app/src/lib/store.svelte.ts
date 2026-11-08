@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { ClipEntry, DisplayTarget, EngineMessage, EngineState, Review, SavedClip, Settings, WindowTarget } from './types';
+import type { AudioApp, AudioDevice, ClipEntry, DisplayTarget, EngineMessage, EngineState, Review, SavedClip, Settings, WindowTarget } from './types';
 
 interface Toast { id: number; text: string; kind: 'ok' | 'error' | 'info' }
 
@@ -19,6 +19,9 @@ export const app = $state({
   reviewError: null as string | null,
   clipInfo: {} as Record<string, { thumb: string | null; duration: number | null }>,
   tab: 'capture' as 'capture' | 'library' | 'settings',
+  inputs: [] as AudioDevice[],
+  apps: [] as AudioApp[],
+  micTest: null as { phase: string; peak: number; message: string | null } | null,
 });
 
 let toastId = 0;
@@ -94,6 +97,13 @@ function onEngine(m: EngineMessage) {
     case 'review_failed':
       app.reviewLoading = false;
       app.reviewError = m.data.message;
+      break;
+    case 'audio_devices':
+      app.inputs = m.data.inputs;
+      app.apps = m.data.apps;
+      break;
+    case 'mic_test':
+      app.micTest = m.data;
       break;
     case 'clip_info':
       app.clipInfo[m.data.path] = { thumb: m.data.thumb, duration: m.data.duration_secs };

@@ -426,7 +426,7 @@ fn main() {
             // not render, so it costs nothing while you play.
             let overlay = WebviewWindowBuilder::new(app, "overlay", WebviewUrl::App("index.html#overlay".into()))
                 .title("CAPTURE overlay")
-                .inner_size(1120.0, 720.0)
+                .inner_size(1120.0, 800.0)
                 .decorations(false)
                 .always_on_top(true)
                 .skip_taskbar(true)

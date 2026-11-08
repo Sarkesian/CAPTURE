@@ -5,6 +5,7 @@
   import Toggle from '../components/Toggle.svelte';
   import Segmented from '../components/Segmented.svelte';
   import Meter from '../components/Meter.svelte';
+  import AudioSources from '../components/AudioSources.svelte';
   import {
     app, setReplay, saveReplay, updateSettings, refreshTargets, openPath, revealPath, copyPath,
     openCaptureFolder, fmtDuration, fmtBytes,
@@ -163,24 +164,10 @@
     {/if}
   </section>
 
-  <section class="card">
+  <section class="card audio">
     <h2>Audio</h2>
-    <div class="row">
-      <Toggle checked={s.game_audio} label="Game sound" onchange={v => updateSettings({ game_audio: v })} />
-      <div class="grow">
-        <div>{sourceMode === 'display' ? 'System sound' : 'Game sound'}</div>
-        <div class="muted small ellipsis">
-          {#if !s.game_audio}Off
-          {:else if gameTrack?.error}<span class="warn">{gameTrack.error}</span>
-          {:else if gameTrack}{gameTrack.mode === 'process-loopback' ? 'Only this app’s sound' : 'Everything you hear'} · {gameTrack.signal_seen ? 'signal detected' : 'no sound yet'}
-          {:else}{sourceMode === 'display' ? 'Everything you hear on your default output' : 'Only the selected app’s sound'}{/if}
-        </div>
-      </div>
-    </div>
-    {#if s.game_audio && gameTrack}
-      <div style="margin-top:10px"><Meter peak={gameTrack.peak} label="Game sound level" /></div>
-    {/if}
-    <p class="muted small">Saved clips get a <b>Preview Mix</b> track for normal playback plus a separate <b>{sourceMode === 'display' ? 'System Audio' : 'Game Audio'}</b> track for editing. The microphone is not recorded.</p>
+    <AudioSources />
+    <p class="muted small">Every source is saved as its own track for editing, plus a <b>Preview Mix</b> that sounds normal in any player. Sliders change Preview Mix only.</p>
   </section>
 
   <section class="card">
@@ -237,6 +224,7 @@
   button.big { padding: 10px 26px; font-size: 16px; }
   kbd { font-family: "Cascadia Mono", Consolas, monospace; background: var(--panel-2); border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; }
   .warn { color: var(--warn); }
+  .audio { grid-column: 1 / -1; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
   .grid p { margin: 10px 0 0; }
   .last { margin-top: 14px; }

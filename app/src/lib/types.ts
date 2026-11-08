@@ -28,7 +28,18 @@ export interface Settings {
   ignored: string[];
   hotkeys: { marker: string; overlay: string; session: string; screenshot: string };
   markers: MarkerConfig;
+  mic_enabled: boolean;
+  mic_device: string | null;
+  mic_muted: boolean;
+  voice_enabled: boolean;
+  voice_app: string | null;
+  other_enabled: boolean;
+  volumes: { game: number; mic: number; voice: number };
 }
+
+export interface AudioDevice { id: string; name: string; is_default: boolean; is_virtual: boolean }
+export interface AudioApp { exe: string; name: string }
+export interface MicLevel { device: string; peak: number; error: string | null }
 
 export interface MarkerConfig { sound: boolean; sound_volume: number; protect: boolean; protect_before_secs: number; protect_after_secs: number }
 export type HotkeyAction = 'save_replay' | 'add_marker' | 'toggle_overlay' | 'toggle_session' | 'screenshot';
@@ -56,6 +67,7 @@ export interface EngineState {
   markers: Marker[];
   now_secs: number;
   session_secs: number | null;
+  mic_monitor: MicLevel | null;
   leftover_buffer_bytes: number;
   free_bytes: number | null;
 }
@@ -90,4 +102,6 @@ export type EngineMessage = { v: number; re?: number } & (
   | { event: 'review_ready'; data: Review }
   | { event: 'review_failed'; data: { message: string } }
   | { event: 'clip_info'; data: { path: string; thumb: string | null; duration_secs: number | null; error: string | null } }
+  | { event: 'audio_devices'; data: { inputs: AudioDevice[]; outputs: AudioDevice[]; apps: AudioApp[] } }
+  | { event: 'mic_test'; data: { phase: 'recording' | 'playing' | 'done' | 'failed'; peak: number; message: string | null } }
 );
