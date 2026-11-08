@@ -3,7 +3,7 @@ target/
 node_modules/
 dist/
 
-# Pinned third-party binaries are downloaded by scripts/fetch-ffmpeg.ps1, not committed
+# Pinned third-party binaries are downloaded by scripts/fetch-deps.ps1, not committed
 third_party/
 
 # Spike/test media output (can contain real screen/mic content)

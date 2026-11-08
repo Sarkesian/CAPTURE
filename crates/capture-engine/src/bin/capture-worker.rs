@@ -97,7 +97,10 @@ fn main() {
                     break;
                 }
             }
-            Input::Tick => engine.publish_state(None, false),
+            Input::Tick => {
+                engine.tick();
+                engine.publish_state(None, false);
+            }
         }
     }
     engine.shutdown();

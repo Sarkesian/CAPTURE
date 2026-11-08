@@ -85,7 +85,11 @@ pub struct AudioConfig {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CaptureTarget {
     None,
+    /// A specific live window (not persisted: handles change between launches).
     Window { hwnd: u64, pid: u32, exe: String, title: String },
+    /// Whatever main window the named executable currently has. Persistable. While the app
+    /// is not running the engine reports "waiting" and starts automatically when it appears.
+    App { exe: String },
     Display { index: u32 },
 }
 

@@ -1,0 +1,8 @@
+[env]
+# Pinned dependencies fetched by scripts/fetch-deps.ps1
+FFMPEG_DIR = { value = "third_party/ffmpeg", relative = true }
+LIBCLANG_PATH = { value = "third_party/libclang/libclang-18.1.1.data/platlib/clang/native", relative = true }
+
+[target.x86_64-pc-windows-msvc]
+# Static C runtime: the portable build must not depend on the VC++ redistributable.
+rustflags = ["-C", "target-feature=+crt-static"]

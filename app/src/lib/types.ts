@@ -1,0 +1,71 @@
+// Mirrors crates/capture-protocol (v1) and app/src-tauri/src/settings.rs.
+
+export type Quality = 'balanced' | 'high' | 'maximum';
+export type Status = 'ready' | 'starting' | 'buffering' | 'needs_attention';
+
+export type TargetPref =
+  | { kind: 'none' }
+  | { kind: 'app'; exe: string; label: string }
+  | { kind: 'display'; index: number; label: string };
+
+export interface Settings {
+  version: number;
+  capture_root: string;
+  replay_enabled: boolean;
+  replay_secs: number;
+  target: TargetPref;
+  quality: Quality;
+  fps: number;
+  capture_cursor: boolean;
+  game_audio: boolean;
+  save_hotkey: string;
+  buffer_cap_gb: number;
+  min_free_gb: number;
+  close_to_tray: boolean;
+  notify_on_save: boolean;
+}
+
+export interface EncoderInfo { name: string; hardware: boolean; width: number; height: number; fps: number; rejected: string[] }
+export interface TrackState { name: string; mode: string; source: string; peak: number; signal_seen: boolean; error: string | null }
+export interface HotkeyState { combo: string; registered: boolean; message: string | null }
+
+export interface EngineState {
+  status: Status;
+  attention: string | null;
+  target_name: string | null;
+  encoder: EncoderInfo | null;
+  buffered_secs: number;
+  buffer_bytes: number;
+  capture_fps: number;
+  frames_captured: number;
+  tracks: TrackState[];
+  saves_in_progress: number;
+  hotkey: HotkeyState;
+  leftover_buffer_bytes: number;
+  free_bytes: number | null;
+}
+
+export interface WindowTarget { hwnd: number; pid: number; exe: string; title: string; app_name: string; width: number; height: number }
+export interface DisplayTarget { index: number; name: string; width: number; height: number; primary: boolean }
+
+export interface SavedClip {
+  save_id: number;
+  path: string;
+  requested_secs: number;
+  duration_secs: number;
+  bytes: number;
+  video_streams: number;
+  audio_tracks: string[];
+}
+
+export interface ClipEntry { path: string; name: string; game: string; bytes: number; modified_ms: number }
+
+export type EngineMessage = { v: number; re?: number } & (
+  | { event: 'hello'; data: { worker_version: string } }
+  | { event: 'state'; data: EngineState }
+  | { event: 'targets'; data: { windows: WindowTarget[]; displays: DisplayTarget[] } }
+  | { event: 'save_started'; data: { save_id: number; requested_secs: number } }
+  | { event: 'save_finished'; data: SavedClip }
+  | { event: 'save_failed'; data: { save_id: number; message: string } }
+  | { event: 'error'; data: { message: string } }
+);

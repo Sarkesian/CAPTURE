@@ -1,0 +1,23 @@
+[package]
+name = "capture-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CAPTURE desktop UI (Tauri 2). Spawns and supervises capture-worker."
+
+[[bin]]
+name = "CAPTURE"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.7.4", features = [] }
+
+[dependencies]
+capture-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2.12.5", features = ["tray-icon", "image-png"] }
+tauri-plugin-dialog = "2.8.4"
+tauri-plugin-clipboard-manager = "2.5.0"
+tauri-plugin-single-instance = "2.5.5"
+tauri-plugin-notification = "2.8.0"

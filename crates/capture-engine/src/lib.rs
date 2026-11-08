@@ -38,6 +38,7 @@ pub struct Engine {
     fps_sample: (Instant, u64),
     capture_fps: f64,
     last_state: Option<EngineState>,
+    last_retry: Instant,
 }
 
 impl Engine {
@@ -53,6 +54,7 @@ impl Engine {
             fps_sample: (Instant::now(), 0),
             capture_fps: 0.0,
             last_state: None,
+            last_retry: Instant::now(),
         }
     }
 
@@ -162,6 +164,33 @@ impl Engine {
             id,
         );
         self.send(re, Event::SaveStarted { save_id: id, requested_secs: requested });
+    }
+
+    /// Periodic housekeeping: retry a replay that is waiting for its target, and move to a
+    /// relaunched game after the captured window closed (the old session stays saveable until
+    /// the new one starts).
+    pub fn tick(&mut self) {
+        if !self.replay_on || self.cfg.is_none() {
+            return;
+        }
+        let closed = self.pipeline.as_ref().is_some_and(|p| p.capture.closed.load(Ordering::Relaxed));
+        let waiting = self.pipeline.is_none();
+        if !(closed || waiting) || self.last_retry.elapsed().as_secs_f64() < 3.0 {
+            return;
+        }
+        self.last_retry = Instant::now();
+        let cfg = self.cfg.clone().unwrap();
+        if let Ok(s) = resolve(&cfg) {
+            self.pipeline = None;
+            match Pipeline::start(s, live_of(&cfg)) {
+                Ok(p) => {
+                    self.start_error = None;
+                    self.fps_sample = (Instant::now(), 0);
+                    self.pipeline = Some(p);
+                }
+                Err(e) => self.start_error = Some(e),
+            }
+        }
     }
 
     /// Called periodically and after every command. Emits only when something changed,
@@ -299,6 +328,19 @@ fn resolve(cfg: &EngineConfig) -> Result<Settings, String> {
     }
     let (source, game_name, audio) = match &cfg.target {
         CaptureTarget::None => return Err("Choose a window or display to capture.".into()),
+        CaptureTarget::App { exe } => {
+            let w = targets::windows()
+                .into_iter()
+                .filter(|w| w.exe.eq_ignore_ascii_case(exe))
+                .max_by_key(|w| w.width as u64 * w.height as u64)
+                .ok_or_else(|| format!("Waiting for {exe} to start. Replay begins automatically when it opens."))?;
+            let audio = if cfg.audio.game_audio {
+                vec![SourceSpec::Process { pid: w.pid, label: "Game Audio".into() }]
+            } else {
+                vec![]
+            };
+            (SourceKind::Window(w.hwnd as isize), w.app_name, audio)
+        }
         CaptureTarget::Window { hwnd, pid, exe, title } => {
             let h = HWND(*hwnd as *mut _);
             let mut actual = 0u32;
