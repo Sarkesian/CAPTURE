@@ -92,10 +92,12 @@ pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf, String> {
     if target == path {
         return Ok(target);
     }
-    if target.exists() {
+    // Windows names are case-insensitive: "clip" -> "Clip" is the same file, not a clash.
+    let case_only = target.to_string_lossy().eq_ignore_ascii_case(&path.to_string_lossy());
+    if target.exists() && !case_only {
         return Err(format!("\"{clean}.{ext}\" already exists in this folder."));
     }
-    std::fs::rename(path, &target).map_err(|e| format!("Could not rename: {e}"))?;
+    move_no_replace(path, &target).map_err(|e| format!("Could not rename: {e}"))?;
     if sidecar(path).is_file() {
         let _ = std::fs::rename(sidecar(path), sidecar(&target));
     }
@@ -103,6 +105,15 @@ pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf, String> {
         let _ = std::fs::rename(stems_dir(path), stems_dir(&target));
     }
     Ok(target)
+}
+
+/// Rename that fails instead of replacing an existing file (`std::fs::rename` replaces on
+/// Windows), so a file that appears between the check and the rename is never overwritten.
+fn move_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use windows::core::HSTRING;
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVE_FILE_FLAGS};
+    unsafe { MoveFileExW(&HSTRING::from(from.as_os_str()), &HSTRING::from(to.as_os_str()), MOVE_FILE_FLAGS(0)) }
+        .map_err(|e| std::io::Error::from_raw_os_error(e.code().0 & 0xFFFF))
 }
 
 #[cfg(test)]
@@ -122,6 +133,13 @@ mod tests {
         assert_eq!(t.file_name().unwrap(), "Boss fight.mp4");
         assert!(dir.join("Boss fight.mp4.markers.json").is_file());
         assert!(dir.join("Boss fight_Audio").is_dir());
+        // Case-only rename is allowed (same file on Windows).
+        let t = rename(&t, "BOSS FIGHT").unwrap();
+        assert!(std::fs::read_dir(&dir).unwrap().flatten().any(|e| e.file_name() == "BOSS FIGHT.mp4"));
+        assert!(t.is_file());
+        // The no-replace move itself refuses an existing target.
+        assert!(move_no_replace(&t, &dir.join("taken.mp4")).is_err());
+        assert_eq!(std::fs::read(dir.join("taken.mp4")).unwrap(), b"1");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

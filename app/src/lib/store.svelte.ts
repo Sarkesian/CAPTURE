@@ -147,7 +147,9 @@ export const openAppFolder = (which: 'data' | 'logs' | 'app' | 'resources') => c
 
 export async function updateSettings(patch: Partial<Settings>) {
   if (!app.settings) return;
-  const next = await call<Settings>('update_settings', { settings: { ...app.settings, ...patch } });
+  // Only the changed fields: the backend merges them into its current settings, so a change
+  // made meanwhile elsewhere (mute hotkey, tray, the other window) is never undone.
+  const next = await call<Settings>('update_settings', { patch });
   if (next) { app.settings = next; checkPaths(); }
 }
 
@@ -177,7 +179,9 @@ export async function deleteClip(path: string) {
 export const showMain = (tab?: string) => call('show_main', { tab });
 export const hideOverlay = () => call('hide_overlay');
 
-export const setReplay = (enabled: boolean) => call('set_replay', { enabled }).then(() => { if (app.settings) app.settings.replay_enabled = enabled; });
+// The backend's `settings` event carries the saved value; on failure `call` shows the error and
+// the toggle keeps showing what is really saved.
+export const setReplay = (enabled: boolean) => call('set_replay', { enabled });
 export const saveReplay = () => call('save_replay');
 export const refreshTargets = () => call('list_targets');
 export const clearTempCache = () => call('clear_temp_cache');

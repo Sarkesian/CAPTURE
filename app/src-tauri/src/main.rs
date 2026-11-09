@@ -115,6 +115,29 @@ fn persist(state: &AppState, s: &AppSettings) -> Result<(), String> {
     settings::save(&state.paths.settings, s).map_err(|e| format!("Could not save settings: {e}"))
 }
 
+/// The one way settings change: apply `f` to the current settings and save, all under the
+/// settings lock, so two writers (a window, the tray, the mute hotkey) can never undo each
+/// other or write the file out of order. Memory changes only once the file is saved.
+fn mutate(state: &AppState, f: impl FnOnce(&mut AppSettings)) -> Result<AppSettings, String> {
+    let mut g = state.settings.lock().unwrap();
+    let mut s = g.clone();
+    f(&mut s);
+    persist(state, &s)?;
+    *g = s.clone();
+    Ok(s)
+}
+
+/// `current` with the fields present in `patch` replaced (a window sends only what it changed).
+fn merged(current: &AppSettings, patch: &serde_json::Value) -> Result<AppSettings, String> {
+    let mut v = serde_json::to_value(current).map_err(|e| e.to_string())?;
+    if let (Some(dst), Some(src)) = (v.as_object_mut(), patch.as_object()) {
+        for (k, val) in src {
+            dst.insert(k.clone(), val.clone());
+        }
+    }
+    serde_json::from_value::<AppSettings>(v).map(AppSettings::sanitized).map_err(|e| format!("Invalid setting: {e}"))
+}
+
 #[tauri::command]
 fn bootstrap(window: tauri::WebviewWindow, state: State<AppState>) -> Bootstrap {
     let s = state.settings.lock().unwrap().clone();
@@ -204,26 +227,44 @@ fn apply_update(app: AppHandle, state: State<AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// `patch` holds only the fields a window changed; they are merged into the current settings
+/// here, so a change made meanwhile elsewhere (mute hotkey, tray, the other window) is kept.
 #[tauri::command]
-fn update_settings(app: AppHandle, state: State<AppState>, settings: AppSettings) -> Result<AppSettings, String> {
-    let s = settings.sanitized();
-    if s.capture_root != state.settings.lock().unwrap().capture_root {
-        validate_destination(&s.capture_root)?;
+fn update_settings(app: AppHandle, state: State<AppState>, patch: serde_json::Value) -> Result<AppSettings, String> {
+    // Validate new folders first, without holding the lock (a slow drive must not stall the rest).
+    let (before, candidate) = {
+        let cur = state.settings.lock().unwrap().clone();
+        let cand = merged(&cur, &patch)?;
+        (cur, cand)
+    };
+    if candidate.capture_root != before.capture_root {
+        validate_destination(&candidate.capture_root)?;
     }
-    if let Some(b) = s.buffer_root.as_deref().filter(|b| !b.trim().is_empty()) {
-        if Some(b) != state.settings.lock().unwrap().buffer_root.as_deref() {
+    if let Some(b) = candidate.buffer_root.as_deref().filter(|b| !b.trim().is_empty()) {
+        if Some(b) != before.buffer_root.as_deref() {
             validate_destination(b)?;
         }
     }
-    persist(&state, &s)?;
-    let replay_changed = state.settings.lock().unwrap().replay_enabled != s.replay_enabled;
-    *state.settings.lock().unwrap() = s.clone();
-    state.worker.send(Command::Configure(s.engine_config()))?;
+    let mut replay_changed = false;
+    let mut err = None;
+    let s = mutate(&state, |cur| match merged(cur, &patch) {
+        Ok(next) => {
+            replay_changed = cur.replay_enabled != next.replay_enabled;
+            *cur = next;
+        }
+        Err(e) => err = Some(e),
+    })?;
+    if let Some(e) = err {
+        return Err(e);
+    }
+    // Saved: every window, the tray and the engine follow. While the engine is down the send
+    // fails, which is fine — it gets the saved configuration when it restarts (`apply`).
+    let _ = state.worker.send(Command::Configure(s.engine_config()));
     if replay_changed {
-        state.worker.send(Command::SetReplay { enabled: s.replay_enabled })?;
+        let _ = state.worker.send(Command::SetReplay { enabled: s.replay_enabled });
     }
     refresh_tray(&app);
-    allow_media(&app, &s.capture_root);
+    allow_media(&app, &s);
     let _ = app.emit("settings", &s); // keep every window (main + overlay) in sync
     Ok(s)
 }
@@ -242,10 +283,15 @@ fn validate_destination(root: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Let the webviews play/view files inside the capture folder only (reviews, clips, screenshots).
-fn allow_media(app: &AppHandle, root: &str) {
-    if !root.trim().is_empty() {
-        let _ = app.asset_protocol_scope().allow_directory(root, true);
+/// Let the webviews play/view files inside the capture folder (clips, screenshots) and the
+/// temporary-footage folder (review snapshots live there when it is set) only.
+fn allow_media(app: &AppHandle, s: &AppSettings) {
+    if !s.capture_root.trim().is_empty() {
+        let _ = app.asset_protocol_scope().allow_directory(&s.capture_root, true);
+    }
+    if let Some(b) = s.buffer_root.as_deref().filter(|b| !b.trim().is_empty()) {
+        // `<temporary-footage folder>\Buffer`, as the engine's `storage::buffer_dir_for`.
+        let _ = app.asset_protocol_scope().allow_directory(Path::new(b.trim()).join("Buffer"), true);
     }
 }
 
@@ -326,12 +372,7 @@ fn set_start_with_windows(app: AppHandle, state: State<AppState>, enabled: bool)
     if actual != enabled {
         return Err("Windows did not accept the startup change. Check that no policy blocks startup apps.".into());
     }
-    let s = {
-        let mut g = state.settings.lock().unwrap();
-        g.start_with_windows = enabled;
-        g.clone()
-    };
-    persist(&state, &s)?;
+    let s = mutate(&state, |g| g.start_with_windows = enabled)?;
     let _ = app.emit("settings", &s);
     Ok(())
 }
@@ -340,6 +381,11 @@ fn set_start_with_windows(app: AppHandle, state: State<AppState>, enabled: bool)
 fn engine_command(state: State<AppState>, command: Command) -> Result<u64, String> {
     if matches!(command, Command::Configure(_) | Command::Shutdown) {
         return Err("Not allowed from the UI".into());
+    }
+    // File paths the engine opens (FFmpeg also accepts URLs such as `http:`) must be CAPTURE
+    // recordings inside the capture folder.
+    if let Command::ExportStems { path } | Command::ClipInfo { path } = &command {
+        recording_path(&state, path)?;
     }
     state.worker.send(command)
 }
@@ -424,12 +470,8 @@ fn set_replay(app: AppHandle, state: State<AppState>, enabled: bool) -> Result<(
 }
 
 fn set_replay_inner(app: &AppHandle, state: &AppState, enabled: bool) -> Result<(), String> {
-    let s = {
-        let mut g = state.settings.lock().unwrap();
-        g.replay_enabled = enabled;
-        g.clone()
-    };
-    persist(state, &s)?;
+    // Saved first: if the file cannot be written, nothing claims replay is on (or off).
+    let s = mutate(state, |g| g.replay_enabled = enabled)?;
     state.worker.send(Command::SetReplay { enabled })?;
     let _ = app.emit("settings", &s);
     refresh_tray(app);
@@ -459,7 +501,7 @@ fn list_clips(state: State<AppState>, kind: Option<String>) -> Vec<library::Clip
 
 #[tauri::command]
 fn rename_clip(state: State<AppState>, path: String, name: String) -> Result<String, String> {
-    let p = inside_root(&state, &path)?;
+    let p = recording_path(&state, &path)?;
     library::rename(&p, &name).map(|t| t.to_string_lossy().into_owned())
 }
 
@@ -474,6 +516,16 @@ fn inside_root(state: &AppState, path: &str) -> Result<PathBuf, String> {
     } else {
         Err("Only files in your capture folder can be opened from here.".into())
     }
+}
+
+/// An existing `.mp4`/`.png` file strictly inside the capture folder (never the folder itself).
+fn recording_path(state: &AppState, path: &str) -> Result<PathBuf, String> {
+    let p = inside_root(state, path)?;
+    let ext_ok = p.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp4") || e.eq_ignore_ascii_case("png"));
+    if !ext_ok || !p.is_file() {
+        return Err("Only recordings in your capture folder can be used here.".into());
+    }
+    Ok(p)
 }
 
 #[tauri::command]
@@ -613,12 +665,12 @@ fn on_message(app: &AppHandle, m: Message) {
     match &m.event {
         Event::HotkeyPressed { action: capture_protocol::HotkeyAction::ToggleMicMute } => {
             // Settings live here, so the UI process flips mute and pushes it to the engine.
-            let s = {
+            // Mute must follow the key even if the settings file can't be written right now.
+            let s = mutate(&state, |g| g.mic_muted = !g.mic_muted).unwrap_or_else(|_| {
                 let mut g = state.settings.lock().unwrap();
                 g.mic_muted = !g.mic_muted;
                 g.clone()
-            };
-            let _ = persist(&state, &s);
+            });
             let _ = state.worker.send(Command::Configure(s.engine_config()));
             let _ = app.emit("settings", &s);
         }
@@ -942,7 +994,8 @@ fn main() {
                     api.prevent_close();
                 }
             });
-            allow_media(&handle, &app.state::<AppState>().settings.lock().unwrap().capture_root.clone());
+            let s = app.state::<AppState>().settings.lock().unwrap().clone();
+            allow_media(&handle, &s);
             theme_frame(&window);
             {
                 let handle = handle.clone();

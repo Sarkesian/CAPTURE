@@ -108,7 +108,7 @@ try {
   check(!r.err && runEntry() === '' && !(await settings()).start_with_windows, 'disable startup -> Run entry removed');
 
   // 5. A setting change persists across a restart; Exit stops everything.
-  r = await invoke('update_settings', { settings: { ...(await settings()), replay_secs: 300, minimize_to_tray: true } });
+  r = await invoke('update_settings', { patch: { ...(await settings()), replay_secs: 300, minimize_to_tray: true } });
   check(!r.err, 'settings change accepted');
   check(await quitAndWait(), 'Exit: CAPTURE and its engine both end');
 

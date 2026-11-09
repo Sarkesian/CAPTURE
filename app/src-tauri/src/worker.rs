@@ -54,7 +54,16 @@ impl Worker {
         if !dev.is_empty() {
             path = format!("{dev};{path}");
         }
+        // Checked under the child lock that `shutdown` also takes: a restart racing with Quit
+        // (or an update install) can never leave a fresh worker running.
+        let mut slot = self.child.lock().unwrap();
+        if self.quitting.load(Ordering::SeqCst) {
+            return Err("CAPTURE is closing.".into());
+        }
         let mut child = Proc::new(exe)
+            // The engine leaves this process tree (this window, its WebView2 playback) out of
+            // the desktop-audio tracks, so playing a clip in CAPTURE is never recorded.
+            .env("CAPTURE_UI_PID", std::process::id().to_string())
             .current_dir(&self.runtime)
             .env("PATH", path)
             .stdin(Stdio::piped())
@@ -65,7 +74,8 @@ impl Worker {
             .map_err(|e| format!("Could not start the capture engine: {e}"))?;
         let stdout = child.stdout.take().unwrap();
         *self.stdin.lock().unwrap() = child.stdin.take();
-        *self.child.lock().unwrap() = Some(child);
+        *slot = Some(child);
+        drop(slot);
 
         let me = self.clone();
         std::thread::Builder::new()
@@ -99,6 +109,9 @@ impl Worker {
                 }
                 on_down("The capture engine stopped unexpectedly and is restarting…".into());
                 std::thread::sleep(Duration::from_millis(800));
+                if me.quitting.load(Ordering::SeqCst) {
+                    return;
+                }
                 match me.start(on_msg.clone(), on_restart.clone(), on_down.clone()) {
                     Ok(()) => on_restart(),
                     Err(e) => on_down(e),

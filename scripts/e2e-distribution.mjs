@@ -89,7 +89,7 @@ const outsideSnapshot = () => [process.env.LOCALAPPDATA, process.env.APPDATA, pr
 // Turn recording on (whole display, so no game is needed), save a replay and a screenshot.
 async function recordClip(label) {
   const s = (await boot()).settings;
-  let r = await invoke('update_settings', { settings: { ...s, capture_root: capRoot, replay_enabled: true, target: { kind: 'display', index: 0, label: 'Display 1' }, first_run_done: true } });
+  let r = await invoke('update_settings', { patch: { ...s, capture_root: capRoot, replay_enabled: true, target: { kind: 'display', index: 0, label: 'Display 1' }, first_run_done: true } });
   if (!check(!r.err, `${label}: recording settings accepted`)) console.log(r.err);
   const buffering = await waitUntil(async () => { const b = await boot(); return b.last_state?.status === 'buffering' && b.last_state.buffered_secs >= 4; }, 30000);
   check(buffering, `${label}: packaged engine is buffering (whole display)`);
@@ -159,7 +159,7 @@ try {
   check(b.settings.capture_root === 'Q:\\Videos\\Captures' && b.path_issues.some(i => i.which === 'capture_root'), 'missing drive: setting kept and reported');
   if (!check(await waitUntil(() => js('!!document.querySelector("[data-test=path-issue]")'), 8000), 'missing drive: Home shows the warning'))
     console.log('   page:', (await js('document.querySelector("main")?.innerText.slice(0, 400)')));
-  await invoke('update_settings', { settings: { ...b.settings, capture_root: capRoot } });
+  await invoke('update_settings', { patch: { ...b.settings, capture_root: capRoot } });
 
   // In-app update from a release zip (same files, version 9.9.9 in its manifest).
   const rel = path.join(work, 'release', 'CAPTURE');
@@ -243,7 +243,7 @@ public delegate bool EnumProc(System.IntPtr h, System.IntPtr l);
   check(!(await js('document.visibilityState === "visible"')), 'window hidden after close');
   check(procs('CAPTURE').length === 1 && procs('capture-worker').length === 1, 'closing the window keeps CAPTURE recording in the tray');
   const s = (await boot()).settings;
-  await invoke('update_settings', { settings: { ...s, replay_secs: 300 } });
+  await invoke('update_settings', { patch: { ...s, replay_secs: 300 } });
 
   // Upgrade (same version reinstall) while CAPTURE runs: closed first, settings kept.
   const st2 = runSetup('/S');
