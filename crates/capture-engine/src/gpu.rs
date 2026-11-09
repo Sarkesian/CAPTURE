@@ -46,6 +46,7 @@ impl Gpu {
                 let _ = mt.SetMultithreadProtected(true);
             }
         }
+        raise_gpu_priority(&device);
         let adapter = unsafe {
             device
                 .cast::<IDXGIDevice>()
@@ -74,5 +75,33 @@ impl Gpu {
 impl Drop for Gpu {
     fn drop(&mut self) {
         unsafe { ff::av_buffer_unref(&mut self.hw_device) };
+    }
+}
+
+/// Games keep the GPU busy; at normal priority our copies and NVENC's input conversion wait
+/// behind whole game frames, which capped 4K60 encoding below 60 fps. Ask the GPU scheduler to
+/// run this process's work first (as OBS does). Best effort: without the privilege Windows may
+/// refuse the higher classes, and the result is logged.
+fn raise_gpu_priority(device: &ID3D11Device) {
+    use windows::core::s;
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    unsafe {
+        let thread = device.cast::<IDXGIDevice>().and_then(|d| d.SetGPUThreadPriority(7));
+        // D3DKMT_SCHEDULINGPRIORITYCLASS: NORMAL 2, ABOVE_NORMAL 3, HIGH 4, REALTIME 5.
+        type SetClass = unsafe extern "system" fn(windows::Win32::Foundation::HANDLE, i32) -> i32;
+        let mut class = None;
+        if let Ok(gdi) = LoadLibraryA(s!("gdi32.dll")) {
+            if let Some(f) = GetProcAddress(gdi, s!("D3DKMTSetProcessSchedulingPriorityClass")) {
+                let f: SetClass = std::mem::transmute(f);
+                for c in [5, 4, 3] {
+                    if f(GetCurrentProcess(), c) == 0 {
+                        class = Some(c);
+                        break;
+                    }
+                }
+            }
+        }
+        eprintln!("GPU priority: thread {:?}, process class {:?}", thread.is_ok(), class);
     }
 }

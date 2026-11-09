@@ -31,6 +31,10 @@ struct SendDev(ID3D11Device);
 unsafe impl Send for SendDev {}
 unsafe impl Sync for SendDev {}
 
+/// Capture buffers Windows can fill while earlier ones are still being copied by a busy GPU.
+/// With 2, frames were skipped whenever our copy queued behind the game's rendering.
+const POOL_FRAMES: i32 = 4;
+
 pub enum Source {
     Window(isize),
     Monitor(isize),
@@ -203,7 +207,7 @@ impl Capture {
         let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             &winrt_device,
             DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            2,
+            POOL_FRAMES,
             size,
         )
         .map_err(|e| e.to_string())?;
@@ -223,16 +227,22 @@ impl Capture {
                     let (context, dev) = (&ctx.0, &ctx.1);
                     let dev3d = &dev3d.0;
                     let Ok(pool) = pool.ok() else { return Ok(()) };
+                    let t_arrive = crate::clock::now_100ns();
                     let frame = pool.TryGetNextFrame()?;
                     let content = frame.ContentSize()?;
                     let tex: ID3D11Texture2D = unsafe { frame.Surface()?.cast::<IDirect3DDxgiInterfaceAccess>()?.GetInterface()? };
                     let mut l = latest.lock().unwrap();
+                    if crate::trace::enabled() {
+                        let shown = frame.SystemRelativeTime().map(|t| t.Duration).unwrap_or(0);
+                        let now = crate::clock::now_100ns();
+                        crate::trace::ev("cap", t_arrive, shown, (now - t_arrive) as i64, 0);
+                    }
                     if content != l.last_size {
                         // Size changed (resize, resolution switch): clear stale edges and let the
                         // pool deliver full-size frames from now on.
                         unsafe { context.ClearRenderTargetView(&l.rtv, &[0.0, 0.0, 0.0, 1.0]) };
                         l.last_size = content;
-                        let _ = pool.Recreate(dev, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, content);
+                        let _ = pool.Recreate(dev, DirectXPixelFormat::B8G8R8A8UIntNormalized, POOL_FRAMES, content);
                     }
                     let crop = window.and_then(client_crop);
                     let (cx, cy) = match crop {

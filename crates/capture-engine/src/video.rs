@@ -36,6 +36,77 @@ pub struct VideoEncoder {
 
 unsafe impl Send for VideoEncoder {}
 
+enum GrabKind {
+    /// Own reference to the encoder's D3D11 frames context.
+    Gpu(*mut ff::AVBufferRef),
+    Cpu(ID3D11Texture2D),
+}
+
+/// Takes pictures from [`wgc::Latest`] for a [`VideoEncoder`]. Taking one only queues a GPU copy,
+/// so the frame lock (which the capture callback also needs) is held for microseconds, never
+/// for the duration of an encode.
+pub struct Grabber {
+    kind: GrabKind,
+    gpu: Arc<Gpu>,
+}
+
+unsafe impl Send for Grabber {}
+
+/// One picture, copied out of `Latest`, waiting to be encoded as frame `pts`.
+pub struct Grab {
+    frame: *mut ff::AVFrame,
+    pub pts: i64,
+}
+
+unsafe impl Send for Grab {}
+
+impl Drop for Grab {
+    fn drop(&mut self) {
+        unsafe { ff::av_frame_free(&mut self.frame) };
+    }
+}
+
+impl Grabber {
+    /// Pictures can be encoded on another thread while the next ones are taken (GPU input).
+    /// CPU input shares one staging texture, so each picture must be encoded before the next.
+    pub fn pipelined(&self) -> bool {
+        matches!(self.kind, GrabKind::Gpu(_))
+    }
+
+    /// Copy the current picture for frame `n`. Call with the frame lock held; returns at once.
+    pub fn grab(&self, latest: &wgc::Latest, n: i64) -> Result<Grab, String> {
+        unsafe {
+            let g = Grab { frame: ff::av_frame_alloc(), pts: n };
+            if g.frame.is_null() {
+                return Err("out of memory".into());
+            }
+            let ctx = &self.gpu.context;
+            match &self.kind {
+                GrabKind::Gpu(frames) => {
+                    check(ff::av_hwframe_get_buffer(*frames, g.frame, 0), "get gpu frame")?;
+                    let raw = (*g.frame).data[0] as *mut std::ffi::c_void;
+                    let dst = ID3D11Texture2D::from_raw_borrowed(&raw).ok_or("null texture")?;
+                    let index = (*g.frame).data[1] as usize as u32;
+                    ctx.CopySubresourceRegion(dst, index, 0, 0, 0, &latest.texture, 0, None);
+                }
+                GrabKind::Cpu(staging) => ctx.CopyResource(staging, &latest.texture),
+            }
+            // Submit now: the GPU (shared with a busy game) gets the copy as early as possible,
+            // so it is done by the time the encoder needs it.
+            ctx.Flush();
+            Ok(g)
+        }
+    }
+}
+
+impl Drop for Grabber {
+    fn drop(&mut self) {
+        if let GrabKind::Gpu(frames) = &mut self.kind {
+            unsafe { ff::av_buffer_unref(frames) };
+        }
+    }
+}
+
 struct Rate {
     cq: i32,
     maxrate: i64,
@@ -48,6 +119,27 @@ fn rate(q: Quality, w: u32, h: u32, fps: u32) -> Rate {
         Quality::Maximum => (0.20, 18),
     };
     Rate { cq, maxrate: (w as f64 * h as f64 * fps as f64 * bpp) as i64 }
+}
+
+/// NVENC preset (1..=7) and CQ for a quality at a given pixel rate.
+///
+/// Each quality has a preferred preset, but slower presets cannot keep up at high pixel rates:
+/// measured on an RTX 4090 with the GPU otherwise idle, H.264 at 4K managed p5 76 fps, p4 130,
+/// p3 175, p1-p2 ~220, and with a game sharing the GPU throughput fell to ~60 % of that (p5
+/// then encoded ~48 fps at 4K60: dropped frames). So the preferred preset is kept only while it
+/// has about 2x headroom; otherwise the slowest preset that does is used, with CQ one step
+/// lower to keep the picture quality the setting promises.
+fn nvenc_preset(q: Quality, w: u32, h: u32, fps: u32, cq: i32) -> (u32, i32) {
+    // Idle H.264 throughput per preset, million pixels/s (index = preset - 1).
+    const CAPACITY: [f64; 7] = [1830.0, 1830.0, 1450.0, 1080.0, 630.0, 600.0, 570.0];
+    let preferred = match q {
+        Quality::Balanced => 4,
+        Quality::High => 5,
+        Quality::Maximum => 6,
+    };
+    let need = 2.0 * w as f64 * h as f64 * fps as f64 / 1e6;
+    let preset = (1..=preferred).rev().find(|&p| CAPACITY[p as usize - 1] >= need).unwrap_or(1);
+    (preset, if preset < preferred { cq - 1 } else { cq })
 }
 
 impl VideoEncoder {
@@ -180,10 +272,11 @@ impl VideoEncoder {
             };
             match name {
                 "h264_nvenc" => {
-                    av::opt(pd, "preset", match q { Quality::Balanced => "p4", Quality::High => "p5", Quality::Maximum => "p6" })?;
+                    let (preset, cq) = nvenc_preset(q, w, h, fps, r.cq);
+                    av::opt(pd, "preset", &format!("p{preset}"))?;
                     av::opt(pd, "tune", "hq")?;
                     av::opt(pd, "rc", "vbr")?;
-                    av::opt(pd, "cq", &r.cq.to_string())?;
+                    av::opt(pd, "cq", &cq.to_string())?;
                     av::opt(pd, "profile", "high")?;
                     av::opt(pd, "spatial-aq", "1")?;
                     (*ctx).bit_rate = 0; // pure CQ under the maxrate ceiling
@@ -223,25 +316,36 @@ impl VideoEncoder {
         self.ctx
     }
 
-    /// Encode the current contents of `latest` as frame number `n` and hand finished packets
-    /// to `out`.
-    pub fn encode(&mut self, latest: &wgc::Latest, n: i64, out: &mut impl FnMut(Packet)) -> Result<(), String> {
+    /// What the clock thread needs to take pictures while this encoder runs on its own thread.
+    pub fn grabber(&self) -> Grabber {
+        let kind = match &self.input {
+            Input::Gpu { frames } => GrabKind::Gpu(unsafe { ff::av_buffer_ref(*frames) }),
+            Input::Cpu { staging, .. } => GrabKind::Cpu(staging.clone()),
+        };
+        Grabber { kind, gpu: self.gpu.clone() }
+    }
+
+    /// Encode a picture taken by [`Grabber::grab`] and hand finished packets to `out`.
+    ///
+    /// GPU input: the copy was queued (and flushed) when the picture was taken, typically a frame
+    /// or more earlier, so NVENC/AMF rarely has to wait for it here. CPU input: the picture is in
+    /// the staging texture; it is mapped (waiting for the copy) and converted now.
+    pub fn encode(&mut self, g: Grab, out: &mut impl FnMut(Packet)) -> Result<(), String> {
         unsafe {
-            let mut f = ff::av_frame_alloc();
+            let n = g.pts;
             let res = (|| -> Result<(), String> {
-                match &self.input {
-                    Input::Gpu { frames } => {
-                        check(ff::av_hwframe_get_buffer(*frames, f, 0), "get gpu frame")?;
-                        let raw = (*f).data[0] as *mut std::ffi::c_void;
-                        let dst = ID3D11Texture2D::from_raw_borrowed(&raw).ok_or("null texture")?;
-                        let index = (*f).data[1] as usize as u32;
-                        self.gpu.context.CopySubresourceRegion(dst, index, 0, 0, 0, &latest.texture, 0, None);
+                let f = match &self.input {
+                    Input::Gpu { .. } => {
+                        if g.frame.is_null() {
+                            return Err("picture taken without a GPU frame".into());
+                        }
+                        g.frame
                     }
                     Input::Cpu { staging, sws } => {
                         let ctx = &self.gpu.context;
-                        ctx.CopyResource(staging, &latest.texture);
                         let mut map = D3D11_MAPPED_SUBRESOURCE::default();
                         ctx.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut map)).map_err(|e| e.to_string())?;
+                        let f = g.frame;
                         (*f).format = ff::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
                         (*f).width = (*self.ctx).width;
                         (*f).height = (*self.ctx).height;
@@ -253,13 +357,18 @@ impl VideoEncoder {
                         }
                         ctx.Unmap(staging, 0);
                         check(r, "cpu frame")?;
+                        f
                     }
-                }
+                };
                 (*f).pts = n;
+                let t_send = crate::clock::now_100ns();
                 check(ff::avcodec_send_frame(self.ctx, f), "encode")?;
-                self.drain(out)
+                let t_sent = crate::clock::now_100ns();
+                let r = self.drain(out);
+                crate::trace::ev("encd", t_send, n, (t_sent - t_send) as i64, (crate::clock::now_100ns() - t_sent) as i64);
+                r
             })();
-            ff::av_frame_free(&mut f);
+            drop(g);
             res
         }
     }
@@ -293,5 +402,22 @@ impl Drop for VideoEncoder {
                 Input::Cpu { sws, .. } => ff::sws_freeContext(*sws),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nvenc_preset;
+    use capture_protocol::Quality;
+
+    #[test]
+    fn preset_keeps_up_with_the_pixel_rate() {
+        assert_eq!(nvenc_preset(Quality::High, 1920, 1080, 60, 21), (5, 21));
+        assert_eq!(nvenc_preset(Quality::High, 2560, 1440, 60, 21), (5, 21));
+        assert_eq!(nvenc_preset(Quality::Maximum, 2560, 1440, 60, 18), (6, 18));
+        assert_eq!(nvenc_preset(Quality::High, 3840, 2160, 60, 21), (4, 20), "4K60: p5 drops frames under game load");
+        assert_eq!(nvenc_preset(Quality::Maximum, 3840, 2160, 60, 18), (4, 17));
+        assert_eq!(nvenc_preset(Quality::Balanced, 3840, 2160, 60, 24), (4, 24));
+        assert_eq!(nvenc_preset(Quality::High, 3840, 2160, 120, 21), (1, 20));
     }
 }

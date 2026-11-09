@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,7 @@ use crate::av::Packet;
 use crate::gpu::Gpu;
 use crate::mux::{SegmentWriter, StreamDesc};
 use crate::ring::{Ring, Segment};
-use crate::video::VideoEncoder;
+use crate::video::{self, VideoEncoder};
 use crate::{clock, save, storage, wgc};
 
 pub const SEGMENT_SECS: f64 = 2.0;
@@ -527,11 +527,31 @@ fn frame_at(t0: u64, now: u64, fps: u32) -> i64 {
     (now.saturating_sub(t0) as u128 * fps as u128 / 10_000_000) as i64
 }
 
-fn run_video(shared: Arc<Shared>, capture: Arc<wgc::Capture>, mut enc: VideoEncoder, fps: u32, stop: Arc<AtomicBool>, tx: std::sync::mpsc::SyncSender<Packet>) {
-    let mut n: i64 = 0;
+/// Pictures taken but not yet encoded (GPU input). Enough to ride out an encoder call that waits
+/// on a GPU busy with the game; if the encoder falls further behind than this, ticks are dropped.
+const ENCODE_QUEUE: usize = 6;
+
+fn run_video(shared: Arc<Shared>, capture: Arc<wgc::Capture>, enc: VideoEncoder, fps: u32, stop: Arc<AtomicBool>, tx: std::sync::mpsc::SyncSender<Packet>) {
+    let grabber = enc.grabber();
+    // GPU input: the clock thread only takes pictures (a queued GPU copy) and an encoder thread
+    // submits them. An encoder call can block for longer than a frame while the GPU is busy
+    // with the game; on the clock thread, and under the frame lock, that dropped ticks and
+    // starved the capture callback (frozen runs of repeated pictures in the recording).
+    let (mut sync_enc, queue, enc_thread) = if grabber.pipelined() {
+        let (qtx, qrx) = sync_channel::<video::Grab>(ENCODE_QUEUE);
+        let (shared, tx) = (shared.clone(), tx.clone());
+        let t = std::thread::Builder::new()
+            .name("video-encode".into())
+            .spawn(move || encode_loop(shared, enc, qrx, tx))
+            .unwrap();
+        (None, Some(qtx), Some(t))
+    } else {
+        (Some(enc), None, None)
+    };
     let mut send = |p: Packet| {
         let _ = tx.send(p);
     };
+    let mut n: i64 = 0;
     let mut ended = false;
     while !stop.load(Ordering::Relaxed) {
         let due = frame_due(shared.t0, n, fps);
@@ -542,6 +562,7 @@ fn run_video(shared: Arc<Shared>, capture: Arc<wgc::Capture>, mut enc: VideoEnco
         }
         let behind = frame_at(shared.t0, now, fps) - n;
         if behind > 0 {
+            crate::trace::ev("drop", now, n, behind, (now - due) as i64);
             shared.frames_dropped.fetch_add(behind as u64, Ordering::Relaxed);
             n += behind;
         }
@@ -549,31 +570,59 @@ fn run_video(shared: Arc<Shared>, capture: Arc<wgc::Capture>, mut enc: VideoEnco
             ended = true; // reported as "Waiting" by the engine; footage stays saveable
             break;
         }
-        // Encode under the frame lock, but send after releasing it: a slow disk that fills the
-        // channel must not also block the capture callback and screenshots.
-        let mut out = Vec::new();
+        // Only the GPU copy happens under the frame lock (microseconds); encoding happens after
+        // it is released, so the capture callback and screenshots never wait for the encoder.
+        let t_lock = clock::now_100ns();
         let latest = capture.latest.lock().unwrap();
-        if latest.has_frame {
-            let r = enc.encode(&latest, n, &mut |p| out.push(p));
-            drop(latest);
-            match r {
-                Ok(()) => {
-                    shared.frames_encoded.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(e) => {
+        let t_locked = clock::now_100ns();
+        let grab = latest.has_frame.then(|| grabber.grab(&latest, n));
+        drop(latest);
+        crate::trace::ev("enc", t_lock, n, (t_locked - t_lock) as i64, (clock::now_100ns() - t_locked) as i64);
+        let result = match grab {
+            None => Ok(()),
+            Some(Err(e)) => Err(e),
+            Some(Ok(g)) => match (&queue, sync_enc.as_mut()) {
+                (Some(q), _) => match q.try_send(g) {
+                    Ok(()) => Ok(()),
+                    Err(TrySendError::Full(_)) => {
+                        // The encoder is more than ENCODE_QUEUE frames behind: lose this one.
+                        crate::trace::ev("drop", now, n, 1, -1);
+                        shared.frames_dropped.fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    }
+                    // The encoder thread stopped after an error (already reported).
+                    Err(TrySendError::Disconnected(_)) => {
+                        ended = true;
+                        break;
+                    }
+                },
+                (None, Some(enc)) => {
+                    let mut out = Vec::new();
+                    let r = enc.encode(g, &mut |p| out.push(p));
                     out.into_iter().for_each(&mut send);
-                    shared.set_attention(Some(format!("Video encoding failed: {e}")));
-                    ended = true;
-                    break;
+                    if r.is_ok() {
+                        shared.frames_encoded.fetch_add(1, Ordering::Relaxed);
+                    }
+                    r
                 }
-            }
-        } else {
-            drop(latest);
+                (None, None) => unreachable!(),
+            },
+        };
+        if let Err(e) = result {
+            shared.set_attention(Some(format!("Video encoding failed: {e}")));
+            ended = true;
+            break;
         }
-        out.into_iter().for_each(&mut send);
         n += 1;
     }
-    enc.flush(&mut send);
+    drop(queue);
+    if let Some(t) = enc_thread {
+        let _ = t.join(); // encodes what is queued, then flushes
+    }
+    if let Some(enc) = sync_enc.as_mut() {
+        enc.flush(&mut send);
+    }
+    crate::trace::flush();
     if ended {
         // No more picture: stop the whole session (audio too) so the mux closes the last
         // segment on disk and saves end where the video ended, instead of an open segment
@@ -581,6 +630,24 @@ fn run_video(shared: Arc<Shared>, capture: Arc<wgc::Capture>, mut enc: VideoEnco
         *shared.ended_at.lock().unwrap() = Some(shared.now());
         stop.store(true, Ordering::SeqCst);
     }
+}
+
+fn encode_loop(shared: Arc<Shared>, mut enc: VideoEncoder, queue: Receiver<video::Grab>, tx: std::sync::mpsc::SyncSender<Packet>) {
+    let mut send = |p: Packet| {
+        let _ = tx.send(p);
+    };
+    for g in queue.iter() {
+        match enc.encode(g, &mut send) {
+            Ok(()) => {
+                shared.frames_encoded.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                shared.set_attention(Some(format!("Video encoding failed: {e}")));
+                break; // dropping `queue` tells the clock thread to end the session
+            }
+        }
+    }
+    enc.flush(&mut send);
 }
 
 fn run_mux(shared: Arc<Shared>, rx: Receiver<Packet>, streams: Vec<StreamDesc>) {

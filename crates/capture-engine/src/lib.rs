@@ -20,6 +20,7 @@ pub mod sound;
 pub mod stems;
 pub mod storage;
 pub mod targets;
+pub mod trace;
 pub mod video;
 pub mod wgc;
 
