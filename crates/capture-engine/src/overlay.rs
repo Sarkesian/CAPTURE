@@ -131,7 +131,9 @@ unsafe fn present(hwnd: HWND, n: Notice) {
     let (mut dx, mut dy) = (96u32, 96u32);
     let _ = GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
     SCALE_PCT.store(dx * 100 / 96, Ordering::Relaxed);
-    let (wdt, hgt) = (s(380), s(66));
+    // One extra row per additional detail line (e.g. the overlay hotkey under the save hotkey).
+    let extra = n.detail.lines().count().saturating_sub(1) as i32;
+    let (wdt, hgt) = (s(380), s(66) + extra * s(19));
     let x = mi.rcMonitor.right - wdt - s(24);
     let y = mi.rcMonitor.top + s(24);
     *CURRENT.lock().unwrap() = Some(n);
@@ -185,7 +187,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let br = CreateSolidBrush(dot);
                 let old_b = SelectObject(dc, br.into());
                 let old_p = SelectObject(dc, GetStockObject(NULL_PEN));
-                let cy = rc.bottom / 2;
+                let cy = s(23); // level with the title, however many detail lines follow
                 let _ = Ellipse(dc, s(18), cy - s(7), s(32), cy + s(7));
                 SelectObject(dc, old_p);
                 SelectObject(dc, old_b);
@@ -205,7 +207,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     SelectObject(dc, old);
                 };
                 draw(f1, rgb(240, 242, 246), s(11), s(34), &n.title);
-                draw(f2, rgb(160, 168, 182), s(35), s(56), &n.detail);
+                for (i, line) in n.detail.lines().enumerate() {
+                    let top = s(35) + i as i32 * s(19);
+                    draw(f2, rgb(160, 168, 182), top, top + s(21), line);
+                }
                 let _ = DeleteObject(f1.into());
                 let _ = DeleteObject(f2.into());
             }

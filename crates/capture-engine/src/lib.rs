@@ -68,6 +68,11 @@ pub struct Engine {
     meter_clients: std::collections::HashSet<String>,
 }
 
+/// A hotkey as shown in notices: `"Alt+F10"`.
+fn quoted(combo: &str) -> String {
+    format!("\"{combo}\"")
+}
+
 pub fn fmt_secs(s: f64) -> String {
     let s = s.round() as u64;
     match (s / 60, s % 60) {
@@ -371,14 +376,19 @@ impl Engine {
                 self.start_error = None;
                 self.fps_sample = (Instant::now(), 0);
                 self.pipeline = Some(p);
-                let hk = if cfg.save_hotkey.is_empty() { "Save clip in CAPTURE".to_string() } else { cfg.save_hotkey.clone() };
+                let save = if cfg.save_hotkey.is_empty() { "Save clip in CAPTURE".to_string() } else { quoted(&cfg.save_hotkey) };
                 let title = if display { "Recording your display".to_string() } else { format!("Recording {name}") };
                 let mic = match (cfg.audio.mic_enabled, cfg.audio.mic_muted) {
                     (true, false) => " · mic ON",
                     (true, true) => " · mic muted",
                     _ => "",
                 };
-                self.notice(Kind::Recording, title, format!("{hk} saves the last {}{mic}", fmt_secs(live_of(cfg).replay_secs as f64)));
+                let mut detail = format!("{save} saves the last {}{mic}", fmt_secs(live_of(cfg).replay_secs as f64));
+                if !cfg.hotkeys.overlay.is_empty() {
+                    detail.push_str(&format!("
+{} opens the overlay", quoted(&cfg.hotkeys.overlay)));
+                }
+                self.notice(Kind::Recording, title, detail);
             }
             Err(e) => self.start_error = Some(failed(e)),
         }
@@ -393,7 +403,12 @@ impl Engine {
         if p.start_session() {
             let game = p.shared.game_name.clone();
             self.ack_sound();
-            self.notice(Kind::Recording, format!("Recording session · {game}"), "Press the same key again to stop and save it".into());
+            let key = self.cfg.as_ref().map(|c| c.hotkeys.session.clone()).filter(|k| !k.is_empty());
+            let detail = match key {
+                Some(k) => format!("Press {} again to stop and save it", quoted(&k)),
+                None => "Press the same key again to stop and save it".into(),
+            };
+            self.notice(Kind::Recording, format!("Recording session · {game}"), detail);
         }
     }
 
