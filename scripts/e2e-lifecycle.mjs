@@ -76,7 +76,11 @@ async function quitAndWait() {
 }
 
 try {
-  // 1. First launch of a new version, started like Windows sign-in does.
+  // 1. First launch of a new version, started like Windows sign-in does. The previous version
+  // was set to start with Windows: its entry must move to the new copy (it would otherwise keep
+  // starting the old version, and single-instance would hand every new launch to it).
+  writeFileSync(path.join(oldDir, 'CAPTURE.exe'), 'placeholder for the previous version');
+  ps(`Set-ItemProperty '${RUN}' -Name CAPTURE -Value '"${path.join(oldDir, 'CAPTURE.exe')}" --tray'`);
   launch('--tray');
   await connect();
   await waitUntil(() => procs('capture-worker').length === 1, 10000);
@@ -84,6 +88,7 @@ try {
   check(s.save_hotkey === 'Alt+F9' && s.mic_enabled && s.mic_device === previous.mic_device && s.replay_secs === 600 && s.per_game.length === 1 && s.games[0] === 'MyGame.exe',
     'update: settings copied from the previous version folder (mic, hotkey, replay, games, per-game)');
   check(existsSync(path.join(oldDir, 'data', 'settings.json')), 'update: previous version folder left untouched');
+  check(runEntry() === `"${exe}" --tray` && s.start_with_windows, `update: Start with Windows moved from the previous version to this copy (${runEntry()})`);
   check(!mainVisible(), 'started with --tray: no window shown');
   check(procs('CAPTURE').length === 1 && procs('capture-worker').length === 1, 'one UI process, one capture engine');
 
