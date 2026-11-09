@@ -522,6 +522,15 @@ fn run_mux(shared: Arc<Shared>, rx: Receiver<Packet>, streams: Vec<StreamDesc>) 
     let mut last_video = 0.0;
     let mut seq: u64 = 0;
     let mut disk_paused = false;
+    // The buffer folder could not be written (drive unplugged, network share gone...). Cleared,
+    // with its message, as soon as a new segment can be created again.
+    let mut write_failed = false;
+    let cant_write = |e: &dyn std::fmt::Display| {
+        format!(
+            "Can't write temporary footage to {} ({e}). Is the drive disconnected? Recording resumes by itself when it is back; the gap is not recorded.",
+            shared.session_dir.parent().unwrap_or(&shared.session_dir).display()
+        )
+    };
     let mut last_free_check = Instant::now() - Duration::from_secs(10);
     loop {
         let p = match rx.recv_timeout(Duration::from_millis(250)) {
@@ -569,21 +578,35 @@ fn run_mux(shared: Arc<Shared>, rx: Receiver<Packet>, streams: Vec<StreamDesc>) 
             }
             seq += 1;
             let path = shared.session_dir.join(format!("seg_{seq:06}.ts"));
+            // A drive that came back may have lost the session folder (e.g. remounted).
+            let _ = std::fs::create_dir_all(&shared.session_dir);
             match SegmentWriter::create(&path, &streams) {
                 Ok(w) => {
                     writer = Some(w);
                     seg_start = p.secs();
                     shared.ring.lock().unwrap().push(Segment { seq, path, start: seg_start, end: None, bytes: 0, protect: 0 });
+                    if write_failed {
+                        write_failed = false;
+                        shared.set_attention(None);
+                    }
                 }
                 Err(e) => {
-                    shared.set_attention(Some(format!("Cannot write the replay buffer: {e}")));
+                    write_failed = true;
+                    shared.set_attention(Some(cant_write(&e)));
                     continue;
                 }
             }
         }
         if let Some(w) = writer.as_mut() {
             if let Err(e) = w.write(p) {
-                shared.set_attention(Some(format!("Cannot write the replay buffer: {e}")));
+                // Stop writing into a dead file: close it and retry a new segment at the next
+                // keyframe (about once a second) instead of failing for a whole segment.
+                write_failed = true;
+                shared.set_attention(Some(cant_write(&e)));
+                if let Some(w) = writer.take() {
+                    let bytes = w.finish();
+                    shared.ring.lock().unwrap().close_last(last_video, bytes);
+                }
             }
         }
     }
