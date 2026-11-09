@@ -29,9 +29,10 @@ const server=createServer((req,res)=>{
 await new Promise(r=>server.listen(0,'127.0.0.1',r));
 const media=`http://127.0.0.1:${server.address().port}`;
 const pageFile=path.join(root,'app/preview-acceptance.html');
-const html=`<!doctype html><meta charset="utf-8"><style>body{background:#121418;color:#eee;font:14px system-ui;margin:24px}#grid{display:grid;grid-template-columns:repeat(5,200px);gap:16px}.card{height:113px;position:relative;background:#252932;border-radius:8px}h1{font-size:22px}.label{margin-top:120px}</style><h1>Video preview acceptance · direct decoding, memory cache</h1><div id="grid"></div><script type="module">
+const html=`<!doctype html><meta charset="utf-8"><style>body{background:#121418;color:#eee;font:14px system-ui;margin:24px}#grid{display:grid;grid-template-columns:repeat(5,200px);gap:16px}.card{height:113px;position:relative;background:#252932;border-radius:8px}h1{font-size:22px}.label{margin-top:120px}</style><h1>Video preview acceptance · direct decoding, memory cache</h1><div id="recent"></div><div id="grid"></div><script type="module">
 import {mount,unmount} from 'svelte';
 import Preview from '/src/components/VideoPreview.svelte';
+import RecentClips from '/src/components/RecentClips.svelte';
 import {videoPreview} from '/src/lib/videoPreview.ts';
 import {app,init} from '/src/lib/store.svelte.ts';
 const callbacks=new Map(),listeners=new Map();let callbackId=0;
@@ -55,6 +56,14 @@ engine('save_failed',{save_id:1,message:'Disk unavailable'});check(app.toasts.le
 ${process.argv.includes('--feedback-only')?'return {results};':''}
 let last=performance.now(),maxGap=0;const heartbeat=setInterval(()=>{const now=performance.now();maxGap=Math.max(maxGap,now-last);last=now},16);
 const url=${JSON.stringify(media)};
+await sleep(0); // let mocked save-completion list refreshes settle before seeding recent clips
+app.clips=[0,1].map(i=>({path:url+'/opening.mp4?recent='+i,name:'Recent '+i,game:'Preview test',bytes:123,modified_ms:1,kind:'clip',has_stems:false,has_markers:false}));
+for(const clip of app.clips)app.clipInfo[clip.path]={duration:125};
+let played=false;mount(RecentClips,{target:document.querySelector('#recent'),props:{count:4,onplay:()=>played=true}});
+const recentEnd=performance.now()+10000;while(document.querySelectorAll('#recent img').length<2&&performance.now()<recentEnd)await sleep(50);
+check(document.querySelectorAll('#recent img').length===2,'Home Recent clips uses real decoded previews');
+check(document.querySelectorAll('#recent .dur').length===2&&[...document.querySelectorAll('#recent .dur')].every(e=>e.textContent==='2m 05s'),'Recent clips retains duration badges');
+document.querySelector('#recent .thumb').click();check(played,'Recent clips still opens the selected clip');
 const start=performance.now();
 const first=await videoPreview('opening',url+'/opening.mp4');
 const img=new Image();img.src=first;await img.decode();

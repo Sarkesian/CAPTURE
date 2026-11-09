@@ -10,6 +10,7 @@
     openPath, revealPath, deleteClip, openCaptureFolder, showMain, hideOverlay, releaseReview, fmtDuration, fmtBytes,
   } from '../lib/store.svelte';
   import Icon from '../components/Icon.svelte';
+  import VideoPreview from '../components/VideoPreview.svelte';
   import Toggle from '../components/Toggle.svelte';
   import Segmented from '../components/Segmented.svelte';
   import ReviewPanel from './ReviewPanel.svelte';
@@ -195,6 +196,7 @@
             {@const info = app.clipInfo[c.path]}
             <article class="clip">
               <button class="thumb" aria-label="Play {c.name}" onclick={() => { playing = c; view = 'player'; }}>
+                <VideoPreview path={c.path} bytes={c.bytes} modified={c.modified_ms} />
                 <span class="play"><Icon name="play" size={18} /></span>
                 {#if info?.duration}<span class="dur">{fmtDuration(info.duration)}</span>{/if}
               </button>

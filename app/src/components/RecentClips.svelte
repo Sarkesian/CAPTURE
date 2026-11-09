@@ -2,6 +2,7 @@
   // The most recent clips (play tile + duration). Used on Home.
   import { app, requestClipInfo, openPath, revealPath, fmtDuration } from '../lib/store.svelte';
   import Icon from './Icon.svelte';
+  import VideoPreview from './VideoPreview.svelte';
   import type { ClipEntry } from '../lib/types';
 
   let { count = 4, onplay }: { count?: number; onplay?: (c: ClipEntry) => void } = $props();
@@ -25,6 +26,7 @@
       {@const info = app.clipInfo[c.path]}
       <article class="clip">
         <button class="thumb" title="Play {c.name}" onclick={() => (onplay ? onplay(c) : openPath(c.path))}>
+          <VideoPreview path={c.path} bytes={c.bytes} modified={c.modified_ms} />
           <span class="play"><Icon name="play" size={16} /></span>
           {#if info?.duration}<span class="dur">{fmtDuration(info.duration)}</span>{/if}
         </button>
