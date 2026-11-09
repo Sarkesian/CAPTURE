@@ -41,14 +41,14 @@ async function waitFor(pred, ms) { const u = Date.now() + ms; while (Date.now() 
 const click = (p, text, scope = 'button') => p.js(`(() => { const b = [...document.querySelectorAll('${scope}')].find(e => e.innerText.trim().startsWith(${JSON.stringify(text)}) && !e.disabled); if (!b) return false; b.click(); return true; })()`);
 
 const main = await connect(await page(u => !u.includes('#overlay')));
-check(await waitFor(async () => (await main.js(`document.querySelector('.pill')?.textContent.trim()`)) === 'Buffering', 30000), 'main window: Buffering on the running game');
+check(await waitFor(async () => (await main.js(`document.querySelector('[data-test=status]')?.textContent.trim()`)) === 'Replay on', 30000), 'main window: Replay on on the running game');
 const frames0 = await main.js(`0`);
 
 // 1) Real overlay hotkey opens it.
 altKey(0x7a); // Alt+F11
 check(await waitFor(async () => overlayVisible(), 5000), 'Alt+F11 opens the overlay');
 const ov = await connect(await page(u => u.includes('#overlay')));
-await waitFor(async () => (await ov.js(`document.querySelector('.st')?.textContent`)) === 'Buffering', 10000);
+await waitFor(async () => (await ov.js(`document.querySelector('.st')?.textContent`)) === 'Replay on', 10000);
 check((await ov.js(`[...document.querySelectorAll('.act .big')].map(e => e.textContent).join('|')`)) === 'Save Replay|Add Marker|Review Recording|Start Recording', 'four primary actions visible');
 await ov.shot('1-overlay-home');
 
@@ -76,7 +76,7 @@ await ov.shot('4-review-selection');
 const clips1 = files('Clips').length;
 await click(ov, 'Save clip');
 check(await waitFor(async () => files('Clips').length > clips1, 20000), 'selected range saved as a clip');
-await click(ov, '← Back');
+await click(ov, 'Back');
 
 // 4) Session recording.
 await sleep(500);
@@ -89,8 +89,8 @@ check(await waitFor(async () => files('Sessions').length > 0, 20000), `session f
 // 5) Esc hides; recording kept running the whole time.
 await ov.js(`window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))`);
 check(await waitFor(async () => !overlayVisible(), 5000), 'Esc closes the overlay');
-const status1 = await main.js(`document.querySelector('.pill')?.textContent.trim()`);
-check(['Buffering', 'Saving…'].includes(status1), `still recording after using the overlay (status "${status1}")`);
+const status1 = await main.js(`document.querySelector('[data-test=status]')?.textContent.trim()`);
+check(status1 === 'Replay on', `still recording after using the overlay (status "${status1}")`);
 // 6) Marker hotkey without the overlay.
 altKey(0x77); // Alt+F8
 check(await waitFor(async () => (await main.js(`document.body.innerText`)).includes('Marker added'), 5000), 'Alt+F8 adds a marker without opening anything');

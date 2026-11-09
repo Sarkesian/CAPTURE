@@ -5,6 +5,7 @@
   import { convertFileSrc } from '@tauri-apps/api/core';
   import { app, prepareReview, saveRange, engine, fmtDuration } from '../lib/store.svelte';
   import type { Marker } from '../lib/types';
+  import Icon from '../components/Icon.svelte';
 
   let { onclose }: { onclose: () => void } = $props();
 
@@ -94,10 +95,10 @@
   {#if app.reviewError}
     <div class="card">
       <p>{app.reviewError}</p>
-      <button onclick={onclose}>Back</button>
+      <button class="btn" onclick={onclose}>Back</button>
     </div>
   {:else if !rv}
-    <div class="card muted">Opening your recent gameplay… (recording continues)</div>
+    <div class="card muted"><span class="spinner" aria-hidden="true"></span>Opening your recent gameplay… recording continues.</div>
   {:else}
     <div class="stage">
       <!-- svelte-ignore a11y_media_has_caption -->
@@ -122,22 +123,22 @@
         {/if}
       </div>
       <div class="row ctl">
-        <button title="Beginning" aria-label="Beginning" onclick={() => seek(0)}>⏮</button>
-        <button title="Back 5 s" aria-label="Back 5 seconds" onclick={() => step(-5)}>−5s</button>
-        <button class="play" aria-label={paused ? 'Play' : 'Pause'} onclick={toggle}>{paused ? '▶' : '❚❚'}</button>
-        <button title="Forward 5 s" aria-label="Forward 5 seconds" onclick={() => step(5)}>+5s</button>
-        <button title="Latest footage" onclick={live}>Live ⏭</button>
+        <button class="btn icon ghost" title="Beginning" aria-label="Beginning" onclick={() => seek(0)}><Icon name="skip-back" size={18} /></button>
+        <button class="btn ghost sm" title="Back 5 seconds (Left arrow)" aria-label="Back 5 seconds" onclick={() => step(-5)}>−5s</button>
+        <button class="btn icon play" title="Play or pause (Space)" aria-label={paused ? 'Play' : 'Pause'} onclick={toggle}><Icon name={paused ? 'play' : 'pause'} size={18} /></button>
+        <button class="btn ghost sm" title="Forward 5 seconds (Right arrow)" aria-label="Forward 5 seconds" onclick={() => step(5)}>+5s</button>
+        <button class="btn ghost sm" title="Jump to the latest footage" onclick={live}><Icon name="live" size={16} />Live</button>
         <span class="sep"></span>
-        <button disabled={!markers.length} onclick={() => jumpMarker(-1)} aria-label="Previous marker">◀ Marker</button>
-        <button disabled={!markers.length} onclick={() => jumpMarker(1)} aria-label="Next marker">Marker ▶</button>
-        <span class="mono muted">{fmt(t)} / {fmt(dur)}</span>
+        <button class="btn ghost sm" disabled={!markers.length} onclick={() => jumpMarker(-1)} aria-label="Previous marker" title="Previous marker"><Icon name="back" size={14} />Marker</button>
+        <button class="btn ghost sm" disabled={!markers.length} onclick={() => jumpMarker(1)} aria-label="Next marker" title="Next marker">Marker<Icon name="chevron" size={14} /></button>
+        <span class="mono time">{fmt(t)} <span class="faint">/ {fmt(dur)}</span></span>
         <span class="grow"></span>
         {#if sel}
-          <span class="muted small">Clip {fmt(sel.a)}–{fmt(sel.b)} ({fmtDuration(sel.b - sel.a)})</span>
-          <button onclick={() => (sel = null)}>Cancel</button>
-          <button class="primary" onclick={saveSel}>Save clip</button>
+          <span class="muted small">Clip {fmt(sel.a)}–{fmt(sel.b)} · {fmtDuration(sel.b - sel.a)}</span>
+          <button class="btn ghost" onclick={() => (sel = null)}>Cancel</button>
+          <button class="btn primary" onclick={saveSel}>Save clip</button>
         {:else}
-          <button class="primary" onclick={createClip}>Create clip</button>
+          <button class="btn primary" onclick={createClip}>Create clip</button>
         {/if}
       </div>
     </div>
@@ -148,7 +149,7 @@
           <div class="mrow">
             <button class="link" onclick={() => aroundMarker(m)}>{m.at}</button>
             {#if renaming === m.id}
-              <input type="text" value={m.label} placeholder="Name (optional)" aria-label="Marker name"
+              <input class="input" type="text" value={m.label} placeholder="Name (optional)" aria-label="Marker name"
                 onkeydown={ev => { if (ev.key === 'Enter') { engine('rename_marker', { id: m.id, label: (ev.target as HTMLInputElement).value }); renaming = null; } if (ev.key === 'Escape') { ev.stopPropagation(); renaming = null; } }} />
             {:else}
               <span class="ellipsis grow">{m.label || 'Marker'}</span>
@@ -156,37 +157,41 @@
             <span class="small {m.footage === 'protected' ? 'ok' : 'muted'}" title={m.note ?? ''}>
               {m.saved_in.length ? 'Saved in a clip' : m.footage === 'protected' ? 'Kept until saved or session ends' : m.footage === 'buffered' ? 'Temporary' : 'Footage gone'}
             </span>
-            <button onclick={() => saveAround(m)} title="Save {fmtDuration(before)} before to {fmtDuration(after)} after">Save around</button>
-            <button onclick={() => (renaming = m.id)}>Rename</button>
-            <button onclick={() => engine('remove_marker', { id: m.id })}>Remove</button>
+            <button class="btn sm" onclick={() => saveAround(m)} title="Save {fmtDuration(before)} before to {fmtDuration(after)} after">Save around</button>
+            <button class="btn ghost sm icon" title="Rename" aria-label="Rename marker" onclick={() => (renaming = m.id)}><Icon name="pencil" size={15} /></button>
+            <button class="btn ghost sm icon" title="Remove" aria-label="Remove marker" onclick={() => engine('remove_marker', { id: m.id })}><Icon name="x" size={15} /></button>
           </div>
         {/each}
       </div>
     {/if}
-    <p class="muted small">Showing footage up to {fmt(dur)} into the buffer. Recording continues in the background; press Live to catch up.</p>
+    <p class="faint xs">Showing footage up to {fmt(dur)} into the buffer. Recording continues in the background; press Live to catch up.</p>
   {/if}
 </section>
 
 <style>
-  .rv { display: flex; flex-direction: column; gap: 10px; flex: 1; min-height: 0; }
-  .stage { position: relative; flex: 1; min-height: 0; background: #000; border-radius: 10px; overflow: hidden; }
-  video { width: 100%; height: 100%; object-fit: contain; display: block; }
-  .busy { position: absolute; top: 10px; right: 10px; background: #000b; padding: 4px 10px; border-radius: 6px; font-size: 13px; }
-  .timeline { display: flex; flex-direction: column; gap: 8px; }
-  .track { position: relative; height: 26px; background: #232833; border-radius: 6px; cursor: pointer; touch-action: none; }
-  .fill { position: absolute; inset: 0 auto 0 0; background: #2f3644; border-radius: 6px; pointer-events: none; }
-  .sel { position: absolute; top: 0; bottom: 0; background: #ef444440; border: 1px solid var(--accent); border-radius: 4px; pointer-events: none; }
-  .head { position: absolute; top: -3px; bottom: -3px; width: 2px; background: white; transform: translateX(-1px); pointer-events: none; }
-  .mk { position: absolute; top: 3px; width: 10px; height: 20px; padding: 0; transform: translateX(-5px); background: var(--warn); border: none; border-radius: 3px; }
-  .mk.prot { box-shadow: 0 0 0 2px #fbbf2455; }
+  .rv { display: flex; flex-direction: column; gap: var(--s3); flex: 1; min-height: 0; }
+  .card { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: var(--s3); flex: 1; padding: var(--s8);
+          border-radius: var(--r-lg); background: var(--surface); text-align: center; }
+  .spinner { width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--line-strong); border-top-color: var(--accent); animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .stage { position: relative; flex: 1; min-height: 160px; background: #000; border-radius: var(--r-lg); overflow: hidden; }
+  video { width: 100%; height: 100%; object-fit: contain; display: block; cursor: pointer; }
+  .busy { position: absolute; top: var(--s3); right: var(--s3); background: rgba(0, 0, 0, 0.75); color: #fff; padding: var(--s1) var(--s3); border-radius: var(--r-sm); font-size: var(--fs-sm); }
+  .timeline { display: flex; flex-direction: column; gap: var(--s2); }
+  .track { position: relative; height: 28px; background: var(--surface-2); border-radius: var(--r-sm); cursor: pointer; touch-action: none; }
+  .track:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .fill { position: absolute; inset: 0 auto 0 0; background: var(--surface-3); border-radius: var(--r-sm); pointer-events: none; }
+  .sel { position: absolute; top: 0; bottom: 0; background: var(--accent-soft); border: 1px solid var(--accent); border-radius: var(--r-sm); pointer-events: none; }
+  .head { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--text); transform: translateX(-1px); pointer-events: none; }
+  .mk { position: absolute; top: 4px; width: 8px; height: 20px; padding: 0; transform: translateX(-4px); background: var(--warn); border: none; border-radius: 2px; cursor: pointer; }
+  .mk.prot { box-shadow: 0 0 0 2px var(--warn-soft); }
   .handle { position: absolute; top: -4px; bottom: -4px; width: 10px; transform: translateX(-5px); background: var(--accent); border-radius: 3px; cursor: ew-resize; }
-  .ctl { gap: 6px; }
-  .ctl button { padding: 5px 10px; }
-  .play { width: 52px; }
-  .sep { width: 10px; }
-  .markers { display: flex; flex-direction: column; gap: 4px; max-height: 120px; overflow: auto; }
-  .mrow { display: flex; align-items: center; gap: 8px; font-size: 14px; }
-  .mrow button { padding: 3px 8px; font-size: 13px; }
-  .mrow input { padding: 3px 8px; }
+  .ctl { gap: var(--s1); flex-wrap: wrap; }
+  .play { width: 44px; }
+  .time { font-size: var(--fs-sm); padding: 0 var(--s2); }
+  .sep { width: 1px; height: 20px; background: var(--line); margin: 0 var(--s1); }
+  .markers { display: flex; flex-direction: column; max-height: 132px; overflow: auto; border-top: 1px solid var(--line); }
+  .mrow { display: flex; align-items: center; gap: var(--s2); font-size: var(--fs-sm); padding: var(--s1) 0; border-bottom: 1px solid var(--line); }
+  .mrow .input { height: var(--h-sm); }
   .ok { color: var(--ok); }
 </style>

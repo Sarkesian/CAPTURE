@@ -33,6 +33,11 @@ impl Monitor {
         &self.device
     }
 
+    pub fn take_level(&self) -> capture_protocol::Level {
+        let (peak, rms) = self.buf.lock().unwrap().take_level();
+        capture_protocol::Level { name: "Microphone".into(), peak, rms }
+    }
+
     pub fn level(&self) -> MicLevel {
         let b = self.buf.lock().unwrap();
         MicLevel { device: self.device.clone(), peak: (b.live_peak() * 100.0).round() / 100.0, error: b.error() }

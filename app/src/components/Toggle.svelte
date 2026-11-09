@@ -4,26 +4,27 @@
   } = $props();
 </script>
 
-<button
-  type="button"
-  role="switch"
-  aria-checked={checked}
-  aria-label={label}
-  class="switch"
-  class:on={checked}
-  class:big
-  {disabled}
-  onclick={() => onchange(!checked)}
->
+<button type="button" role="switch" aria-checked={checked} aria-label={label} class="switch" class:on={checked} class:big {disabled}
+  onclick={() => onchange(!checked)}>
   <span class="knob"></span>
 </button>
 
 <style>
-  .switch { width: 46px; height: 26px; padding: 0; border-radius: 999px; position: relative; background: #3a404c; border: none; flex: none; }
-  .switch.big { width: 60px; height: 34px; }
-  .switch.on { background: var(--accent); }
-  .knob { position: absolute; top: 3px; left: 3px; width: 20px; height: 20px; border-radius: 50%; background: white; transition: transform 0.15s; }
-  .big .knob { width: 28px; height: 28px; }
-  .on .knob { transform: translateX(20px); }
-  .big.on .knob { transform: translateX(26px); }
+  .switch {
+    --w: 40px; --h: 22px; --k: 16px;
+    position: relative; flex: none; width: var(--w); height: var(--h); padding: 0; border-radius: 999px;
+    border: 1px solid var(--line-strong); background: var(--surface-3); cursor: pointer;
+    transition: background var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease);
+  }
+  .switch.big { --w: 48px; --h: 26px; --k: 20px; }
+  .switch:hover:not(:disabled) { border-color: var(--text-3); }
+  .switch.on { background: var(--accent); border-color: var(--accent); }
+  .switch:disabled { opacity: 0.45; cursor: default; }
+  .knob {
+    position: absolute; top: 50%; left: 2px; width: var(--k); height: var(--k); margin-top: calc(var(--k) / -2);
+    border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+    transition: transform var(--t-med) var(--ease);
+  }
+  .on .knob { transform: translateX(calc(var(--w) - var(--k) - 6px)); }
+  .switch:active:not(:disabled) .knob { width: calc(var(--k) + 3px); }
 </style>

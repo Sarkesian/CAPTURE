@@ -38,16 +38,17 @@
   }
 </script>
 
-<div class="row">
-  <button type="button" class="key" class:rec={recording} onclick={() => (recording = !recording)} {onkeydown} aria-label="Save hotkey: {value || 'none'}. Activate to record a new one.">
+<div class="row hk">
+  <button type="button" class="btn key" class:rec={recording} onclick={() => (recording = !recording)} {onkeydown} aria-label="Save hotkey: {value || 'none'}. Activate to record a new one.">
     {recording ? 'Press keys… (Esc to cancel)' : value || 'Not set'}
   </button>
   {#if value && !recording}
-    <button type="button" class="link" onclick={() => onchange('')}>Clear</button>
+    <button type="button" class="btn ghost sm" onclick={() => onchange('')} aria-label="Clear hotkey">Clear</button>
   {/if}
 </div>
 
 <style>
-  .key { font-family: "Cascadia Mono", Consolas, monospace; min-width: 150px; }
-  .key.rec { border-color: var(--focus); color: var(--focus); }
+  .hk { gap: var(--s2); }
+  .key { min-width: 160px; font-family: "Cascadia Mono", Consolas, monospace; font-size: var(--fs-sm); }
+  .key.rec { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
 </style>

@@ -31,9 +31,9 @@ ws.addEventListener('message', ev => { const m = JSON.parse(ev.data); if (pendin
 const cdp = (method, params = {}) => new Promise(r => { const i = ++id; pending.set(i, r); ws.send(JSON.stringify({ id: i, method, params })); });
 const js = async expr => (await cdp('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true })).result?.result?.value;
 const shot = async name => { const r = await cdp('Page.captureScreenshot', { format: 'png' }); writeFileSync(`${shots}/${name}.png`, Buffer.from(r.result.data, 'base64')); };
-const status = () => js(`document.querySelector('.pill')?.textContent?.trim() ?? ''`);
+const status = () => js(`document.querySelector('[data-test=status]')?.textContent?.trim() ?? ''`);
 const detail = () => js(`document.querySelector('.detail')?.textContent?.trim() ?? ''`);
-const lastClip = () => js(`document.querySelector('.last .ellipsis')?.textContent ?? ''`);
+const lastClip = () => js(`document.querySelector('[data-test=last-clip] .link')?.textContent ?? ''`);
 async function waitFor(pred, ms) { const until = Date.now() + ms; while (Date.now() < until) { if (await pred()) return true; await sleep(250); } return false; }
 
 function ps(script) { return execFileSync('powershell', ['-NoProfile', '-Command', script]).toString().trim(); }
@@ -51,10 +51,10 @@ await shot('1-watching');
 
 // Launch the game; it becomes the foreground window.
 const game = spawn(gameExe, [], { cwd: path.dirname(gameExe), detached: true, stdio: 'ignore' });
-check(await waitFor(async () => (await status()) === 'Buffering', 30000), `game launched -> auto-detected and Buffering (got "${await status()}: ${await detail()}")`);
-const rec = await js(`document.querySelector('.card p b')?.textContent ?? ''`);
-const how = await js(`document.querySelector('.card p .muted')?.textContent ?? ''`);
-check(/FAULTHEART/i.test(rec), `Capture tab says Recording ${rec} ${how}`);
+check(await waitFor(async () => (await status()) === 'Replay on', 30000), `game launched -> auto-detected and Replay on (got "${await status()}: ${await detail()}")`);
+const rec = await js(`document.querySelector('[data-test=title]')?.textContent ?? ''`);
+const how = await js(`document.querySelector('.detail')?.textContent ?? ''`);
+check(/FAULTHEART/i.test(rec), `Home says ${rec} ${how}`);
 
 // The on-screen notice: visible, topmost, excluded from capture.
 const ov = ps(`
@@ -84,7 +84,7 @@ await sleep(1500);
 before = await lastClip();
 tap(0x23, 0x4f, true);
 check(!(await waitFor(async () => (await lastClip()) !== before, 5000)), 'the real End key does not trigger a save');
-console.log('last clip:', (await js(`document.querySelector('.last')?.innerText ?? ''`)).replace(/\n/g, ' | '));
+console.log('last clip:', (await js(`document.querySelector('[data-test=last-clip]')?.innerText ?? ''`)).replace(/\n/g, ' | '));
 await shot('3-saved');
 
 // Close the game: status returns to waiting, footage still saveable.

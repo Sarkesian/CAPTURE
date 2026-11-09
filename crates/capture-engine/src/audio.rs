@@ -114,6 +114,10 @@ pub(crate) struct TrackBuf {
     source: String,
     /// Level-only monitor: samples are measured but not stored.
     pub(crate) discard: bool,
+    /// Meter window since the last `take_level` (peak, sum of squares, sample count).
+    win_peak: f32,
+    win_sq: f64,
+    win_n: u64,
 }
 
 impl TrackBuf {
@@ -162,6 +166,9 @@ impl TrackBuf {
 
     fn measure(&mut self, s: &[f32]) {
         let p = s.iter().fold(0f32, |m, x| m.max(x.abs()));
+        self.win_peak = self.win_peak.max(p);
+        self.win_sq += s.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>();
+        self.win_n += s.len() as u64;
         if p > 0.0 {
             self.signal_seen = true;
         }
@@ -188,6 +195,16 @@ impl TrackBuf {
         } else {
             0.0
         }
+    }
+
+    /// Peak and RMS since the previous call (both 0 when no sound arrived), then reset.
+    pub(crate) fn take_level(&mut self) -> (f32, f32) {
+        let rms = if self.win_n > 0 { (self.win_sq / self.win_n as f64).sqrt() as f32 } else { 0.0 };
+        let r = (self.win_peak, rms);
+        self.win_peak = 0.0;
+        self.win_sq = 0.0;
+        self.win_n = 0;
+        r
     }
 
     pub(crate) fn error(&self) -> Option<String> {
@@ -313,6 +330,29 @@ impl AudioPipeline {
             });
         }
         v
+    }
+
+    /// Meter levels since the last call: Preview Mix (as heard, with gains and mute) then each
+    /// source. Muted microphone reports 0.
+    pub fn take_levels(&self) -> Vec<capture_protocol::Level> {
+        let mix = *self.mix.lock().unwrap();
+        let mut srcs: Vec<(f32, f32)> = self.bufs.iter().map(|b| b.lock().unwrap().take_level()).collect();
+        for (i, s) in srcs.iter_mut().enumerate() {
+            if self.sources[i].role == Role::Mic && mix.mic_muted {
+                *s = (0.0, 0.0);
+            }
+        }
+        let mut out = Vec::new();
+        if !srcs.is_empty() {
+            let mixed: Vec<usize> = (0..srcs.len()).filter(|&i| self.sources[i].in_mix).collect();
+            let peak = mixed.iter().map(|&i| srcs[i].0 * mix.gain(self.sources[i].role)).fold(0f32, f32::max).min(1.0);
+            let rms = mixed.iter().map(|&i| (srcs[i].1 * mix.gain(self.sources[i].role)).powi(2)).sum::<f32>().sqrt().min(1.0);
+            out.push(capture_protocol::Level { name: "Preview Mix".into(), peak, rms });
+        }
+        for (i, (p, r)) in srcs.into_iter().enumerate() {
+            out.push(capture_protocol::Level { name: self.labels[i + 1].clone(), peak: p, rms: r });
+        }
+        out
     }
 
     pub fn join(&mut self) {
@@ -740,6 +780,16 @@ mod tests {
         b.push(0, Some(&vec![0.25f32; 4800 * CH]), 4800);
         assert!(b.data.is_empty());
         assert!((b.live_peak() - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn meter_window_reports_peak_and_rms_then_resets() {
+        let mut b = TrackBuf::default();
+        let s: Vec<f32> = (0..4800).flat_map(|i| { let v = if i % 2 == 0 { 0.5 } else { -0.5 }; [v, v] }).collect();
+        b.push(0, Some(&s), 4800);
+        let (p, r) = b.take_level();
+        assert!((p - 0.5).abs() < 1e-6 && (r - 0.5).abs() < 1e-3);
+        assert_eq!(b.take_level(), (0.0, 0.0));
     }
 
     #[test]

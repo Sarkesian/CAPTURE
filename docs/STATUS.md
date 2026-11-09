@@ -1,7 +1,7 @@
-# CAPTURE status: requirement-by-requirement (v0.3.0)
+# CAPTURE status: requirement-by-requirement (v0.4.0)
 
-**Date:** 2026-11-08 · **Branch:** `phase0/spikes` · **Build:** `dist\CAPTURE-0.3.0\` and `dist\CAPTURE-0.3.0-portable.zip`
-**Specs:** `docs/spec/CAPTURE_Design.md`, `docs/spec/CAPTURE_Agent_Prompt.md`, `docs/spec/CAPTURE_Overlay_Addendum.md`
+**Date:** 2026-11-08 · **Branch:** `main` · **Build:** `dist\CAPTURE-0.4.0\` and `dist\CAPTURE-0.4.0-portable.zip`
+**Specs:** `docs/spec/CAPTURE_Design.md`, `docs/spec/CAPTURE_Agent_Prompt.md`, `docs/spec/CAPTURE_Overlay_Addendum.md`, UX/UI overhaul brief (see `docs/UX_AUDIT.md`)
 **Test machine:** Windows 11 Pro 26200, i5-13600KF, 32 GB, RTX 4090 (driver 617.14), 4K@143 Hz.
 
 Legend: ✅ done and tested on this machine · 🟡 done, but only partly verifiable here · ❌ not done
@@ -64,13 +64,32 @@ Legend: ✅ done and tested on this machine · 🟡 done, but only partly verifi
 | Portable build + zip; unsigned | ✅ | Windows SmartScreen will warn (no code-signing certificate). There is no installer. |
 | Third-party licences | ✅ | `docs/THIRD_PARTY.md` (LGPL FFmpeg, unmodified DLLs) |
 
+## UX/UI overhaul (v0.4.0)
+Details, decisions and before/after screenshots: `docs/UX_AUDIT.md`, `docs/ux/before/`, `docs/ux/after/`.
+
+| Requirement | Status | Evidence |
+|---|---|---|
+| Audit first, with before screenshots | ✅ | `docs/ux/before/` (1000×760 and 760×600, plus overlay) |
+| Design tokens, dark-first plus light theme | ✅ | `app/src/app.css`; light follows Windows. The overlay stays dark over games. |
+| Window frame matches the app; native behaviour kept | ✅ | DWM caption, text and border colours, re-applied on theme change; `docs/ux/after/window-frame.png` |
+| Navigation; Home answers the key questions | ✅ | Sidebar: Home, Replay, Library, Settings. Home shows the state, the game, replay readiness, audio and Save replay. |
+| Audio meters: 30–60 updates/s, fast attack, smooth release, peak/RMS, hold, clip, off/muted/disconnected states, no fake motion | ✅ | `ui-perf`: 30.0 level updates/s, draws capped at 60/s (48/s on a 144 Hz display). Smoothing: attack 30 ms, release about 270 ms to 95%. Flat, labelled bar when there is no signal. |
+| Meters cost nothing when not seen | ✅ | `ui-perf`: minimised gives 0 updates/s, 0 draws and 0.03% UI CPU (2.8% visible). The hidden overlay no longer keeps the level stream running. |
+| Fast feel: press feedback, short transitions, reduced motion | ✅ | 80/140 ms colour and opacity transitions; `prefers-reduced-motion` honoured. Page switch paints in 10–22 ms (`ui-perf`). |
+| Settings grouped by task, with an index | ✅ | Recording, Audio, Hotkeys, Markers, Overlay & notices, Games, Storage, Startup, Advanced |
+| Quality: Balanced / High / Maximum (Custom optional) | 🟡 | Three presets. Custom was not added because a free bitrate field would be untested. |
+| Replay and Library restyled; sort/filter, hover actions, empty states | ✅ | Replay page; Library search, game filter, 4 sorts, hover actions and a "…" menu, skeleton and empty states |
+| Overlay consistent with the app | ✅ | Same tokens and icons; `ui-overlay-test` passes |
+| Recording, tray, settings and overlay not broken | ✅ | `ui-auto-test`, `ui-overlay-test` and `ui-perf` on the 0.4.0 package (below) |
+| Screen reader names, keyboard navigation | 🟡 | Labelled controls, arrow keys in the sidebar and segmented controls, visible keyboard focus. No screen reader was used to test. |
+
 ## Performance and reliability (measured)
 - Buffering FAULTHEART 1604×946@60: worker 0.19 % CPU, about 100 MB RAM, NVENC 7 %. Game CPU unchanged.
 - **25-minute soak** (`scripts/soak.mjs`, window capture, 2 min replay, a save every 5 min): worker memory
   79 → 85 MB (peak 88, no unbounded growth), 0.31 % CPU average, buffer held at its cap, 6/6 saves at
   120.2–120.8 s, 0 failures, buffer emptied on exit.
 - Forced kill → recovery: 12.0 s recovered, full decode.
-- Acceptance suites on the final 0.3.0 package: `ui-auto-test` 10/10, `ui-overlay-test` 18/18.
+- Acceptance suites on the final 0.4.0 package: `ui-auto-test` 10/10, `ui-overlay-test` 18/18, `ui-perf` 7/7.
 - Unit tests: 39 pass.
 - **Not measured:** game FPS impact (needs a frame-time tool such as PresentMon and a demanding game), and
   overhead with the overlay open on a heavy game.
