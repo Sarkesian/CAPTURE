@@ -408,6 +408,9 @@ impl Drop for AudioPipeline {
 }
 
 /// Capture until `stop`; on any failure, report it and retry the *same* source.
+/// `capture_source` result meaning "reopen now" (not an error to show).
+const REOPEN: &str = "<reopen>";
+
 pub(crate) fn source_thread(spec: &SourceSpec, buf: &Mutex<TrackBuf>, t0_qpc: u64, stop: &AtomicBool) {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -415,6 +418,8 @@ pub(crate) fn source_thread(spec: &SourceSpec, buf: &Mutex<TrackBuf>, t0_qpc: u6
     while !stop.load(Ordering::Relaxed) {
         match capture_source(spec, buf, t0_qpc, stop) {
             Ok(()) => return,
+            // The Windows default microphone changed: switch to it at once, quietly.
+            Err(e) if e == REOPEN => continue,
             Err(e) => buf.lock().unwrap().error = Some(e),
         }
         let until = Instant::now() + RETRY;
@@ -662,6 +667,10 @@ fn capture_source(spec: &SourceSpec, buf: &Mutex<TrackBuf>, t0_qpc: u64, stop: &
         })
     };
     let mut level_checked = Instant::now();
+    // "Default microphone" follows Windows: when the default input changes (a headset plugged
+    // in), reopen on the new one instead of recording the old device.
+    let follows_default = matches!(spec, SourceSpec::Mic { device_id: None });
+    let default_at_open = if follows_default { devices::default_id(eCapture) } else { None };
     let watched = watch.and_then(|pid| unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid).ok() }).map(HandleGuard);
     let fmt = float_format();
     unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 200_000, 0, &fmt, None) }.map_err(|e| e.to_string())?;
@@ -691,6 +700,12 @@ fn capture_source(spec: &SourceSpec, buf: &Mutex<TrackBuf>, t0_qpc: u64, stop: &
             level_checked = Instant::now();
             let h = level_hint(&source);
             buf.lock().unwrap().hint = h;
+            if follows_default && devices::default_id(eCapture).is_some_and(|now| Some(&now) != default_at_open.as_ref()) {
+                unsafe {
+                    let _ = client.Stop();
+                }
+                return Err(REOPEN.into());
+            }
         }
         if let Some(h) = &watched {
             if unsafe { WaitForSingleObject(h.0, 0) } == WAIT_OBJECT_0 {

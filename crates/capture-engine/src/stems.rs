@@ -31,7 +31,18 @@ struct Out {
     /// Samples written so far (output timeline, 48 kHz).
     written: i64,
     lead: i64,
+    /// Time base of the clip's audio stream (frame timestamps).
+    tb: ff::AVRational,
     path: PathBuf,
+}
+
+/// Silence (in samples) to insert before a decoded frame that belongs at output sample `at`
+/// when `written` samples are on disk: the gap, if it is more than 10 ms. The MP4 keeps real
+/// timestamps across a gap in the recording (low-disk pause, unreachable buffer drive, a
+/// damaged segment), so the WAV must leave the same gap or everything after it plays early.
+fn gap_before(at: i64, written: i64) -> i64 {
+    let gap = at - written;
+    if gap > 480 { gap } else { 0 }
 }
 
 impl Drop for Out {
@@ -120,7 +131,7 @@ unsafe fn export_inner(clip: &Path, folder: &Path) -> Result<StemResult, String>
         let start = if (*st).start_time == ff::AV_NOPTS_VALUE { 0 } else { (*st).start_time };
         let lead = ff::av_rescale_q(start, (*st).time_base, ff::AVRational { num: 1, den: 48_000 }).max(0);
         manifest_tracks.push(serde_json::json!({ "file": file_name_for(&label), "track": label, "stream_index": i }));
-        outs.push(Out { oc, enc, dec, swr, in_index: i, written: 0, lead, path });
+        outs.push(Out { oc, enc, dec, swr, in_index: i, written: 0, lead, tb: (*st).time_base, path });
     }
     if outs.is_empty() {
         return Err("This clip has no separate audio tracks to export.".into());
@@ -176,6 +187,14 @@ unsafe fn export_inner(clip: &Path, folder: &Path) -> Result<StemResult, String>
 }
 
 unsafe fn convert_and_write(o: &mut Out, input: *mut ff::AVFrame) -> Result<(), String> {
+    let ts = (*input).best_effort_timestamp;
+    if ts != ff::AV_NOPTS_VALUE {
+        let at = ff::av_rescale_q(ts, o.tb, ff::AVRational { num: 1, den: 48_000 });
+        let gap = gap_before(at, o.written);
+        if gap > 0 {
+            write_silence(o, gap)?;
+        }
+    }
     let out = ff::av_frame_alloc();
     (*out).format = ff::AVSampleFormat::AV_SAMPLE_FMT_S32 as i32;
     (*out).sample_rate = 48_000;
@@ -255,5 +274,16 @@ mod tests {
         assert_eq!(super::file_name_for("Game Audio"), "GameAudio.wav");
         assert_eq!(super::file_name_for("Voice Chat"), "VoiceChat.wav");
         assert_eq!(super::file_name_for("All Desktop Audio"), "AllDesktopAudio.wav");
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    #[test]
+    fn gaps_in_the_clip_are_kept_in_the_wav() {
+        assert_eq!(super::gap_before(48_000, 48_000), 0, "contiguous");
+        assert_eq!(super::gap_before(48_300, 48_000), 0, "rounding jitter is not a gap");
+        assert_eq!(super::gap_before(48_000 * 3, 48_000), 96_000, "a 2 s gap stays 2 s");
+        assert_eq!(super::gap_before(47_000, 48_000), 0, "overlap: nothing inserted");
     }
 }

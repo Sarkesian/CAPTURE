@@ -70,6 +70,14 @@ pub fn list(flow: EDataFlow) -> Vec<AudioDevice> {
     }
 }
 
+/// Endpoint id of the current Windows default device for `flow`.
+pub fn default_id(flow: EDataFlow) -> Option<String> {
+    unsafe {
+        let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+        en.GetDefaultAudioEndpoint(flow, eConsole).ok().map(|d| id_of(&d))
+    }
+}
+
 pub fn default_name(flow: EDataFlow) -> Option<String> {
     unsafe {
         let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
