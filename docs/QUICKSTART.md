@@ -1,4 +1,4 @@
-# CAPTURE quick start (v0.3)
+# CAPTURE quick start (v0.3.1)
 
 1. **Start** `CAPTURE.exe`. No installer is needed; its own settings live in the `data` folder next to it.
    (Windows may warn that the app is unrecognised because it isn't code-signed. Choose *More info → Run anyway*.)
@@ -28,10 +28,13 @@ the overlay without leaving the game. Use borderless, or just the keys, which al
 - **Game sound**: only the game's own sound (*Whole display*: everything you hear except CAPTURE).
 - **Your microphone**: **off until you turn it on.** Pick the device, watch the meter, **Test**
   (records 3 s and plays it back) and **Mute**. If your chosen mic is unplugged, CAPTURE says so and never
-  switches to another one.
+  switches to another one. If Windows has the mic muted or at 0%, or the mic sends pure silence (headset
+  off, mute switch on), CAPTURE says that under the device list. CAPTURE never changes Windows settings.
+  **Mic check:** put the headset on and switch it on, turn on *Your microphone*, press **Test** and speak
+  for 3 seconds. You should hear yourself played back and see "Peaked at … dB".
 - **Voice chat**: pick the app (e.g. Discord). It's recorded from that app only. Voices in a game's
   *built-in* chat are part of the game sound and can't be separated.
-- **Other computer audio**: optional extra track of everything; it is not added to Preview Mix.
+- **All computer audio (extra track)**: optional track of everything you hear. It also contains the game and voice chat (Windows can only leave out one app), so it is never added to Preview Mix. In an editor, keep it muted unless you need it.
 - Sliders change the Preview Mix only. Every source is also saved untouched as its own track.
 
 ## Your files
@@ -43,7 +46,9 @@ D:\Captures\Buffer\                          temporary footage (size-capped, rem
 ```
 A clip is a normal MP4: **Preview Mix** (default, sounds normal anywhere) plus Game Audio / Microphone /
 Voice Chat tracks for editing. In an editor that shows all tracks, mute *Preview Mix*. For editors that
-can't use MP4 audio tracks: Library → **Editor audio files** writes synced WAVs to `<clip>_Audio\`.
+can't use MP4 audio tracks: Library → **Editor audio files** writes synced WAVs to `<clip>_Audio\`, or turn on
+Settings → Storage → **Create separate audio files for editors** to get them after every save (off by default:
+each WAV track takes about 12× the space of the same track inside the MP4).
 
 ## Library
 Clips · Sessions · Screenshots, grouped by game, with search, Play, Show in folder, Copy path, Editor
@@ -54,5 +59,9 @@ audio files, Rename, and Delete (to the Recycle Bin, after confirmation).
 - Settings → Games: per-game replay length, quality and sound.
 - Settings → Storage: temporary-buffer limit and free-space reserve. When space runs low, buffering
   pauses with a message instead of filling the drive. Saved files are never touched.
-- *Start with Windows* starts CAPTURE in the tray. *Keep running in the tray* keeps it recording when the
-  window is closed.
+- *Start with Windows* starts CAPTURE in the tray. Closing the window keeps CAPTURE recording in the tray
+  (turn off *Keep running in the tray* to make close quit). *Minimize to the tray* is optional. **Quit
+  CAPTURE** in the tray menu really exits.
+- Updating: unzip the new version next to the old one (e.g. `CAPTURE-0.3.1` beside `CAPTURE-0.3.0`). On first
+  start it copies your settings from the old folder; the old folder is left as it was.
+- If the capture drive is unplugged, CAPTURE says so and carries on by itself when it is back.
