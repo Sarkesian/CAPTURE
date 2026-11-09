@@ -22,7 +22,7 @@ const shot = async n => { const r = await cdp('Page.captureScreenshot', { format
 const settings = () => js(`window.__TAURI_INTERNALS__.invoke('bootstrap').then(b => b.settings)`);
 await sleep(2500);
 
-await js(`document.getElementById('tab-settings').click()`);
+await js(`(document.getElementById('nav-settings') ?? document.getElementById('tab-settings')).click()`);
 await sleep(600);
 const body = await js('document.body.innerText');
 check(body.includes('Create separate audio files for editors'), 'Settings shows "Create separate audio files for editors"');
@@ -33,17 +33,18 @@ check((await settings()).editor_audio_files === false, 'editor audio files are o
 await js(`${toggleFor('Create separate audio files for editors')}.click()`);
 await sleep(700);
 check((await settings()).editor_audio_files === true, 'toggling it saves the setting');
-await js(`[...document.querySelectorAll('h2')].find(h => h.textContent.includes('Storage'))?.scrollIntoView()`);
-await sleep(300);
-await shot('settings-storage');
-
-await js(`document.getElementById('tab-capture').click()`);
+// The full audio panel (with the mic monitor) lives in Settings › Audio in the redesign.
 await sleep(9000); // the silence verdict needs 5 s of zeros from the mic monitor
+await js(`[...document.querySelectorAll('h2')].find(h => h.textContent.trim() === 'Audio')?.scrollIntoView()`);
+await sleep(300);
+await shot('settings-audio');
+await js(`[...document.querySelectorAll('h2')].find(h => h.textContent.includes('Startup'))?.scrollIntoView()`);
+await sleep(300);
+await shot('settings-startup');
 const cap = await js('document.body.innerText');
 const silent = /complete silence|muted, so it records silence|0% in Windows/.test(cap);
 console.log(silent ? 'mic message shown' : 'no mic message (the default microphone may be delivering sound)');
 check(cap.includes('All computer audio'), 'audio sources use the honest "All computer audio" label');
-await shot('capture-audio');
 console.log(fail ? `${fail} FAILED` : 'ALL PASSED');
 ws.close();
 process.exit(fail ? 1 : 0);

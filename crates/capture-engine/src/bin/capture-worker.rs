@@ -15,6 +15,7 @@ use capture_protocol::*;
 enum Input {
     Req(Option<u64>, Command),
     Tick,
+    MeterTick,
 }
 
 fn main() {
@@ -106,6 +107,17 @@ fn main() {
         });
     }
 
+    {
+        // Level meters: ~30 Hz. The engine sends nothing unless a visible UI subscribed.
+        let tx = tx.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(33));
+            if tx.send(Input::MeterTick).is_err() {
+                break;
+            }
+        });
+    }
+
     for input in rx {
         match input {
             Input::Req(re, cmd) => {
@@ -118,6 +130,7 @@ fn main() {
                     break;
                 }
             }
+            Input::MeterTick => engine.meter_tick(),
             Input::Tick => {
                 engine.tick();
                 engine.publish_state(None, false);

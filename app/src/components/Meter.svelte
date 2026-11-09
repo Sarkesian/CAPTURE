@@ -1,16 +1,38 @@
 <script lang="ts">
-  // Shows a real peak value reported by the engine (0..1 linear). No synthetic animation.
-  let { peak, label }: { peak: number; label: string } = $props();
-  const db = $derived(peak > 0 ? 20 * Math.log10(peak) : -Infinity);
-  const pct = $derived(Math.max(0, Math.min(100, ((db + 60) / 60) * 100)));
+  // A real level meter (see lib/meters.ts). `source` is the engine track name, or 'mic_monitor'.
+  // `state` other than 'live' shows a flat, labelled meter; it never animates fake activity.
+  import { meter } from '../lib/meters';
+
+  let { source, label, state = 'live', size = 'md' }: {
+    source: string; label: string; state?: 'live' | 'off' | 'muted' | 'error' | 'idle'; size?: 'sm' | 'md';
+  } = $props();
 </script>
 
-<div class="meter" role="meter" aria-label={label} aria-valuemin={-60} aria-valuemax={0} aria-valuenow={Number.isFinite(db) ? Math.round(db) : -60}>
-  <div class="fill" class:hot={db > -3} style:width="{pct}%"></div>
-</div>
+{#if state === 'live'}
+  <div class="meter {size}" use:meter={source} role="img" aria-label={label}>
+    <div class="peak"></div>
+    <div class="rms"></div>
+    <div class="hold"></div>
+    <span class="clip" title="Clipping: this source hit full scale"></span>
+  </div>
+{:else}
+  <div class="meter {size} flat" class:err={state === 'error'} role="img" aria-label="{label}: {state}"></div>
+{/if}
 
 <style>
-  .meter { height: 8px; border-radius: 4px; background: #2a2f39; overflow: hidden; min-width: 120px; }
-  .fill { height: 100%; background: var(--ok); transition: width 0.12s linear; }
-  .fill.hot { background: var(--warn); }
+  .meter {
+    --rms: 0; --peak: 0; --hold: 0;
+    position: relative; height: 6px; min-width: 80px; border-radius: 3px; overflow: hidden;
+    background: var(--meter-bg);
+  }
+  .meter.sm { height: 4px; min-width: 60px; }
+  .rms, .peak { position: absolute; inset: 0; transform-origin: left center; will-change: transform; }
+  .peak { background: var(--meter-peak); transform: scaleX(var(--peak)); }
+  .rms { background: var(--meter-rms); transform: scaleX(var(--rms)); }
+  .hold { position: absolute; top: 0; bottom: 0; width: 2px; left: calc(var(--hold) * 100% - 2px); background: var(--meter-rms); opacity: 0.9; }
+  .meter:global([data-hot='1']) .hold { background: var(--meter-hot); }
+  .clip { position: absolute; right: 0; top: 0; bottom: 0; width: 4px; background: var(--meter-clip); opacity: 0; }
+  .meter:global([data-clip='1']) .clip { opacity: 1; }
+  .flat { opacity: 0.55; }
+  .flat.err { background: var(--warn-soft); opacity: 1; }
 </style>

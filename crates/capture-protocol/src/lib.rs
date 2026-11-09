@@ -49,6 +49,9 @@ pub enum Command {
     /// Full-session recording, independent of the replay length (uses the same capture).
     StartSession,
     StopSession,
+    /// Live level meters: a UI view (`client`) that shows meters subscribes while visible.
+    /// While any client is subscribed the worker sends `Levels` ~30 times per second.
+    Meters { client: String, enabled: bool },
     /// Microphones, outputs and apps that currently play audio (answered with `AudioDevices`).
     ListAudio,
     /// Live level of a microphone while settings are open (nothing is recorded).
@@ -88,6 +91,8 @@ pub enum Event {
     ReviewFailed { message: String },
     ClipInfo { path: String, thumb: Option<String>, duration_secs: Option<f64>, error: Option<String> },
     AudioDevices { inputs: Vec<AudioDevice>, outputs: Vec<AudioDevice>, apps: Vec<AudioApp> },
+    /// Real audio levels since the previous `Levels` message (peak and RMS, linear 0..1).
+    Levels { tracks: Vec<Level>, mic_monitor: Option<Level> },
     StemsDone { path: String, folder: Option<String>, files: Vec<String>, error: Option<String> },
     ScreenshotSaved { path: String },
     /// Result of RecoverLeftovers: saved clip paths and any folders that could not be recovered.
@@ -362,6 +367,13 @@ pub struct AudioDevice {
 pub struct AudioApp {
     pub exe: String,
     pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Level {
+    pub name: String,
+    pub peak: f32,
+    pub rms: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -1,7 +1,7 @@
 # Runs the real-app acceptance suites against a packaged build, each in an isolated copy with
 # its own settings and capture folder under test-output\. Needs FAULTHEART (itch.io) installed.
 #
-#   powershell -ExecutionPolicy Bypass -File scripts\run-acceptance.ps1 [-Version 0.3.0]
+#   powershell -ExecutionPolicy Bypass -File scripts\run-acceptance.ps1 [-Version 0.4.0]
 param([string]$Version = '')
 $ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent $PSScriptRoot
@@ -44,6 +44,13 @@ $p = Start-Run 'overlay' '{ "capture_root": "ROOT", "replay_enabled": true, "rep
 Start-Sleep -Seconds 12
 node scripts\ui-overlay-test.mjs "$root\test-output\shots-overlay" "$root\test-output\cap-overlay" 2>&1 | Tee-Object -Variable out2 | ForEach-Object { "  $_" }
 $results += "overlay: " + ($out2 | Select-Object -Last 1)
+Stop-Run $p
+
+# 3) UI performance while recording: meter rate, CPU visible vs minimised, page switches
+$p = Start-Run 'perf' '{ "capture_root": "ROOT", "replay_enabled": true, "replay_secs": 30, "first_run_done": true, "game_audio": true }'
+Start-Sleep -Seconds 15
+node scripts\ui-perf.mjs "$root\test-output\run-perf" 2>&1 | Tee-Object -Variable out3 | ForEach-Object { "  $_" }
+$results += "perf: " + ($out3 | Select-Object -Last 1)
 Stop-Run $p
 Stop-Process -Id $g.Id -ErrorAction SilentlyContinue
 

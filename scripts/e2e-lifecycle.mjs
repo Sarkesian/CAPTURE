@@ -146,7 +146,7 @@ try {
 } finally {
   for (const n of ['CAPTURE', 'capture-worker']) for (const p of procs(n)) ps(`Stop-Process -Id ${p} -Force -ErrorAction SilentlyContinue`);
   if (savedEntry) ps(`Set-ItemProperty '${RUN}' -Name CAPTURE -Value '${savedEntry.replace(/'/g, "''")}'`);
-  else ps(`try { Remove-ItemProperty '${RUN}' -Name CAPTURE -ErrorAction Stop } catch {}`);
+  else try { ps(`Remove-ItemProperty '${RUN}' -Name CAPTURE -ErrorAction Stop`); } catch {} // already absent
   console.log('startup entry restored to:', runEntry() || '(none)');
 }
 console.log(fail ? `${fail} FAILED` : 'ALL PASSED');

@@ -64,6 +64,8 @@ pub struct Engine {
     last_state: Option<EngineState>,
     last_retry: Instant,
     mic_monitor: Option<mic::Monitor>,
+    /// UI views currently showing meters.
+    meter_clients: std::collections::HashSet<String>,
 }
 
 pub fn fmt_secs(s: f64) -> String {
@@ -91,6 +93,7 @@ impl Engine {
             last_state: None,
             last_retry: Instant::now(),
             mic_monitor: None,
+            meter_clients: Default::default(),
         }
     }
 
@@ -154,6 +157,14 @@ impl Engine {
                 }
                 None => self.send(re, Event::ReviewFailed { message: "Nothing is being recorded right now.".into() }),
             },
+            Command::Meters { client, enabled } => {
+                if enabled {
+                    self.meter_clients.insert(client);
+                } else {
+                    self.meter_clients.remove(&client);
+                }
+                return true; // no state echo needed
+            }
             Command::ListAudio => {
                 let emit = self.emit.clone();
                 std::thread::spawn(move || {
@@ -567,6 +578,20 @@ impl Engine {
         if let Ok(s) = resolve(&cfg) {
             self.launch(&cfg, s);
         }
+    }
+
+    /// Called ~30 times per second by the worker: sends real levels only while a visible UI
+    /// view shows meters, so a hidden UI costs nothing.
+    pub fn meter_tick(&mut self) {
+        if self.meter_clients.is_empty() {
+            return;
+        }
+        let tracks = self.pipeline.as_ref().and_then(|p| p.audio.as_ref()).map(|a| a.take_levels()).unwrap_or_default();
+        let mic_monitor = self.mic_monitor.as_ref().map(|m| m.take_level());
+        if tracks.is_empty() && mic_monitor.is_none() {
+            return;
+        }
+        self.send(None, Event::Levels { tracks, mic_monitor });
     }
 
     /// Called periodically and after every command. Emits only when something changed,

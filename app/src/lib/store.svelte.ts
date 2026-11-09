@@ -18,7 +18,7 @@ export const app = $state({
   reviewLoading: false,
   reviewError: null as string | null,
   clipInfo: {} as Record<string, { thumb: string | null; duration: number | null }>,
-  tab: 'capture' as 'capture' | 'library' | 'settings',
+  tab: 'home' as 'home' | 'replay' | 'library' | 'settings',
   inputs: [] as AudioDevice[],
   outputs: [] as AudioDevice[],
   apps: [] as AudioApp[],

@@ -209,6 +209,7 @@ fn toggle_overlay(app: AppHandle) {
 fn hide_overlay(app: AppHandle) {
     if let Some(w) = app.get_webview_window("overlay") {
         let _ = w.hide();
+        set_page_visible(&w, false);
     }
 }
 
@@ -253,6 +254,7 @@ fn toggle_overlay_window(app: &AppHandle) {
     let Some(w) = app.get_webview_window("overlay") else { return };
     if w.is_visible().unwrap_or(false) {
         let _ = w.hide();
+        set_page_visible(&w, false);
         return;
     }
     // Centre on the monitor under the mouse (the one being played on).
@@ -267,6 +269,7 @@ fn toggle_overlay_window(app: &AppHandle) {
         }
     }
     let _ = w.show();
+    set_page_visible(&w, true);
     let _ = w.set_focus();
     let _ = app.emit_to("overlay", "overlay_shown", ());
 }
@@ -374,10 +377,44 @@ fn quit(app: &AppHandle) {
     });
 }
 
+/// Make the native Windows 11 title bar part of the app: caption, caption text and border take
+/// the app's own surface colours (dark or light, following Windows). Native behaviour — Snap
+/// layouts, caption buttons, resize, double-click maximise, active/inactive state — is untouched,
+/// because the frame stays the real system frame. On Windows 10 these attributes are ignored.
+fn theme_frame(window: &tauri::WebviewWindow) {
+    use windows::Win32::Foundation::{COLORREF, HWND};
+    use windows::Win32::Graphics::Dwm::*;
+    let Ok(hwnd) = window.hwnd() else { return };
+    let dark = !matches!(window.theme(), Ok(tauri::Theme::Light));
+    let rgb = |r: u32, g: u32, b: u32| COLORREF(r | (g << 8) | (b << 16));
+    // Must match --chrome / --text-2 / --chrome-line in app.css.
+    let (caption, text, border) = if dark { (rgb(0x12, 0x14, 0x18), rgb(0xA4, 0xAB, 0xB8), rgb(0x12, 0x14, 0x18)) } else { (rgb(0xEE, 0xF0, 0xF3), rgb(0x4A, 0x52, 0x60), rgb(0xEE, 0xF0, 0xF3)) };
+    let h = HWND(hwnd.0);
+    unsafe {
+        let set = |attr: DWMWINDOWATTRIBUTE, v: &u32| {
+            let _ = DwmSetWindowAttribute(h, attr, v as *const u32 as *const _, 4);
+        };
+        set(DWMWA_USE_IMMERSIVE_DARK_MODE, &(dark as u32));
+        set(DWMWA_CAPTION_COLOR, &caption.0);
+        set(DWMWA_TEXT_COLOR, &text.0);
+        set(DWMWA_BORDER_COLOR, &border.0);
+    }
+}
+
+/// Tell WebView2 whether its page is on screen. Hiding or minimising the native window alone
+/// leaves the page "visible" (measured: `document.hidden` stayed false), so it kept animating and
+/// kept live meters streaming. With this the page sees `document.hidden` and stops both.
+fn set_page_visible(w: &tauri::WebviewWindow, visible: bool) {
+    let _ = w.with_webview(move |wv| unsafe {
+        let _ = wv.controller().SetIsVisible(visible);
+    });
+}
+
 fn show_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.unminimize();
         let _ = w.show();
+        set_page_visible(&w, true);
         let _ = w.set_focus();
     }
 }
@@ -444,6 +481,11 @@ fn on_message(app: &AppHandle, m: Message) {
         Event::HotkeyPressed { action: capture_protocol::HotkeyAction::ToggleOverlay } => {
             let a = app.clone();
             let _ = app.run_on_main_thread(move || toggle_overlay_window(&a));
+        }
+        Event::Levels { .. } => {
+            // High-rate meter data: forward straight to the webviews, nothing else to do.
+            let _ = app.emit("levels", &m.event);
+            return;
         }
         Event::State(s) => {
             *state.last_state.lock().unwrap() = Some(s.clone());
@@ -546,13 +588,18 @@ fn main() {
             let handle = app.handle().clone();
             // Started from Windows sign-in: stay in the tray until opened.
             let start_hidden = std::env::args().any(|a| a == "--tray");
+            let dark_bg = tauri::window::Color(0x12, 0x14, 0x18, 0xff);
             let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                 .visible(!start_hidden)
+                .background_color(dark_bg) // no white flash before the page paints
                 .title("CAPTURE")
-                .inner_size(1000.0, 760.0)
-                .min_inner_size(760.0, 600.0)
+                .inner_size(1120.0, 780.0)
+                .min_inner_size(720.0, 540.0)
                 .data_directory(data_dir.join("webview"))
                 .build()?;
+            if start_hidden {
+                set_page_visible(&window, false);
+            }
             // The in-game overlay: created once, hidden until its hotkey. A hidden WebView2 does
             // not render, so it costs nothing while you play.
             let overlay = WebviewWindowBuilder::new(app, "overlay", WebviewUrl::App("index.html#overlay".into()))
@@ -565,25 +612,36 @@ fn main() {
                 .visible(false)
                 .data_directory(data_dir.join("webview"))
                 .build()?;
+            set_page_visible(&overlay, false);
             overlay.on_window_event(|e| {
                 if let WindowEvent::CloseRequested { api, .. } = e {
                     api.prevent_close();
                 }
             });
             allow_media(&handle, &app.state::<AppState>().settings.lock().unwrap().capture_root.clone());
+            theme_frame(&window);
             {
                 let handle = handle.clone();
+                let w2 = window.clone();
                 window.on_window_event(move |e| {
-                    if let WindowEvent::Resized(_) = e {
-                        // Minimize to tray (optional): a minimized window raises Resized.
-                        let state = handle.state::<AppState>();
-                        if state.settings.lock().unwrap().minimize_to_tray {
-                            if let Some(w) = handle.get_webview_window("main") {
-                                if w.is_minimized().unwrap_or(false) {
-                                    let _ = w.hide();
-                                }
-                            }
+                    if let WindowEvent::ThemeChanged(_) = e {
+                        theme_frame(&w2);
+                    }
+                    // WebView2 keeps reporting "visible" while the window is minimised, so pages
+                    // keep animating and live meters keep streaming. Tell the controller instead:
+                    // the page then sees `document.hidden` and rAF/timers are throttled.
+                    // Decide from the new size (a minimised window is 0x0): `is_minimized()` can still
+                    // report the old state while the restore is being processed.
+                    if let WindowEvent::Resized(size) = e {
+                        let visible = size.width > 0 && size.height > 0 && w2.is_visible().unwrap_or(true);
+                        set_page_visible(&w2, visible);
+                        // Minimize to tray (optional): a minimised window is 0x0.
+                        if size.width == 0 && size.height == 0 && handle.state::<AppState>().settings.lock().unwrap().minimize_to_tray {
+                            let _ = w2.hide();
                         }
+                    }
+                    if let WindowEvent::Focused(true) = e {
+                        set_page_visible(&w2, true);
                     }
                     if let WindowEvent::CloseRequested { api, .. } = e {
                         api.prevent_close();
@@ -591,6 +649,7 @@ fn main() {
                         if state.settings.lock().unwrap().close_to_tray {
                             if let Some(w) = handle.get_webview_window("main") {
                                 let _ = w.hide();
+                                set_page_visible(&w, false);
                             }
                         } else {
                             quit(&handle);
