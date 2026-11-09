@@ -76,12 +76,20 @@ pub struct Shared {
     review_seq: AtomicU64,
     /// Start of the full-session recording in progress (timeline secs).
     pub session_start: Mutex<Option<f64>>,
+    /// Timeline time video stopped, if it has (see `save_end`).
+    pub ended_at: Mutex<Option<f64>>,
+    /// Set when the `Pipeline` is dropped; buffer files are deleted only after that.
+    pub dropped: AtomicBool,
+    /// Pin id of the running session (valid while `session_start` is set).
+    pub session_pin: AtomicU64,
     /// Set by the mux thread when low disk space forces the session to end.
     pub session_must_stop: AtomicBool,
 }
 
 /// Pin id reserved for full-session recording (never released by the marker budget).
-pub const SESSION_PIN: u64 = u64::MAX;
+/// Pin id of the next full-session recording (each session its own, so finishing one session's
+/// save can never release a newer session's footage).
+static NEXT_SESSION_PIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(crate::ring::SESSION_PIN_BASE);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SaveKind {
@@ -96,6 +104,13 @@ const PIN_BUDGET_SHARE: f64 = 0.5;
 impl Shared {
     pub fn now(&self) -> f64 {
         clock::secs_since(self.t0)
+    }
+
+    /// The latest time a save may end at: now, or when video stopped (window closed, encoder
+    /// failed) — after that there is no picture to save.
+    pub fn save_end(&self) -> f64 {
+        let now = self.now();
+        self.ended_at.lock().unwrap().map_or(now, |e| e.min(now))
     }
 
     pub fn add_marker(&self, label: Option<String>, cfg: &MarkerConfig) -> Marker {
@@ -163,8 +178,8 @@ impl Shared {
         let budget = (cap as f64 * PIN_BUDGET_SHARE) as u64;
         let mut ring = self.ring.lock().unwrap();
         let mut released = Vec::new();
-        while ring.marker_pinned_bytes(SESSION_PIN) > budget {
-            let Some(id) = ring.oldest_pin_except(SESSION_PIN) else { break };
+        while ring.marker_pinned_bytes() > budget {
+            let Some(id) = ring.oldest_marker_pin() else { break };
             ring.unpin(id);
             released.push(id);
         }
@@ -201,7 +216,9 @@ impl Shared {
 
     /// Delete this session's buffer files once the session has ended and no save needs them.
     pub fn cleanup_if_idle(&self) {
-        if !self.mux_done.load(Ordering::SeqCst) {
+        // Only once the pipeline itself is gone: a session whose window closed (mux finished)
+        // keeps its footage saveable until a new one replaces it.
+        if !self.mux_done.load(Ordering::SeqCst) || !self.dropped.load(Ordering::SeqCst) {
             return;
         }
         let mut ring = self.ring.lock().unwrap();
@@ -314,6 +331,9 @@ impl Pipeline {
             review: Mutex::new(None),
             review_seq: AtomicU64::new(1),
             session_start: Mutex::new(None),
+            ended_at: Mutex::new(None),
+            dropped: AtomicBool::new(false),
+            session_pin: AtomicU64::new(0),
             session_must_stop: AtomicBool::new(false),
         });
 
@@ -371,8 +391,8 @@ impl Pipeline {
     ) -> f64 {
         let shared = self.shared.clone();
         let (t_end, secs) = match range {
-            Some((a, b)) => (b.min(shared.now()), (b - a).max(1.0)),
-            None => (shared.now(), shared.live.lock().unwrap().replay_secs as f64),
+            Some((a, b)) => (b.min(shared.save_end()), (b - a).max(1.0)),
+            None => (shared.save_end(), shared.live.lock().unwrap().replay_secs as f64),
         };
         shared.saves_in_progress.fetch_add(1, Ordering::SeqCst);
         std::thread::Builder::new()
@@ -396,7 +416,9 @@ impl Pipeline {
         let t = self.shared.now();
         *s = Some(t);
         self.shared.session_must_stop.store(false, Ordering::SeqCst);
-        self.shared.ring.lock().unwrap().pin(SESSION_PIN, t, f64::INFINITY);
+        let pin = NEXT_SESSION_PIN.fetch_add(1, Ordering::SeqCst);
+        self.shared.session_pin.store(pin, Ordering::SeqCst);
+        self.shared.ring.lock().unwrap().pin(pin, t, f64::INFINITY);
         true
     }
 
@@ -404,13 +426,14 @@ impl Pipeline {
     /// the save has protected its own segments.
     pub fn stop_session(&self, done: impl FnOnce(Result<(SavedClip, f64), String>) + Send + 'static, save_id: u64) -> Option<f64> {
         let start = self.shared.session_start.lock().unwrap().take()?;
-        let end = self.shared.now();
+        let pin = self.shared.session_pin.load(Ordering::SeqCst);
+        let end = self.shared.save_end();
         let shared = self.shared.clone();
         let secs = self.request_save(
             Some((start, end)),
             SaveKind::Session,
             move |r| {
-                shared.ring.lock().unwrap().unpin(SESSION_PIN);
+                shared.ring.lock().unwrap().unpin(pin);
                 done(r)
             },
             save_id,
@@ -473,47 +496,77 @@ impl Drop for Pipeline {
         if let Some(t) = self.mux_thread.take() {
             let _ = t.join();
         }
+        self.shared.dropped.store(true, Ordering::SeqCst);
         self.shared.cleanup_if_idle();
     }
 }
 
+/// When frame `n` is due, in 100 ns units: `t0 + n / fps` computed exactly. (A truncated
+/// per-frame period, e.g. 166 666 for 60 fps, drifts against the audio clock by ~14 ms an hour.)
+fn frame_due(t0: u64, n: i64, fps: u32) -> u64 {
+    // Rounded up, so that at `frame_due(n)` frame `n` (not `n - 1`) is the newest one due.
+    t0 + (n as u128 * 10_000_000).div_ceil(fps as u128) as u64
+}
+
+/// Index of the newest frame due at `now`.
+fn frame_at(t0: u64, now: u64, fps: u32) -> i64 {
+    (now.saturating_sub(t0) as u128 * fps as u128 / 10_000_000) as i64
+}
+
 fn run_video(shared: Arc<Shared>, capture: Arc<wgc::Capture>, mut enc: VideoEncoder, fps: u32, stop: Arc<AtomicBool>, tx: std::sync::mpsc::SyncSender<Packet>) {
-    let period = 10_000_000u64 / fps as u64; // 100 ns units
     let mut n: i64 = 0;
     let mut send = |p: Packet| {
         let _ = tx.send(p);
     };
+    let mut ended = false;
     while !stop.load(Ordering::Relaxed) {
-        let due = shared.t0 + n as u64 * period;
+        let due = frame_due(shared.t0, n, fps);
         let now = clock::now_100ns();
         if now < due {
             std::thread::sleep(Duration::from_micros((due - now) / 10));
             continue;
         }
-        let behind = ((now - due) / period) as i64;
+        let behind = frame_at(shared.t0, now, fps) - n;
         if behind > 0 {
             shared.frames_dropped.fetch_add(behind as u64, Ordering::Relaxed);
             n += behind;
         }
         if capture.closed.load(Ordering::Relaxed) {
-            break; // reported as "Waiting" by the engine; footage stays saveable
+            ended = true; // reported as "Waiting" by the engine; footage stays saveable
+            break;
         }
+        // Encode under the frame lock, but send after releasing it: a slow disk that fills the
+        // channel must not also block the capture callback and screenshots.
+        let mut out = Vec::new();
         let latest = capture.latest.lock().unwrap();
         if latest.has_frame {
-            match enc.encode(&latest, n, &mut send) {
+            let r = enc.encode(&latest, n, &mut |p| out.push(p));
+            drop(latest);
+            match r {
                 Ok(()) => {
                     shared.frames_encoded.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) => {
-                    drop(latest);
+                    out.into_iter().for_each(&mut send);
                     shared.set_attention(Some(format!("Video encoding failed: {e}")));
+                    ended = true;
                     break;
                 }
             }
+        } else {
+            drop(latest);
         }
+        out.into_iter().for_each(&mut send);
         n += 1;
     }
     enc.flush(&mut send);
+    if ended {
+        // No more picture: stop the whole session (audio too) so the mux closes the last
+        // segment on disk and saves end where the video ended, instead of an open segment
+        // growing with audio only.
+        *shared.ended_at.lock().unwrap() = Some(shared.now());
+        stop.store(true, Ordering::SeqCst);
+    }
 }
 
 fn run_mux(shared: Arc<Shared>, rx: Receiver<Packet>, streams: Vec<StreamDesc>) {
@@ -685,4 +738,19 @@ fn do_save(shared: &Shared, t_end: f64, secs: f64, save_id: u64, kind: SaveKind)
     })();
     shared.ring.lock().unwrap().unprotect(&all);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_times_do_not_drift() {
+        for fps in [30u32, 60, 144, 240] {
+            let hour = fps as i64 * 3600;
+            assert_eq!(frame_due(0, hour, fps), 36_000_000_000, "{fps} fps: exactly one hour");
+            assert_eq!(frame_at(0, 36_000_000_000, fps), hour);
+            assert_eq!(frame_at(0, frame_due(0, 12_345, fps), fps), 12_345);
+        }
+    }
 }

@@ -63,9 +63,19 @@ pub struct Engine {
     capture_fps: f64,
     last_state: Option<EngineState>,
     last_retry: Instant,
+    /// Auto mode: a different game seen in the foreground, and since when. Switching replaces
+    /// the replay buffer, so it only happens once the new window has stayed for `SWITCH_AFTER`.
+    switch_candidate: Option<(u32, Instant)>,
     mic_monitor: Option<mic::Monitor>,
     /// UI views currently showing meters.
     meter_clients: std::collections::HashSet<String>,
+}
+
+/// How long a different game must stay in front before Auto mode switches to it: a little
+/// while for a running game, longer after the recorded game closed so its replay can still be
+/// saved (e.g. the launcher returning at the end of a match).
+fn switch_after(previous_closed: bool) -> std::time::Duration {
+    std::time::Duration::from_secs(if previous_closed { 20 } else { 4 })
 }
 
 /// A hotkey as shown in notices: `"Alt+F10"`.
@@ -97,6 +107,7 @@ impl Engine {
             capture_fps: 0.0,
             last_state: None,
             last_retry: Instant::now(),
+            switch_candidate: None,
             mic_monitor: None,
             meter_clients: Default::default(),
         }
@@ -297,10 +308,10 @@ impl Engine {
             // Older versions kept `<root>\Clips\<Game>`; move those into `<root>\<Game>\Clips`.
             storage::migrate_layout(Path::new(&cfg.capture_root));
         }
-        let restart = match &self.cfg {
+        // Everything except the target that needs a new pipeline.
+        let restart_other = match &self.cfg {
             Some(old) => {
-                old.target != cfg.target
-                    || old.fps != cfg.fps
+                old.fps != cfg.fps
                     || old.quality != cfg.quality
                     || old.encoder != cfg.encoder
                     || old.capture_cursor != cfg.capture_cursor
@@ -314,12 +325,13 @@ impl Engine {
             }
             None => true,
         };
+        let restart = restart_other || self.cfg.as_ref().is_some_and(|old| old.target != cfg.target);
         // In Auto mode, editing the games/ignore lists must not interrupt a running recording
-        // unless the current game was just ignored.
-        let auto_lists_only = matches!((&self.cfg, &cfg), (Some(old), new)
-            if matches!(old.target, CaptureTarget::Auto { .. }) && matches!(new.target, CaptureTarget::Auto { .. })
-            && old.fps == new.fps && old.quality == new.quality && old.capture_cursor == new.capture_cursor
-            && old.audio.same_sources(&new.audio) && old.capture_root == new.capture_root);
+        // unless the current game was just ignored. Any other change that needs a restart
+        // (encoder, buffer folder, per-game quality...) still restarts.
+        let auto_lists_only = !restart_other
+            && matches!((&self.cfg, &cfg), (Some(old), new)
+                if matches!(old.target, CaptureTarget::Auto { .. }) && matches!(new.target, CaptureTarget::Auto { .. }));
         let live = live_of(&cfg);
         let now_ignored = match (&cfg.target, &self.pipeline) {
             (CaptureTarget::Auto { ignore, .. }, Some(p)) => ignore.iter().any(|i| i.eq_ignore_ascii_case(&p.shared.target_exe)),
@@ -594,7 +606,27 @@ impl Engine {
                 return;
             };
             let same = self.pipeline.as_ref().is_some_and(|p| p.shared.target_pid == w.pid && !closed);
-            if !same {
+            if same {
+                self.switch_candidate = None;
+                return;
+            }
+            // Something is (or was just) being recorded: a launcher or another app flashing
+            // to the front for a moment must not throw that buffer away. Switch only to a
+            // window that stays (the user's own games list counts at once).
+            if self.pipeline.is_some() && reason != detect::Reason::UserList {
+                let since = match self.switch_candidate {
+                    Some((pid, t)) if pid == w.pid => t,
+                    _ => {
+                        self.switch_candidate = Some((w.pid, Instant::now()));
+                        return;
+                    }
+                };
+                if since.elapsed() < switch_after(closed) {
+                    return;
+                }
+            }
+            self.switch_candidate = None;
+            {
                 match settings_for_window(&cfg, &w, Some(reason.label())) {
                     Ok(s) => self.launch(&cfg, s),
                     Err(u) => self.start_error = Some(u),
@@ -686,7 +718,7 @@ impl Engine {
         let (buffered, bytes, has_segments) = {
             let ring = sh.ring.lock().unwrap();
             let live = *sh.live.lock().unwrap();
-            (ring.available_secs(sh.now()).min(live.replay_secs as f64), ring.total_bytes(), !ring.segments().is_empty())
+            (ring.available_secs(sh.save_end()).min(live.replay_secs as f64), ring.total_bytes(), !ring.segments().is_empty())
         };
         let attention = sh.attention.lock().unwrap().clone();
         st.markers = sh.markers_now();
@@ -762,8 +794,9 @@ impl Engine {
     pub fn shutdown(&mut self) {
         self.stop_session(None);
         if let Some(p) = &self.pipeline {
-            // Let in-flight saves finish (bounded) before tearing down the session.
-            let until = Instant::now() + std::time::Duration::from_secs(30);
+            // Let in-flight saves finish before tearing down the session. A full-session save
+            // of a long recording can take minutes; the bound only guards against a hang.
+            let until = Instant::now() + std::time::Duration::from_secs(14 * 60);
             while p.shared.saves_in_progress.load(Ordering::SeqCst) > 0 && Instant::now() < until {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }

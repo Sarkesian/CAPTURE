@@ -19,6 +19,14 @@ pub struct Segment {
     pub protect: u32,
 }
 
+/// Pin ids at or above this belong to full-session recordings (each session has its own id);
+/// they have no budget. Marker pins use small ids.
+pub const SESSION_PIN_BASE: u64 = 1 << 63;
+
+fn is_session_pin(id: u64) -> bool {
+    id >= SESSION_PIN_BASE
+}
+
 #[derive(Debug, Default)]
 pub struct Ring {
     segments: Vec<Segment>,
@@ -132,17 +140,18 @@ impl Ring {
         self.pins.iter().min_by(|a, b| a.1.total_cmp(&b.1)).map(|p| p.0)
     }
 
-    pub fn oldest_pin_except(&self, keep: u64) -> Option<u64> {
-        self.pins.iter().filter(|p| p.0 != keep).min_by(|a, b| a.1.total_cmp(&b.1)).map(|p| p.0)
+    /// Oldest marker pin (session pins are never released for the budget).
+    pub fn oldest_marker_pin(&self) -> Option<u64> {
+        self.pins.iter().filter(|p| !is_session_pin(p.0)).min_by(|a, b| a.1.total_cmp(&b.1)).map(|p| p.0)
     }
 
-    /// Bytes held by pins other than `except` (the session pin has no budget).
-    pub fn marker_pinned_bytes(&self, except: u64) -> u64 {
+    /// Bytes held by marker pins (session pins have no budget).
+    pub fn marker_pinned_bytes(&self) -> u64 {
         self.segments
             .iter()
             .filter(|s| {
                 let end = s.end.unwrap_or(f64::INFINITY);
-                self.pins.iter().any(|&(id, a, b)| id != except && s.start < b && end > a)
+                self.pins.iter().any(|&(id, a, b)| !is_session_pin(id) && s.start < b && end > a)
             })
             .map(|s| s.bytes)
             .sum()
@@ -283,6 +292,20 @@ mod tests {
         r.unpin(7);
         let removed = r.retain(20.0, 4.0, u64::MAX, 0);
         assert!(removed.iter().any(|s| s.seq == 2));
+    }
+
+    #[test]
+    fn each_session_pin_is_released_on_its_own() {
+        let mut r = ring(10, 2.0, 100);
+        let (first, second) = (SESSION_PIN_BASE, SESSION_PIN_BASE + 1);
+        r.pin(first, 2.0, f64::INFINITY);
+        r.pin(second, 12.0, f64::INFINITY); // started while the first was still saving
+        r.unpin(first); // the first session's save finished
+        r.retain(20.0, 2.0, u64::MAX, 0);
+        assert!(r.segments().iter().any(|s| s.seq == 6), "second session's footage still held");
+        r.pin(1, 0.0, 1.0);
+        assert_eq!(r.oldest_marker_pin(), Some(1), "session pins never count as markers");
+        assert_eq!(r.marker_pinned_bytes(), 0, "marker footage already expired");
     }
 
     #[test]

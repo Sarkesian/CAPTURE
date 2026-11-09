@@ -568,7 +568,9 @@ fn quit(app: &AppHandle) {
     }
     let (app, worker) = (app.clone(), state.worker.clone());
     std::thread::spawn(move || {
-        worker.shutdown(Duration::from_secs(30)); // lets in-flight saves finish
+        // The worker exits as soon as in-flight saves are written; a long full-session save
+        // can take minutes, so only a hung worker ever reaches this limit.
+        worker.shutdown(Duration::from_secs(15 * 60));
         app.exit(0);
     });
 }

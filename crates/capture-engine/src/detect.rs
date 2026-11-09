@@ -45,7 +45,16 @@ const NOT_GAMES: &[&str] = &[
     "applicationframehost.exe", "textinputhost.exe", "shellexperiencehost.exe", "searchhost.exe",
     "startmenuexperiencehost.exe", "lockapp.exe", "systemsettings.exe", "taskmgr.exe", "capture.exe",
     "capture-worker.exe", "claude.exe", "msedgewebview2.exe", "photos.exe", "blender.exe",
+    // Launchers, lobbies and helpers that live in game-library folders.
+    "riotclientservices.exe", "riotclientux.exe", "riotclientuxrender.exe", "riot client.exe",
+    "leagueclient.exe", "leagueclientux.exe", "leagueclientuxrender.exe", "socialclubhelper.exe",
+    "rockstarservice.exe", "launcherpatcher.exe", "ubisoftconnect.exe", "eabackgroundservice.exe",
+    "crashreportclient.exe", "unitycrashhandler64.exe", "unitycrashhandler32.exe", "steamerrorreporter.exe",
+    "steamerrorreporter64.exe", "unrealcefsubprocess.exe", "easyanticheat_eos_setup.exe",
 ];
+
+/// Launcher folders inside game-library folders: never a game, whatever the exe is called.
+const NOT_GAME_FOLDERS: &[&str] = &["\\riot client\\", "\\rockstar games\\launcher\\", "\\rockstar games\\social club\\", "\\steamworks shared\\"];
 
 const LIBRARY_MARKERS: &[&str] = &[
     "\\steamapps\\common\\", "\\epic games\\", "\\gog galaxy\\games\\", "\\gog games\\", "\\itch\\apps\\",
@@ -66,6 +75,9 @@ pub fn classify(exe_path: &str, exe: &str, covers_monitor: bool, games: &[String
         return None;
     }
     let path = exe_path.to_ascii_lowercase().replace('/', "\\");
+    if NOT_GAME_FOLDERS.iter().any(|m| path.contains(m)) {
+        return None;
+    }
     if LIBRARY_MARKERS.iter().any(|m| path.contains(m)) {
         return Some(Reason::Library);
     }
@@ -131,6 +143,17 @@ mod tests {
         assert_eq!(classify(r"C:\Windows\explorer.exe", "explorer.exe", true, &[], &[]), None);
         // ...unless the user explicitly says so.
         assert_eq!(classify(r"C:\x\chrome.exe", "chrome.exe", false, &["Chrome.exe".into()], &[]), Some(Reason::UserList));
+    }
+
+    #[test]
+    fn launchers_in_library_folders_are_not_games() {
+        let g = |p: &str, e: &str| classify(p, e, true, &[], &[]);
+        assert_eq!(g(r"C:\Riot Games\Riot Client\RiotClientServices.exe", "RiotClientServices.exe"), None);
+        assert_eq!(g(r"C:\Program Files\Rockstar Games\Launcher\Launcher.exe", "Launcher.exe"), None);
+        assert_eq!(g(r"C:\Riot Games\League of Legends\LeagueClient.exe", "LeagueClient.exe"), None);
+        // The games themselves still are.
+        assert_eq!(classify(r"C:\Program Files\Rockstar Games\Grand Theft Auto V\GTA5.exe", "GTA5.exe", false, &[], &[]), Some(Reason::Library));
+        assert_eq!(classify(r"C:\Riot Games\VALORANT\live\VALORANT.exe", "VALORANT.exe", false, &[], &[]), Some(Reason::Library));
     }
 
     #[test]
