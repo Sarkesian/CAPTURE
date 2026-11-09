@@ -206,6 +206,13 @@ try {
   console.log('--- Installer');
   const idir = path.join(work, 'Install Dir', 'CAPTURE');
   const runSetup = (...args) => spawnSync(`"${setup}" ${args.join(' ')}`, { shell: true, windowsVerbatimArguments: true, stdio: 'ignore' }).status;
+  // A folder holding another program's Runtime/Resources/Data is refused, untouched.
+  const foreign = path.join(work, 'Shared Folder');
+  for (const d of ['Runtime', 'Resources', 'Data']) { mkdirSync(path.join(foreign, d), { recursive: true }); writeFileSync(path.join(foreign, d, 'theirs.txt'), 'keep'); }
+  const stForeign = runSetup('/S', `/D=${foreign}`);
+  check(stForeign !== 0 && ['Runtime', 'Resources', 'Data'].every(d => readFileSync(path.join(foreign, d, 'theirs.txt'), 'utf8') === 'keep')
+    && !existsSync(path.join(foreign, 'CAPTURE.exe')) && !uninstValue('InstallLocation'),
+    `install into a folder with another program's Runtime/Resources/Data is refused, nothing changed (exit ${stForeign})`);
   const st = runSetup('/S', '/STARTUP=1', testDesktop ? '/DESKTOP=1' : '', `/D=${idir}`);
   check(st === 0, `silent install to ${idir} (exit ${st})`);
   ({ m, bad } = matchesManifest(idir));

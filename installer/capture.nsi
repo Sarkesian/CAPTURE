@@ -230,6 +230,16 @@ Function DirLeave
     ${EndIf}
   ${Else}
     ${DirState} $INSTDIR $0
+    ; CAPTURE replaces (and its uninstaller removes) its own Runtime, Resources and Data
+    ; folders as a whole, so a folder that already has one of those names but no CAPTURE.exe
+    ; holds someone else's files: never install over it.
+    ${If} ${FileExists} "$INSTDIR\Runtime\*.*"
+    ${OrIf} ${FileExists} "$INSTDIR\Resources\*.*"
+    ${OrIf} ${FileExists} "$INSTDIR\Data\*.*"
+    ${OrIf} ${FileExists} "$INSTDIR\licenses\*.*"
+      MessageBox MB_OK|MB_ICONEXCLAMATION "This folder already contains other programs' files (a Runtime, Resources, Data or licenses folder) that CAPTURE would replace.$\r$\n$\r$\nChoose an empty folder or a new one, for example $INSTDIR\CAPTURE."
+      Abort
+    ${EndIf}
     ${If} $0 == 1
       MessageBox MB_OKCANCEL|MB_ICONINFORMATION "This folder is not empty. CAPTURE adds its own files and leaves everything else there alone." IDOK folderOk
       Abort
@@ -301,6 +311,19 @@ Section "CAPTURE" SecMain
   SectionIn RO
   StrCpy $Failed ""
   Call CloseCapture
+
+  ; Same rule as the folder page, for silent installs (which skip the page): the folders
+  ; replaced below must belong to an existing CAPTURE.
+  ${IfNot} ${FileExists} "$INSTDIR\${EXE}"
+    ${If} ${FileExists} "$INSTDIR\Runtime\*.*"
+    ${OrIf} ${FileExists} "$INSTDIR\Resources\*.*"
+    ${OrIf} ${FileExists} "$INSTDIR\Data\*.*"
+    ${OrIf} ${FileExists} "$INSTDIR\licenses\*.*"
+      MessageBox MB_OK|MB_ICONSTOP "$INSTDIR already contains other programs' files (Runtime, Resources, Data or licenses). Nothing was installed. Choose an empty folder." /SD IDOK
+      SetErrorLevel 2
+      Quit
+    ${EndIf}
+  ${EndIf}
 
   SetOutPath $INSTDIR
   ; Program files from 0.3–0.4 portable folders (flat layout), replaced by Runtime\ and Resources\.
