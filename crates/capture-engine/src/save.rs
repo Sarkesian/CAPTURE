@@ -88,6 +88,20 @@ unsafe fn keyframes(path: &Path, video_idx: usize) -> Vec<i64> {
     out
 }
 
+/// Session-timeline time (seconds) of the first video keyframe in a buffer segment. Segments
+/// keep absolute timeline timestamps, so this places a recovered clip on the session timeline.
+pub fn first_keyframe_secs(path: &Path) -> Option<f64> {
+    unsafe {
+        let ic = open_input(path).ok()?;
+        let n = (*ic.0).nb_streams as usize;
+        let v = (0..n).find(|&i| (*(*(*(*ic.0).streams.add(i))).codecpar).codec_type == ff::AVMediaType::AVMEDIA_TYPE_VIDEO)?;
+        let tb = (*(*(*ic.0).streams.add(v))).time_base;
+        drop(ic);
+        let k = *keyframes(path, v).first()?;
+        Some(k as f64 * tb.num as f64 / tb.den as f64)
+    }
+}
+
 /// Pure choice of the cut point (unit-tested): the last keyframe at or before `want`, else the
 /// first keyframe.
 pub fn pick_origin(keys: &[i64], want: i64) -> Option<i64> {

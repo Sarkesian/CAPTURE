@@ -20,7 +20,12 @@ const cfg = { capture_root: root, replay_secs: 30, target: { kind: 'display', in
 const a = start();
 a.send('configure', cfg); a.send('set_replay', { enabled: true });
 await a.waitFor(m => m.event === 'state' && m.data.status === 'buffering');
-await sleep(12000);
+await sleep(5000);
+const mk = a.send('add_marker', { label: 'before crash' });
+const marker = (await a.waitFor(m => m.re === mk && m.event === 'marker_added')).data;
+await sleep(7000);
+a.send('get_state'); await sleep(300);
+const nowAtKill = a.state().now_secs;
 a.proc.kill('SIGKILL'); // TerminateProcess: no cleanup at all
 await new Promise(r => a.proc.on('exit', r));
 const b = start();
@@ -34,6 +39,18 @@ check(rec.data.clips.length === 1 && rec.data.failed.length === 0, `recovered: $
 b.send('get_state'); await sleep(800);
 check(b.state().leftover_buffer_bytes === 0, 'leftover removed only after the clip was saved');
 console.log('RECOVERED=' + (rec.data.clips[0] ?? ''));
+// The marker survives the crash, placed where it was in the recovered clip. The recovered clip
+// ends at the kill, so marker position from the end = (now at kill - marker.t), within ~1.5 s.
+const side = rec.data.clips[0] + '.markers.json';
+const { existsSync, readFileSync } = await import('node:fs');
+const { spawnSync } = await import('node:child_process');
+if (existsSync(side)) {
+  const doc = JSON.parse(readFileSync(side, 'utf8'));
+  const dur = Number(spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', rec.data.clips[0]], { encoding: 'utf8' }).stdout.trim());
+  const fromEnd = dur - doc.markers[0].t, expected = nowAtKill - marker.t;
+  check(doc.markers.length === 1 && doc.markers[0].label === 'before crash' && Math.abs(fromEnd - expected) < 1.5,
+    `marker kept in the recovered clip at ${doc.markers[0].t} s of ${dur.toFixed(1)} s (${fromEnd.toFixed(1)} s before the end, expected ~${expected.toFixed(1)})`);
+} else check(false, 'marker sidecar written for the recovered clip');
 b.send('shutdown'); await new Promise(r => b.proc.on('exit', r));
 console.log(fail ? `${fail} FAILED` : 'ALL PASSED');
 process.exit(fail ? 1 : 0);

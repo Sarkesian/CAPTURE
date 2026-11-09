@@ -778,12 +778,36 @@ fn recover_session(root: &Path, dir: &Path) -> Result<PathBuf, String> {
     if segs.is_empty() {
         return Err("no footage".into());
     }
+    let origin = save::first_keyframe_secs(&segs[0]);
     let list: Vec<(PathBuf, f64)> = segs.into_iter().map(|p| (p, 0.0)).collect();
     let out_dir = storage::clips_dir(root, &game);
     std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
     let name = storage::clip_file_name(&storage::local_stamp(), &game, "Recovered");
     let path = storage::reserve_unique_path(&out_dir, &name).map_err(|e| e.to_string())?;
-    save::remux(&list, 0.0, 0.0, 1e9, &tracks, &path).map(|(c, _)| c.path)
+    let (clip, _) = save::remux(&list, 0.0, 0.0, 1e9, &tracks, &path)?;
+    // Markers survive a crash: the session's crash-safe markers.json becomes the recovered
+    // clip's sidecar (before the caller deletes the buffer folder).
+    let markers: Vec<Marker> = std::fs::read(dir.join("markers.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    if let (Some(origin), false) = (origin, markers.is_empty()) {
+        write_marker_sidecar(&clip.path, &markers, origin, clip.duration_secs);
+    }
+    Ok(clip.path)
+}
+
+/// `<clip>.markers.json` with times relative to the clip start (same format as normal saves).
+fn write_marker_sidecar(clip: &Path, markers: &[Marker], origin: f64, duration: f64) {
+    let inside: Vec<_> = markers
+        .iter()
+        .filter(|m| m.t >= origin && m.t <= origin + duration)
+        .map(|m| serde_json::json!({ "t": ((m.t - origin) * 100.0).round() / 100.0, "label": m.label, "at": m.at }))
+        .collect();
+    if inside.is_empty() {
+        return;
+    }
+    let doc = serde_json::json!({ "capture_markers": 1, "clip": clip.file_name().map(|n| n.to_string_lossy().into_owned()), "markers": inside });
+    let mut side = clip.as_os_str().to_owned();
+    side.push(".markers.json");
+    let _ = std::fs::write(PathBuf::from(side), serde_json::to_vec_pretty(&doc).unwrap());
 }
 
 fn live_of(cfg: &EngineConfig) -> Live {
