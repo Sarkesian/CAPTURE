@@ -418,7 +418,7 @@ pub(crate) fn source_thread(spec: &SourceSpec, buf: &Mutex<TrackBuf>, t0_qpc: u6
     while !stop.load(Ordering::Relaxed) {
         match capture_source(spec, buf, t0_qpc, stop) {
             Ok(()) => return,
-            // The Windows default microphone changed: switch to it at once, quietly.
+            // The Windows default microphone or output device changed: switch at once, quietly.
             Err(e) if e == REOPEN => continue,
             Err(e) => buf.lock().unwrap().error = Some(e),
         }
@@ -589,6 +589,121 @@ impl Drop for AacEncoder {
 
 // ---- WASAPI capture ----------------------------------------------------------------------
 
+/// Channel count and speaker mask of the default output device's mix, when it has more than
+/// two channels (a 7.1 gaming headset or speaker set).
+fn render_layout() -> Option<(usize, u32)> {
+    unsafe {
+        let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+        let dev = en.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
+        let client: IAudioClient = dev.Activate(CLSCTX_ALL, None).ok()?;
+        let mf = client.GetMixFormat().ok()?;
+        let n = (*mf).nChannels as usize;
+        let mask = if (*mf).wFormatTag == 0xFFFE && (*mf).cbSize >= 22 { (*(mf as *const WAVEFORMATEXTENSIBLE)).dwChannelMask } else { 0 };
+        CoTaskMemFree(Some(mf as *const _));
+        let mask = if mask.count_ones() as usize == n { mask } else { default_mask(n)? };
+        (n > 2).then_some((n, mask))
+    }
+}
+
+/// Windows' default speaker masks for channel counts that come without one.
+fn default_mask(n: usize) -> Option<u32> {
+    Some(match n {
+        3 => 0x7,
+        4 => 0x33,
+        5 => 0x37,
+        6 => 0x3F,
+        8 => 0x63F,
+        _ => return None,
+    })
+}
+
+/// 32-bit float, 48 kHz, `channels` with speaker `mask`.
+fn float_format_ext(channels: u16, mask: u32) -> WAVEFORMATEXTENSIBLE {
+    WAVEFORMATEXTENSIBLE {
+        Format: WAVEFORMATEX {
+            wFormatTag: 0xFFFE, // WAVE_FORMAT_EXTENSIBLE
+            nChannels: channels,
+            nSamplesPerSec: RATE,
+            nAvgBytesPerSec: RATE * channels as u32 * 4,
+            nBlockAlign: channels * 4,
+            wBitsPerSample: 32,
+            cbSize: 22,
+        },
+        Samples: WAVEFORMATEXTENSIBLE_0 { wValidBitsPerSample: 32 },
+        dwChannelMask: mask,
+        // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+        SubFormat: windows::core::GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71),
+    }
+}
+
+/// Surround to stereo at full level. Windows' own conversion scales the whole mix down so that
+/// every channel at full scale at once could not clip, which made games on 7.1 devices ~14 dB
+/// quieter in recordings than they really are. Here front left/right pass through untouched
+/// (stereo content stays bit-exact), centre and surrounds are added at -3 dB (ITU-R BS.775),
+/// LFE is left out as in standard downmixes, and when centre/surround channels are summed in,
+/// the rare result above 0.9 is softly limited instead of clipping.
+pub struct Downmix {
+    pub channels: usize,
+    pub mask: u32,
+    /// (left, right) gain per input channel, in the stream's channel order.
+    gains: Vec<(f32, f32)>,
+    /// Front left/right (copied as they are) and LFE (left out): nothing to sum or limit.
+    plain: Vec<bool>,
+}
+
+impl Downmix {
+    pub fn new(channels: usize, mask: u32) -> Self {
+        const K: f32 = std::f32::consts::FRAC_1_SQRT_2;
+        let mut gains = Vec::with_capacity(channels);
+        let mut plain = Vec::with_capacity(channels);
+        for bit in 0..32 {
+            if gains.len() == channels {
+                break;
+            }
+            if mask & (1 << bit) == 0 {
+                continue;
+            }
+            plain.push(matches!(1u32 << bit, 0x1 | 0x2 | 0x8));
+            gains.push(match 1u32 << bit {
+                0x1 | 0x40 => (1.0, 0.0),                    // front left, front left of centre
+                0x2 | 0x80 => (0.0, 1.0),                    // front right, front right of centre
+                0x4 => (K, K),                               // front centre
+                0x8 => (0.0, 0.0),                           // LFE
+                0x10 | 0x200 | 0x1000 | 0x8000 => (K, 0.0),  // back / side / top left
+                0x20 | 0x400 | 0x4000 | 0x20000 => (0.0, K), // back / side / top right
+                _ => (0.5, 0.5),                             // back / top centre
+            });
+        }
+        gains.resize(channels, (0.0, 0.0));
+        plain.resize(channels, true);
+        Self { channels, mask, gains, plain }
+    }
+
+    pub fn run(&self, input: &[f32], out: &mut Vec<f32>) {
+        out.clear();
+        out.reserve(input.len() / self.channels * CH);
+        for frame in input.chunks_exact(self.channels) {
+            let (mut l, mut r) = (0f32, 0f32);
+            // Whether anything besides a plain left/right channel contributes to this frame.
+            let mut summed = false;
+            for ((&x, &(gl, gr)), &plain) in frame.iter().zip(&self.gains).zip(&self.plain) {
+                summed |= !plain && x != 0.0;
+                l += x * gl;
+                r += x * gr;
+            }
+            // Stereo content (front left/right only) passes bit-exact, even near full scale;
+            // only a sum with centre/surround channels can exceed it and is limited.
+            if summed {
+                out.push(soft_clip(l));
+                out.push(soft_clip(r));
+            } else {
+                out.push(l);
+                out.push(r);
+            }
+        }
+    }
+}
+
 fn float_format() -> WAVEFORMATEX {
     WAVEFORMATEX {
         wFormatTag: 3, // WAVE_FORMAT_IEEE_FLOAT
@@ -672,8 +787,34 @@ fn capture_source(spec: &SourceSpec, buf: &Mutex<TrackBuf>, t0_qpc: u64, stop: &
     let follows_default = matches!(spec, SourceSpec::Mic { device_id: None });
     let default_at_open = if follows_default { devices::default_id(eCapture) } else { None };
     let watched = watch.and_then(|pid| unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid).ok() }).map(HandleGuard);
+    // Loopback sources are captured in the output device's own channel layout and downmixed
+    // here (see `Downmix`): Windows' own conversion of a surround mix to stereo lowers the
+    // level by ~14 dB on a 7.1 device. Microphones are captured as stereo directly.
+    let loopback = flags & AUDCLNT_STREAMFLAGS_LOOPBACK != 0;
+    // What the layout was chosen from; a change (headset plugged in, speaker setup changed in
+    // Windows) reopens the source so the new device's layout is used.
+    let output_at_open = if loopback { (devices::default_id(eRender), render_layout()) } else { (None, None) };
     let fmt = float_format();
-    unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 200_000, 0, &fmt, None) }.map_err(|e| e.to_string())?;
+    let mut client = client;
+    let mut downmix = None;
+    if let Some((n, mask)) = output_at_open.1 {
+        let ext = float_format_ext(n as u16, mask);
+        match unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 200_000, 0, &ext as *const WAVEFORMATEXTENSIBLE as *const WAVEFORMATEX, None) } {
+            Ok(()) => downmix = Some(Downmix::new(n, mask)),
+            Err(e) => {
+                // Never lose the audio over this: Windows' own stereo conversion (quieter on
+                // surround devices) is still better than nothing.
+                eprintln!("{n}-channel capture refused ({e}); capturing stereo");
+                client = open(spec)?.0;
+            }
+        }
+    }
+    if downmix.is_none() {
+        unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 200_000, 0, &fmt, None) }.map_err(|e| e.to_string())?;
+    }
+    let in_ch = downmix.as_ref().map_or(CH, |d| d.channels);
+    let mut output_checked = Instant::now();
+    let mut stereo: Vec<f32> = Vec::new();
     let ev = unsafe { CreateEventW(None, false, false, None) }.map_err(|e| e.to_string())?;
     let _guard = HandleGuard(ev);
     unsafe { client.SetEventHandle(ev) }.map_err(|e| e.to_string())?;
@@ -707,6 +848,17 @@ fn capture_source(spec: &SourceSpec, buf: &Mutex<TrackBuf>, t0_qpc: u64, stop: &
                 return Err(REOPEN.into());
             }
         }
+        if loopback && output_checked.elapsed() >= Duration::from_secs(1) {
+            output_checked = Instant::now();
+            let now = (devices::default_id(eRender), render_layout());
+            if now != output_at_open {
+                eprintln!("audio output changed ({:?} -> {:?} channels); reopening {source}", output_at_open.1.map(|l| l.0), now.1.map(|l| l.0));
+                unsafe {
+                    let _ = client.Stop();
+                }
+                return Err(REOPEN.into());
+            }
+        }
         if let Some(h) = &watched {
             if unsafe { WaitForSingleObject(h.0, 0) } == WAIT_OBJECT_0 {
                 unsafe {
@@ -729,7 +881,14 @@ fn capture_source(spec: &SourceSpec, buf: &Mutex<TrackBuf>, t0_qpc: u64, stop: &
             let now_idx = clock::qpc100ns_to_samples(clock::now_100ns(), t0_qpc, RATE);
             let idx = plausible_index(clock::qpc100ns_to_samples(qpc, t0_qpc, RATE), now_idx, frames, bflags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 != 0);
             let silent = bflags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
-            let samples = (!silent).then(|| unsafe { std::slice::from_raw_parts(data as *const f32, frames as usize * CH) });
+            let samples = (!silent).then(|| unsafe { std::slice::from_raw_parts(data as *const f32, frames as usize * in_ch) });
+            let samples = match (samples, &downmix) {
+                (Some(s), Some(d)) => {
+                    d.run(s, &mut stereo);
+                    Some(&stereo[..])
+                }
+                (s, _) => s,
+            };
             buf.lock().unwrap().push(idx, samples, frames as usize);
             unsafe { cap.ReleaseBuffer(frames) }.map_err(|e| lost(&e.message()))?;
         }
@@ -928,6 +1087,63 @@ mod tests {
         let (p, r) = b.take_level();
         assert!((p - 0.5).abs() < 1e-6 && (r - 0.5).abs() < 1e-3);
         assert_eq!(b.take_level(), (0.0, 0.0));
+    }
+
+    #[test]
+    fn surround_downmix_keeps_stereo_exact_and_full_level() {
+        let d = super::Downmix::new(8, 0x63F); // 7.1: FL FR FC LFE BL BR SL SR
+        let mut out = Vec::new();
+        // Stereo content on the front pair: unchanged.
+        d.run(&[0.5, -0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], &mut out);
+        assert_eq!(out, vec![0.5, -0.25]);
+        // Centre at -3 dB to both, LFE dropped, surrounds to their side.
+        d.run(&[0.0, 0.0, 0.4, 1.0, 0.2, 0.0, 0.0, 0.2], &mut out);
+        let k = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((out[0] - (0.4 * k + 0.2 * k)).abs() < 1e-6 && (out[1] - (0.4 * k + 0.2 * k)).abs() < 1e-6);
+        // Everything at full scale: limited below 1, not clipped.
+        d.run(&[1.0; 8], &mut out);
+        assert!(out[0] <= 1.0 && out[0] > 0.9, "limited to full scale, not beyond");
+        // Loud stereo near full scale is not touched by the limiter.
+        d.run(&[0.98, -0.99, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], &mut out);
+        assert_eq!(out, vec![0.98, -0.99]);
+    }
+
+    /// Every common speaker setup: each channel lands where it belongs, at the right level,
+    /// and stereo content on the front pair is bit-exact.
+    #[test]
+    fn downmix_handles_every_common_layout() {
+        let k = std::f32::consts::FRAC_1_SQRT_2;
+        // (name, mask, expected (left, right) gain per channel in stream order)
+        let layouts: &[(&str, u32, &[(f32, f32)])] = &[
+            ("quad", 0x33, &[(1.0, 0.0), (0.0, 1.0), (k, 0.0), (0.0, k)]),
+            ("5.1 back", 0x3F, &[(1.0, 0.0), (0.0, 1.0), (k, k), (0.0, 0.0), (k, 0.0), (0.0, k)]),
+            ("5.1 side", 0x60F, &[(1.0, 0.0), (0.0, 1.0), (k, k), (0.0, 0.0), (k, 0.0), (0.0, k)]),
+            ("7.1", 0x63F, &[(1.0, 0.0), (0.0, 1.0), (k, k), (0.0, 0.0), (k, 0.0), (0.0, k), (k, 0.0), (0.0, k)]),
+            (
+                "7.1.4",
+                0x2D63F,
+                &[(1.0, 0.0), (0.0, 1.0), (k, k), (0.0, 0.0), (k, 0.0), (0.0, k), (k, 0.0), (0.0, k), (k, 0.0), (0.0, k), (k, 0.0), (0.0, k)],
+            ),
+        ];
+        for &(name, mask, want) in layouts {
+            let n = want.len();
+            assert_eq!(mask.count_ones() as usize, n, "{name}");
+            let d = super::Downmix::new(n, mask);
+            let mut out = Vec::new();
+            for (i, &(wl, wr)) in want.iter().enumerate() {
+                let mut frame = vec![0.0f32; n];
+                frame[i] = 0.5;
+                d.run(&frame, &mut out);
+                assert!((out[0] - 0.5 * wl).abs() < 1e-6 && (out[1] - 0.5 * wr).abs() < 1e-6, "{name} channel {i}: got {out:?}");
+            }
+            let mut frame = vec![0.0f32; n];
+            frame[0] = 0.7;
+            frame[1] = -0.3;
+            d.run(&frame, &mut out);
+            assert_eq!(out, vec![0.7, -0.3], "{name}: stereo exact");
+        }
+        assert_eq!(super::default_mask(6), Some(0x3F));
+        assert_eq!(super::default_mask(8), Some(0x63F));
     }
 
     #[test]

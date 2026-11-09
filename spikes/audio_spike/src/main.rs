@@ -63,6 +63,16 @@ fn main() {
 fn run() -> windows::core::Result<()> {
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("play") {
+        let secs: f64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10.0);
+        let speaker: u32 = args.get(2).and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or(0x4);
+        let amp: f32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0.01);
+        return play_71(secs, speaker, amp);
+    }
+    if args.first().map(String::as_str) == Some("native") {
+        let secs: f64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(5.0);
+        return native_levels(secs, args.get(2).and_then(|s| s.parse().ok()));
+    }
     match args.first().map(String::as_str) {
         Some("list") => list(),
         Some("record") => {
@@ -391,3 +401,83 @@ fn write_stream(out: &std::path::Path, t0: u64, elapsed: f64, st: Stats) {
 
 #[allow(dead_code)]
 fn _unused(_: GUID, _: PCWSTR) {}
+
+/// Loopback of the default output device in its own mix format (no conversion): peak per channel.
+fn native_levels(secs: f64, pid: Option<u32>) -> windows::core::Result<()> {
+    unsafe {
+        let d = endpoint(eRender, &None)?;
+        let dev_client: IAudioClient = d.Activate(CLSCTX_ALL, None)?;
+        let mf = dev_client.GetMixFormat()?;
+        // With a pid: the same format from process loopback (the app's audio only).
+        let client: IAudioClient = match pid { Some(p) => process_loopback_client(p)?, None => dev_client };
+        let (ch, bits, tag, rate) = ((*mf).nChannels as usize, (*mf).wBitsPerSample, (*mf).wFormatTag, (*mf).nSamplesPerSec);
+        let mask = if tag == 0xFFFE { (*(mf as *const WAVEFORMATEXTENSIBLE)).dwChannelMask } else { 0 };
+        eprintln!("device {} mix format: tag {tag:#x} {ch} ch {bits} bit {rate} Hz mask {mask:#x}", device_name(&d));
+        let flags = if pid.is_some() { AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM } else { AUDCLNT_STREAMFLAGS_LOOPBACK };
+        client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 2_000_000, 0, mf, None)?;
+        let cap: IAudioCaptureClient = client.GetService()?;
+        client.Start()?;
+        let mut peak = vec![0f32; ch];
+        let end = Instant::now() + Duration::from_secs_f64(secs);
+        while Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+            loop {
+                let n = cap.GetNextPacketSize()?;
+                if n == 0 { break; }
+                let (mut data, mut frames, mut fl) = (std::ptr::null_mut(), 0u32, 0u32);
+                cap.GetBuffer(&mut data, &mut frames, &mut fl, None, None)?;
+                if bits == 32 && fl & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 == 0 {
+                    let s = std::slice::from_raw_parts(data as *const f32, frames as usize * ch);
+                    for (i, x) in s.iter().enumerate() { peak[i % ch] = peak[i % ch].max(x.abs()); }
+                }
+                cap.ReleaseBuffer(frames)?;
+            }
+        }
+        let _ = client.Stop();
+        let db: Vec<String> = peak.iter().map(|p| format!("{:.1}", 20.0 * p.max(1e-9).log10())).collect();
+        println!("{{\"channels\":{ch},\"mask\":{mask},\"peaks\":[{}]}}", peak.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(","));
+        eprintln!("peak dBFS per channel: {}", db.join(" | "));
+    }
+    Ok(())
+}
+
+/// Render a 1 kHz tone on one speaker of a 7.1 stream (float, mask 0x63F) to the default output
+/// device. Windows converts it if the device has another layout.
+fn play_71(secs: f64, speaker: u32, amp: f32) -> windows::core::Result<()> {
+    const MASK: u32 = 0x63F;
+    let ch = 8usize;
+    // `speaker` is a mask: the tone plays on every 7.1 channel it names.
+    let on: Vec<bool> = (0..32).filter(|b| MASK & (1 << b) != 0).map(|b| speaker & (1 << b) != 0).collect();
+    unsafe {
+        let d = endpoint(eRender, &None)?;
+        let client: IAudioClient = d.Activate(CLSCTX_ALL, None)?;
+        let fmt = WAVEFORMATEXTENSIBLE {
+            Format: WAVEFORMATEX { wFormatTag: 0xFFFE, nChannels: ch as u16, nSamplesPerSec: RATE, nAvgBytesPerSec: RATE * ch as u32 * 4, nBlockAlign: ch as u16 * 4, wBitsPerSample: 32, cbSize: 22 },
+            Samples: WAVEFORMATEXTENSIBLE_0 { wValidBitsPerSample: 32 },
+            dwChannelMask: MASK,
+            SubFormat: GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71),
+        };
+        client.Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, 2_000_000, 0, &fmt as *const _ as *const WAVEFORMATEX, None)?;
+        let size = client.GetBufferSize()?;
+        let render: IAudioRenderClient = client.GetService()?;
+        let mut phase = 0u64;
+        client.Start()?;
+        let end = Instant::now() + Duration::from_secs_f64(secs);
+        while Instant::now() < end {
+            let free = size - client.GetCurrentPadding()?;
+            if free > 0 {
+                let buf = render.GetBuffer(free)? as *mut f32;
+                let s = std::slice::from_raw_parts_mut(buf, free as usize * ch);
+                for f in 0..free as usize {
+                    let v = amp * (2.0 * std::f64::consts::PI * 1000.0 * phase as f64 / RATE as f64).sin() as f32;
+                    phase += 1;
+                    for c in 0..ch { s[f * ch + c] = if on[c] { v } else { 0.0 }; }
+                }
+                render.ReleaseBuffer(free, 0)?;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = client.Stop();
+    }
+    Ok(())
+}
