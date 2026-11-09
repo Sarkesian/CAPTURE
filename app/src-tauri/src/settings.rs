@@ -64,6 +64,11 @@ pub struct AppSettings {
     pub overlay_scale: u32,
     /// Optional separate folder for temporary footage.
     pub buffer_root: Option<String>,
+    /// Also write per-track WAV files after every save ("Create separate audio files for
+    /// editors"). Off: the MP4 already contains every track; WAVs can be made later per clip.
+    pub editor_audio_files: bool,
+    /// Minimizing the window hides it to the tray instead of the taskbar.
+    pub minimize_to_tray: bool,
 }
 
 impl Default for AppSettings {
@@ -81,7 +86,9 @@ impl Default for AppSettings {
             save_hotkey: "Alt+F10".into(),
             buffer_cap_gb: 20.0,
             min_free_gb: 10.0,
-            close_to_tray: false,
+            // A background recorder: closing the window keeps it recording in the tray. Quit
+            // from the tray menu (or turn this off) to stop it.
+            close_to_tray: true,
             notify_on_save: true,
             games: vec![],
             ignored: vec![],
@@ -101,6 +108,8 @@ impl Default for AppSettings {
             notices: Notices::default(),
             overlay_scale: 100,
             buffer_root: None,
+            editor_audio_files: false,
+            minimize_to_tray: false,
         }
     }
 }
@@ -148,6 +157,7 @@ impl AppSettings {
             notices: self.notices,
             buffer_cap_bytes: (self.buffer_cap_gb.max(1.0) * 1e9) as u64,
             min_free_bytes: (self.min_free_gb.max(1.0) * 1e9) as u64,
+            editor_audio_files: self.editor_audio_files,
         }
     }
 
@@ -204,20 +214,103 @@ fn writable(dir: &Path) -> bool {
     ok
 }
 
-/// Missing file -> defaults. Unreadable file -> kept as `settings.json.bad` (never silently
-/// overwritten) and defaults are used. A UTF-8 BOM (Notepad/PowerShell) is accepted.
+/// Loads settings without ever losing them:
+/// - Missing file -> settings from the newest older portable build next to this one
+///   (`..\CAPTURE-<version>\data\settings.json`, copied, never moved), else defaults.
+/// - Readable file -> used, and copied to `settings.json.bak` (last known good).
+/// - A file where only some values are unreadable (e.g. written by a different version) ->
+///   every readable value is kept and only the bad ones fall back to defaults.
+/// - A file that is not JSON at all -> the last known good backup, else defaults.
+///   In both damaged cases the original is kept as `settings.json.bad-<time>` first.
+/// A UTF-8 BOM (Notepad/PowerShell) is accepted.
 pub fn load(dir: &Path) -> AppSettings {
     let path = dir.join("settings.json");
-    let Ok(bytes) = std::fs::read(&path) else { return AppSettings::default() };
-    let body = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
-    match serde_json::from_slice::<AppSettings>(body) {
-        Ok(s) => s.sanitized(),
-        Err(e) => {
-            eprintln!("settings.json unreadable ({e}); keeping it as settings.json.bad");
-            let _ = std::fs::rename(&path, dir.join("settings.json.bad"));
-            AppSettings::default()
+    if !path.exists() {
+        if let Some(from) = import_previous(dir) {
+            eprintln!("settings: copied from {}", from.display());
         }
     }
+    let Ok(bytes) = std::fs::read(&path) else { return AppSettings::default() };
+    match parse(&bytes) {
+        Parsed::Ok(s) => {
+            let _ = std::fs::copy(&path, dir.join("settings.json.bak"));
+            s.sanitized()
+        }
+        Parsed::Partial(s, bad) => {
+            keep_damaged(dir, &path);
+            eprintln!("settings.json: kept every readable value; reset {bad:?} to defaults");
+            s.sanitized()
+        }
+        Parsed::Unreadable(e) => {
+            keep_damaged(dir, &path);
+            eprintln!("settings.json unreadable ({e})");
+            match std::fs::read(dir.join("settings.json.bak")).map(|b| parse(&b)) {
+                Ok(Parsed::Ok(s) | Parsed::Partial(s, _)) => s.sanitized(),
+                _ => AppSettings::default(),
+            }
+        }
+    }
+}
+
+enum Parsed {
+    Ok(AppSettings),
+    /// Usable settings plus the names of fields that could not be read.
+    Partial(AppSettings, Vec<String>),
+    Unreadable(String),
+}
+
+fn parse(bytes: &[u8]) -> Parsed {
+    let body = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let e = match serde_json::from_slice::<AppSettings>(body) {
+        Ok(s) => return Parsed::Ok(s),
+        Err(e) => e,
+    };
+    // Salvage field by field: start from defaults and take each stored value that is valid.
+    let Ok(serde_json::Value::Object(stored)) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return Parsed::Unreadable(e.to_string());
+    };
+    let mut merged = serde_json::to_value(AppSettings::default()).unwrap();
+    let mut bad = Vec::new();
+    for (k, v) in stored {
+        let mut trial = merged.clone();
+        trial[&k] = v;
+        if serde_json::from_value::<AppSettings>(trial.clone()).is_ok() {
+            merged = trial;
+        } else {
+            bad.push(k);
+        }
+    }
+    match serde_json::from_value::<AppSettings>(merged) {
+        Ok(s) => Parsed::Partial(s, bad),
+        Err(_) => Parsed::Unreadable(e.to_string()),
+    }
+}
+
+/// Keep a damaged settings file for inspection, under a name that never overwrites an
+/// earlier one.
+fn keep_damaged(dir: &Path, path: &Path) {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let _ = std::fs::copy(path, dir.join(format!("settings.json.bad-{secs}")));
+}
+
+/// First run of a new portable version: copy the settings of the most recently used
+/// `CAPTURE-*` folder beside this one, so an update keeps microphone, hotkeys, folders, games
+/// and every other choice. Only reads the old folder.
+fn import_previous(dir: &Path) -> Option<PathBuf> {
+    let exe_dir = dir.parent()?; // <...>\CAPTURE-0.3.1  (dir = <exe folder>\data)
+    let parent = exe_dir.parent()?;
+    let newest = std::fs::read_dir(parent)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p != exe_dir && p.file_name().is_some_and(|n| n.to_string_lossy().to_ascii_uppercase().starts_with("CAPTURE")))
+        .map(|p| p.join("data").join("settings.json"))
+        .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
+        .filter(|(_, p)| std::fs::read(p).is_ok_and(|b| !matches!(parse(&b), Parsed::Unreadable(_))))
+        .max_by_key(|(t, _)| *t)?
+        .1;
+    std::fs::copy(&newest, dir.join("settings.json")).ok()?;
+    Some(newest)
 }
 
 /// Write-then-rename so a crash mid-write never leaves corrupt settings.
@@ -240,16 +333,64 @@ mod tests {
         assert_eq!(s.save_hotkey, "Alt+F10");
     }
 
-    #[test]
-    fn bom_is_accepted_and_corrupt_file_is_preserved() {
-        let dir = std::env::temp_dir().join(format!("capture-settings-{}", std::process::id()));
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("capture-settings-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn has_bad_copy(dir: &Path) -> bool {
+        std::fs::read_dir(dir).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("settings.json.bad-"))
+    }
+
+    #[test]
+    fn bom_is_accepted_and_corrupt_file_falls_back_to_last_good_copy() {
+        let dir = temp("bom");
         std::fs::write(dir.join("settings.json"), b"\xEF\xBB\xBF{\"replay_secs\": 300}").unwrap();
         assert_eq!(load(&dir).replay_secs, 300);
+        assert!(dir.join("settings.json.bak").exists(), "last known good copy kept");
         std::fs::write(dir.join("settings.json"), b"{ not json").unwrap();
-        assert_eq!(load(&dir), AppSettings::default());
-        assert!(dir.join("settings.json.bad").exists());
+        assert_eq!(load(&dir).replay_secs, 300, "restored from the last good copy, not reset");
+        assert!(has_bad_copy(&dir), "damaged file kept for inspection");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn one_unreadable_value_does_not_reset_the_others() {
+        // e.g. a value written by a different version that this one cannot read
+        let dir = temp("partial");
+        let body = r#"{"replay_secs": 300, "mic_enabled": true, "mic_device": "{0.0.1}.{abc}", "save_hotkey": "Alt+F9",
+                       "target": {"kind": "spaceship"}, "quality": 7, "start_with_windows": true}"#;
+        std::fs::write(dir.join("settings.json"), body).unwrap();
+        let s = load(&dir);
+        assert_eq!((s.replay_secs, s.mic_enabled, s.mic_device.as_deref(), s.save_hotkey.as_str()), (300, true, Some("{0.0.1}.{abc}"), "Alt+F9"));
+        assert!(s.start_with_windows);
+        assert_eq!(s.target, TargetPref::Auto);
+        assert_eq!(s.quality, Quality::High);
+        assert!(has_bad_copy(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_new_version_folder_copies_the_previous_versions_settings() {
+        let root = temp("update");
+        let old = root.join("CAPTURE-0.3.0").join("data");
+        let new = root.join("CAPTURE-0.3.1").join("data");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(old.join("settings.json"), r#"{"mic_enabled": true, "replay_secs": 600}"#).unwrap();
+        let s = load(&new);
+        assert!(s.mic_enabled && s.replay_secs == 600);
+        assert!(old.join("settings.json").exists(), "the old folder is never changed");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn current_file_round_trips_unchanged() {
+        let s = AppSettings { mic_enabled: true, editor_audio_files: true, minimize_to_tray: true, ..Default::default() };
+        let back: AppSettings = serde_json::from_slice(&serde_json::to_vec(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
     }
 
     #[test]

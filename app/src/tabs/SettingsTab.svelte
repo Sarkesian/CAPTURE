@@ -162,6 +162,10 @@
     {#if s.buffer_root}<button onclick={() => updateSettings({ buffer_root: null })}>Use capture folder</button>{/if}
   </div>
   <div class="field">
+    <div class="grow"><div>Create separate audio files for editors</div><div class="muted small">After each save, also write one WAV per audio track next to the clip. Every track is already inside the MP4; you can make these files for any clip later from the Library.</div></div>
+    <Toggle checked={s.editor_audio_files} label="Create separate audio files for editors" onchange={v => updateSettings({ editor_audio_files: v })} />
+  </div>
+  <div class="field">
     <label class="grow" for="cap">Temporary buffer limit (GB)</label>
     <input id="cap" type="number" min="1" max="2000" step="1" value={s.buffer_cap_gb} onchange={ev => updateSettings({ buffer_cap_gb: num(ev) })} />
   </div>
@@ -185,6 +189,10 @@
   <div class="field">
     <div class="grow"><div>Keep running in the tray when the window is closed</div><div class="muted small">Off: closing the window stops recording and quits.</div></div>
     <Toggle checked={s.close_to_tray} label="Keep running in the tray" onchange={v => updateSettings({ close_to_tray: v })} />
+  </div>
+  <div class="field">
+    <div class="grow"><div>Minimize to the tray</div><div class="muted small">Off: minimizing keeps CAPTURE on the taskbar. Recording continues either way.</div></div>
+    <Toggle checked={s.minimize_to_tray} label="Minimize to the tray" onchange={v => updateSettings({ minimize_to_tray: v })} />
   </div>
   <div class="field">
     <div class="grow"><div>Show small on-screen notices</div><div class="muted small">Brief corner messages over your game. They never appear in your recordings.</div></div>

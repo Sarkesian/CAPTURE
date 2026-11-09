@@ -112,19 +112,51 @@ fn allow_media(app: &AppHandle, root: &str) {
     }
 }
 
-/// Any engine command from either window; the answer arrives as an `engine` event whose
-/// `re` equals the returned id.
-/// Start with Windows: a per-user Run entry that starts CAPTURE in the tray. Removing it
-/// leaves nothing behind.
-#[tauri::command]
-fn set_start_with_windows(app: AppHandle, state: State<AppState>, enabled: bool) -> Result<(), String> {
+const RUN_KEY: windows::core::PCWSTR = windows::core::w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+
+/// The command line of CAPTURE's per-user Run entry, if there is one. This (not the saved
+/// setting) is the truth for "Start with Windows".
+fn startup_entry() -> Option<String> {
+    use windows::core::w;
+    use windows::Win32::System::Registry::*;
+    let mut buf = [0u16; 1024];
+    let mut len = (buf.len() * 2) as u32;
+    let r = unsafe { RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, w!("CAPTURE"), RRF_RT_REG_SZ, None, Some(buf.as_mut_ptr() as *mut _), Some(&mut len)) };
+    r.is_ok().then(|| String::from_utf16_lossy(&buf[..(len as usize / 2).saturating_sub(1)]))
+}
+
+/// The executable a Run entry starts (`"C:\path\CAPTURE.exe" --tray` -> `C:\path\CAPTURE.exe`).
+fn entry_exe(cmd: &str) -> PathBuf {
+    let t = cmd.trim();
+    PathBuf::from(match t.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(""),
+        None => t.split(" --").next().unwrap_or(t),
+    })
+}
+
+/// At launch: make the toggle show what Windows will actually do, and keep a working entry
+/// working after CAPTURE was moved to a new folder (the old exe is gone). An entry that points
+/// to another existing copy of CAPTURE is left alone.
+fn reconcile_startup(s: &mut AppSettings) -> bool {
+    let entry = startup_entry();
+    let mut changed = s.start_with_windows != entry.is_some();
+    s.start_with_windows = entry.is_some();
+    if let (Some(cmd), Ok(me)) = (entry, std::env::current_exe()) {
+        if !entry_exe(&cmd).exists() && write_startup(true, &me).is_ok() {
+            eprintln!("startup entry pointed to a missing {cmd}; now {}", me.display());
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn write_startup(enabled: bool, exe: &Path) -> Result<(), String> {
     use windows::core::{w, PCWSTR};
     use windows::Win32::System::Registry::*;
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let value = format!("\"{}\" --tray", exe.display());
     unsafe {
         let mut key = HKEY::default();
-        RegCreateKeyExW(HKEY_CURRENT_USER, w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run"), None, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, None, &mut key, None)
+        RegCreateKeyExW(HKEY_CURRENT_USER, RUN_KEY, None, PCWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, None, &mut key, None)
             .ok()
             .map_err(|e| format!("Could not change startup setting: {e}"))?;
         let r = if enabled {
@@ -135,7 +167,20 @@ fn set_start_with_windows(app: AppHandle, state: State<AppState>, enabled: bool)
             if r == windows::Win32::Foundation::ERROR_FILE_NOT_FOUND { windows::Win32::Foundation::ERROR_SUCCESS } else { r }
         };
         let _ = RegCloseKey(key);
-        r.ok().map_err(|e| format!("Could not change startup setting: {e}"))?;
+        r.ok().map_err(|e| format!("Could not change startup setting: {e}"))
+    }
+}
+
+/// Start with Windows: a per-user Run entry that starts CAPTURE in the tray. Removing it
+/// leaves nothing behind.
+#[tauri::command]
+fn set_start_with_windows(app: AppHandle, state: State<AppState>, enabled: bool) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    write_startup(enabled, &exe)?;
+    // Report what Windows now has, not what was asked for.
+    let actual = startup_entry().is_some();
+    if actual != enabled {
+        return Err("Windows did not accept the startup change. Check that no policy blocks startup apps.".into());
     }
     let s = {
         let mut g = state.settings.lock().unwrap();
@@ -452,11 +497,20 @@ fn build_tray(app: &AppHandle) -> tauri::Result<Tray> {
 
 fn main() {
     let data_dir = settings::data_dir();
-    let loaded = settings::load(&data_dir);
+    let mut loaded = settings::load(&data_dir);
+    if reconcile_startup(&mut loaded) {
+        let _ = settings::save(&data_dir, &loaded);
+    }
     let worker = Worker::new();
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_window(app)))
+        // A second launch never starts a second engine: it brings the running one forward.
+        // The sign-in launch (`--tray`) while CAPTURE already runs stays silent.
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if !args.iter().any(|a| a == "--tray") {
+                show_window(app);
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState {
@@ -520,6 +574,17 @@ fn main() {
             {
                 let handle = handle.clone();
                 window.on_window_event(move |e| {
+                    if let WindowEvent::Resized(_) = e {
+                        // Minimize to tray (optional): a minimized window raises Resized.
+                        let state = handle.state::<AppState>();
+                        if state.settings.lock().unwrap().minimize_to_tray {
+                            if let Some(w) = handle.get_webview_window("main") {
+                                if w.is_minimized().unwrap_or(false) {
+                                    let _ = w.hide();
+                                }
+                            }
+                        }
+                    }
                     if let WindowEvent::CloseRequested { api, .. } = e {
                         api.prevent_close();
                         let state = handle.state::<AppState>();
