@@ -35,9 +35,21 @@
 `README.txt`. Every WAV starts at the clip's time 0 and lasts the clip's full duration. Preview Mix
 is deliberately not exported.
 
+## Works today, without changing FrameCut
+Re-checked 2026-11-08 against the installed `D:\Programs\FrameCut Studio` (read-only, `app.asar`):
+`probeMedia()` in `desktop/tools.cjs` uses `streams.find(codec_type === 'audio')`, i.e. the first audio
+stream (Preview Mix), and accepts audio-only files as `kind: 'audio'`. So for separate lanes now:
+turn on **Settings › Storage › Create separate audio files for editors** (or "Editor audio files" on a
+clip in the Library), import the clip and the WAVs from `<clip>_Audio\`, place every WAV at 0 and mute
+the clip's own audio. The WAVs are sample-aligned with the video (`e2e-isolation`, `e2e-stems`).
+
 ## FrameCut side (proposal, when you authorise it)
-1. Today `desktop/tools.cjs:46` imports only the first audio stream. For CAPTURE clips that is Preview
-   Mix: safe (nothing plays twice) but not separable.
+1. Today `probeMedia()` (`desktop/tools.cjs`) imports only the first audio stream. For CAPTURE clips that
+   is Preview Mix: safe (nothing plays twice) but not separable.
+   Smallest change: have `probeMedia` also return `audioStreams: [{ index, handler_name }]`; on import of a
+   media item whose streams carry the labels below, add one audio lane per labelled stream that reads it
+   with `-map 0:a:<n>`. The lane/compose code (`compose.cjs`, timeline) must accept a stream index per
+   audio clip; that part is the real work and was not attempted from CAPTURE.
 2. Proposed: if any audio stream's `handler_name` is one of Game Audio / System Audio / Microphone /
    Voice Chat / All Desktop Audio, import each as its own lane at t = `start_time`, and **mute or exclude
    `Preview Mix`** (keep it as an optional "Combined" lane, off by default). Leave `All Desktop Audio` muted by
