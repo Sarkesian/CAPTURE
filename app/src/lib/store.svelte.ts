@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { AudioApp, AudioDevice, ClipEntry, DisplayTarget, EngineMessage, EngineState, Review, SavedClip, Settings, WindowTarget } from './types';
+import type { AppInfo, AudioApp, AudioDevice, ClipEntry, PathIssue, DisplayTarget, EngineMessage, EngineState, Review, SavedClip, Settings, WindowTarget } from './types';
 
 interface Toast { id: number; text: string; kind: 'ok' | 'error' | 'info' }
 
@@ -14,6 +14,10 @@ export const app = $state({
   clips: [] as ClipEntry[],
   toasts: [] as Toast[],
   dataDir: '',
+  /** This copy of CAPTURE: version, portable or installed, its folders. */
+  info: null as AppInfo | null,
+  /** Saved folders that are not reachable on this PC right now (setting kept). */
+  pathIssues: [] as PathIssue[],
   review: null as Review | null,
   reviewLoading: false,
   reviewError: null as string | null,
@@ -45,13 +49,16 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T |
 }
 
 export async function init() {
-  const b = await invoke<{ settings: Settings; data_dir: string; last_state: EngineState | null; engine_down: string | null }>('bootstrap');
+  const b = await invoke<{ settings: Settings; data_dir: string; last_state: EngineState | null; engine_down: string | null; app: AppInfo; path_issues: PathIssue[]; notices: string[] }>('bootstrap');
   app.settings = b.settings;
   app.dataDir = b.data_dir;
   app.engine = b.last_state;
   app.engineDown = b.engine_down;
+  app.info = b.app;
+  app.pathIssues = b.path_issues;
+  for (const n of b.notices) toast(n, n.startsWith('CAPTURE was updated') ? 'ok' : 'error', 12000);
   await listen<EngineMessage>('engine', e => onEngine(e.payload));
-  await listen<Settings>('settings', e => { app.settings = e.payload; });
+  await listen<Settings>('settings', e => { app.settings = e.payload; checkPaths(); });
   await listen<string>('engine_down', e => { app.engineDown = e.payload; });
   await listen<string>('goto', e => { app.tab = e.payload as typeof app.tab; refreshClips(); });
   refreshTargets();
@@ -132,10 +139,16 @@ function onEngine(m: EngineMessage) {
   }
 }
 
+export async function checkPaths() {
+  app.pathIssues = (await call<PathIssue[]>('check_paths')) ?? [];
+}
+
+export const openAppFolder = (which: 'data' | 'logs' | 'app' | 'resources') => call('open_app_folder', { which });
+
 export async function updateSettings(patch: Partial<Settings>) {
   if (!app.settings) return;
   const next = await call<Settings>('update_settings', { settings: { ...app.settings, ...patch } });
-  if (next) app.settings = next;
+  if (next) { app.settings = next; checkPaths(); }
 }
 
 /** Send any engine command; the reply arrives as an engine event with `re` = returned id. */

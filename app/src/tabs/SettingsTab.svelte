@@ -8,8 +8,8 @@
   import HotkeyField from '../components/HotkeyField.svelte';
   import AudioSources from '../components/AudioSources.svelte';
   import Icon from '../components/Icon.svelte';
-  import { app, updateSettings, clearTempCache, openCaptureFolder, fmtBytes, fmtDuration, engine, toast } from '../lib/store.svelte';
-  import type { GameRule, Quality } from '../lib/types';
+  import { app, updateSettings, clearTempCache, openCaptureFolder, openAppFolder, fmtBytes, fmtDuration, engine, toast } from '../lib/store.svelte';
+  import type { GameRule, Quality, StagedUpdate } from '../lib/types';
 
   const s = $derived(app.settings!);
   const e = $derived(app.engine);
@@ -24,6 +24,7 @@
     { id: 'storage', label: 'Storage' },
     { id: 'startup', label: 'Startup' },
     { id: 'advanced', label: 'Advanced' },
+    { id: 'about', label: 'About & updates' },
   ];
   let active = $state('recording');
   let root = $state<HTMLElement | null>(null);
@@ -72,6 +73,23 @@
   async function changeBuffer() {
     const dir = await open({ directory: true, title: 'Folder for temporary footage', defaultPath: s.buffer_root ?? s.capture_root });
     if (typeof dir === 'string') updateSettings({ buffer_root: dir });
+  }
+  // Updates: choose a downloaded release zip; CAPTURE checks every file before offering to install.
+  let staged = $state<StagedUpdate | null>(null);
+  let updBusy = $state<'' | 'checking' | 'installing'>('');
+  const recordingNow = $derived(e?.session_secs != null);
+  async function chooseUpdate() {
+    const file = await open({ title: 'Choose a CAPTURE release (.zip)', filters: [{ name: 'CAPTURE release', extensions: ['zip'] }] });
+    if (typeof file !== 'string') return;
+    staged = null; updBusy = 'checking';
+    try { staged = await invoke<StagedUpdate>('stage_update', { path: file }); }
+    catch (err) { toast(String(err), 'error', 10000); }
+    finally { updBusy = ''; }
+  }
+  async function installUpdate() {
+    updBusy = 'installing';
+    try { await invoke('apply_update'); }
+    catch (err) { toast(String(err), 'error', 10000); updBusy = ''; }
   }
   const num = (ev: Event) => Number((ev.target as HTMLInputElement).value);
   const join = (dir: string, leaf: string) => `${dir.replace(/[\\/]+$/, '')}\\${leaf}`;
@@ -279,7 +297,10 @@
     <section id="startup">
       <h2>Startup</h2>
       <div class="field">
-        <div class="lbl"><div>Start when I sign in to Windows</div><div class="hint">Starts in the tray, ready to record.</div></div>
+        <div class="lbl">
+          <div>Start when I sign in to Windows</div>
+          <div class="hint">{app.info?.installed ? 'Starts in the tray, ready to record.' : 'Starts this portable copy in the tray. This adds a startup entry to Windows for this folder: turn it off here before you delete the folder.'}</div>
+        </div>
         <Toggle checked={s.start_with_windows} label="Start with Windows" onchange={startup} />
       </div>
       <div class="field">
@@ -306,8 +327,48 @@
         <dt>Frames from Windows</dt><dd>{e?.capture_fps ?? 0} fps. Windows sends frames only when the picture changes; recordings stay at {s.fps} fps.</dd>
         <dt>Audio tracks</dt><dd>{#each e?.tracks ?? [] as t}<div>{t.name}: {t.mode}, {t.source}{t.error ? ` (${t.error})` : ''}</div>{:else}None while recording is off{/each}</dd>
         <dt>Free space</dt><dd>{e?.free_bytes != null ? fmtBytes(e.free_bytes) : 'Unknown'}</dd>
-        <dt>CAPTURE data folder</dt><dd class="mono">{app.dataDir}</dd>
       </dl>
+    </section>
+
+    <section id="about">
+      <h2>About &amp; updates</h2>
+      <div class="field">
+        <div class="lbl">
+          <div>CAPTURE {app.info?.version ?? ''} · {app.info?.installed ? 'Installed' : 'Portable'}</div>
+          <div class="hint mono ellipsis" title={app.info?.app_dir}>{app.info?.app_dir}</div>
+        </div>
+        <button class="btn ghost" onclick={() => openAppFolder('app')}><Icon name="folder" size={16} />Open</button>
+      </div>
+      <div class="field">
+        <div class="lbl">
+          <div>Settings, logs and cache</div>
+          <div class="hint mono ellipsis" title={app.info?.data_dir}>{app.info?.data_dir}</div>
+          {#if app.info?.data_fallback}<div class="hint warn">Kept here because Windows doesn’t allow changes in CAPTURE’s own folder. Move CAPTURE to a folder you can write to, to keep everything together.</div>{/if}
+        </div>
+        <div class="row"><button class="btn ghost" onclick={() => openAppFolder('data')}>Open</button><button class="btn ghost" onclick={() => openAppFolder('logs')}>Logs</button></div>
+      </div>
+      <div class="field">
+        <div class="lbl">
+          <div>Update CAPTURE</div>
+          <div class="hint">Choose a downloaded CAPTURE release (.zip). Every file is checked first; your settings and recordings stay as they are, and CAPTURE restarts.</div>
+        </div>
+        <button class="btn" disabled={updBusy !== ''} onclick={chooseUpdate}><Icon name="refresh" size={16} />{updBusy === 'checking' ? 'Checking…' : 'Choose file…'}</button>
+      </div>
+      {#if staged}
+        <div class="field sub update" data-test="staged-update">
+          <div class="lbl">
+            {#if staged.order > 0}<div><b>CAPTURE {staged.version}</b> is ready to install (you have {staged.current}).</div>
+            {:else if staged.order === 0}<div>This is the version you already have ({staged.version}). Installing it again repairs CAPTURE’s program files.</div>
+            {:else}<div class="warn">This is an older version ({staged.version}; you have {staged.current}). Your settings are backed up first, but newer options may be lost.</div>{/if}
+            {#if recordingNow}<div class="hint warn">A recording is running. Stop it before installing.</div>{/if}
+          </div>
+          <div class="row">
+            <button class="btn ghost" disabled={updBusy === 'installing'} onclick={() => (staged = null)}>Cancel</button>
+            <button class="btn primary" disabled={recordingNow || updBusy === 'installing'} onclick={installUpdate}>{updBusy === 'installing' ? 'Restarting…' : staged.order > 0 ? 'Install and restart' : 'Install anyway'}</button>
+          </div>
+        </div>
+      {/if}
+      <p class="foot">Program files: {app.info?.app_dir}. Recordings are never stored there. {app.info?.installed ? 'To remove CAPTURE, use Installed apps in Windows Settings.' : 'To remove this portable copy, quit CAPTURE from the tray and delete its folder.'}</p>
     </section>
   </div>
 </div>
@@ -345,6 +406,9 @@
   .rule { display: grid; grid-template-columns: minmax(0, 1fr) repeat(3, auto); gap: var(--s2); align-items: center; }
   .rule .select { height: var(--h-sm); font-size: var(--fs-sm); }
   .btn.danger { color: var(--danger); }
+  .update { background: var(--surface-2); border-radius: var(--r-md); padding: var(--s3) var(--s4); margin-bottom: var(--s2); }
+  .warn { color: var(--warn); }
+  .hint.warn { color: var(--warn); }
   dl { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: var(--s2) var(--s4); margin: var(--s3) 0 0; padding-top: var(--s3); border-top: 1px solid var(--line); font-size: var(--fs-sm); }
   dt { color: var(--text-3); }
   dd { margin: 0; overflow-wrap: anywhere; }

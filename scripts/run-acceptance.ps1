@@ -17,9 +17,9 @@ function Start-Run($name, $settingsJson) {
     Start-Sleep -Milliseconds 500
     Remove-Item -Recurse -Force $run, "$root\test-output\cap-$name" -ErrorAction SilentlyContinue
     Copy-Item -Recurse "$root\dist\CAPTURE-$Version" $run
-    Remove-Item -Recurse -Force "$run\data" -ErrorAction SilentlyContinue
-    New-Item -ItemType Directory -Force "$run\data" | Out-Null
-    $settingsJson.Replace('ROOT', ("$root\test-output\cap-$name" -replace '\\', '\\')) | Set-Content -Encoding utf8 "$run\data\settings.json"
+    Remove-Item -Recurse -Force "$run\Data" -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force "$run\Data\Settings" | Out-Null
+    $settingsJson.Replace('ROOT', ("$root\test-output\cap-$name" -replace '\\', '\\')) | Set-Content -Encoding utf8 "$run\Data\Settings\settings.json"
     $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = '--remote-debugging-port=9333'
     $p = Start-Process "$run\CAPTURE.exe" -WorkingDirectory $run -PassThru
     Remove-Item Env:\WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS

@@ -5,6 +5,7 @@
 #
 # - FFmpeg 8.1.3 LGPL shared (BtbN autobuild-2026-11-07-12-47): runtime encode/mux + ffprobe
 # - libclang 18.1.1 (PyPI wheel): build-time only, for generating FFmpeg Rust bindings
+# - NSIS 3.11: build-time only, for the Windows installer (scripts\build-installer.ps1)
 # - OBS Studio 33.0.1 portable (-WithObs): only to re-run the Phase 0 libobs comparison spike
 param([switch]$WithObs)
 $ErrorActionPreference = 'Stop'
@@ -40,6 +41,15 @@ if (-not (Test-Path (Join-Path $tp 'libclang'))) {
     Copy-Item $path "$path.zip"
     Expand-Archive "$path.zip" -DestinationPath (Join-Path $tp 'libclang') -Force
     Remove-Item "$path.zip"
+}
+
+# NSIS 3.11 (build-time only, for the Windows installer). Same archive and checksum that the
+# Tauri bundler pins (SHA-1 EF7FF767E5CBD9EDD22ADD3A32C9B8F4500BB10D).
+$nz = Get-Pinned 'https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.11/nsis-3.11.zip' 'nsis-3.11.zip' 'c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1'
+if (-not (Test-Path (Join-Path $tp 'nsis\makensis.exe'))) {
+    Expand-Archive $nz -DestinationPath (Join-Path $tp '_nsis') -Force
+    Move-Item (Join-Path $tp '_nsis\nsis-3.11') (Join-Path $tp 'nsis')
+    Remove-Item (Join-Path $tp '_nsis')
 }
 
 if ($WithObs) {

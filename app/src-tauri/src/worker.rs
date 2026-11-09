@@ -3,6 +3,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::process::CommandExt;
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command as Proc, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,6 +14,9 @@ use capture_protocol::{Command, Message, Request};
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub struct Worker {
+    /// `<app>\Runtime\capture-worker.exe`; its FFmpeg DLLs sit beside it.
+    exe: PathBuf,
+    runtime: PathBuf,
     stdin: Mutex<Option<ChildStdin>>,
     child: Mutex<Option<Child>>,
     next_id: AtomicU64,
@@ -25,8 +29,10 @@ pub type OnRestart = Arc<dyn Fn() + Send + Sync>;
 pub type OnDown = Arc<dyn Fn(String) + Send + Sync>;
 
 impl Worker {
-    pub fn new() -> Arc<Self> {
+    pub fn new(exe: PathBuf, runtime: PathBuf) -> Arc<Self> {
         Arc::new(Self {
+            exe,
+            runtime,
             stdin: Mutex::new(None),
             child: Mutex::new(None),
             next_id: AtomicU64::new(1),
@@ -36,18 +42,20 @@ impl Worker {
     }
 
     pub fn start(self: &Arc<Self>, on_msg: OnMessage, on_restart: OnRestart, on_down: OnDown) -> Result<(), String> {
-        let exe_dir = std::env::current_exe().map_err(|e| e.to_string())?.parent().unwrap().to_path_buf();
-        let exe = exe_dir.join("capture-worker.exe");
+        let exe = &self.exe;
         if !exe.exists() {
-            return Err(format!("capture-worker.exe is missing from {}", exe_dir.display()));
+            return Err(format!(
+                "The capture engine is missing ({}). Extract or reinstall the complete CAPTURE package; your settings are kept.",
+                exe.display()
+            ));
         }
         let mut path = std::env::var("PATH").unwrap_or_default();
         let dev = env!("CAPTURE_DEV_FFMPEG_BIN");
         if !dev.is_empty() {
             path = format!("{dev};{path}");
         }
-        let mut child = Proc::new(&exe)
-            .current_dir(&exe_dir)
+        let mut child = Proc::new(exe)
+            .current_dir(&self.runtime)
             .env("PATH", path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

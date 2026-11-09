@@ -1,6 +1,7 @@
 # CAPTURE quick start (v0.4.1)
 
-1. **Start** `CAPTURE.exe`. No installer is needed; its own settings live in the `data` folder next to it.
+1. **Start** `CAPTURE.exe` (portable: extract the whole zip first; installed: Start menu). CAPTURE keeps its
+   settings, cache and logs in the `Data` folder next to it, and asks four first-run questions.
    (Windows may warn that the app is unrecognised because it isn't code-signed. Choose *More info → Run anyway*.)
 2. On **Home**, switch **Recording** on. **What to record** is set to **Auto (games)**: start a game and CAPTURE
    finds it (Steam, Epic, GOG, itch, Xbox, EA, Ubisoft, Riot, Battle.net, any `Games` folder, or anything
@@ -68,6 +69,9 @@ files, Rename, and Delete (to the Recycle Bin, after confirmation).
 - *Start with Windows* starts CAPTURE in the tray. Closing the window keeps CAPTURE recording in the tray
   (turn off *Keep running in the tray* to make close quit). *Minimize to the tray* is optional. **Quit
   CAPTURE** in the tray menu really exits.
-- Updating: unzip the new version next to the old one (e.g. `CAPTURE-0.3.1` beside `CAPTURE-0.3.0`). On first
-  start it copies your settings from the old folder; the old folder is left as it was.
+- Updating: Settings › About & updates › **Choose file…** and pick the new release zip. Every file is checked,
+  settings are backed up, CAPTURE restarts. (Installed copies can also run the new setup. A new portable folder
+  next to an old `CAPTURE-*` folder still copies its settings on first start.)
+- Removing: portable, quit from the tray and delete the folder (turn off Start with Windows first). Installed,
+  use Installed apps; recordings are kept unless you choose *Remove CAPTURE and all its data*.
 - If the capture drive is unplugged, CAPTURE says so and carries on by itself when it is back.

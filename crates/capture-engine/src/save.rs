@@ -146,6 +146,9 @@ unsafe fn remux_inner(segments: &[(PathBuf, f64)], seg0_start: f64, want_start: 
         av::dict_set(&mut (*ost).metadata, "handler_name", &label);
         (*ost).disposition = if is_video || audio_i == 1 { ff::AV_DISPOSITION_DEFAULT } else { 0 };
     }
+    // Identifies the file as CAPTURE's own (the uninstaller's "remove all data" option deletes
+    // only files it can verify; see app/src-tauri/src/owned.rs).
+    av::dict_set(&mut (*oc.0).metadata, "comment", "Recorded with CAPTURE");
     check(ff::avio_open(&mut (*oc.0).pb, cpath.as_ptr(), ff::AVIO_FLAG_WRITE), "create clip file")?;
     let mut opts = null_mut();
     av::dict_set(&mut opts, "movflags", "+faststart");

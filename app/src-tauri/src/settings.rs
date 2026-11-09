@@ -1,8 +1,9 @@
-//! User settings and where CAPTURE keeps its own small files.
+//! User settings: one versioned `settings.json` in `Data\Settings` (see `paths.rs`).
+//! Recordings never go here.
 //!
-//! Portable-first: if the folder holding CAPTURE.exe is writable, settings and the WebView2
-//! profile live in `<exe folder>\data\`. Only if it is not writable (e.g. Program Files) do
-//! they fall back to `%LOCALAPPDATA%\CAPTURE`. Recordings never go here.
+//! Schema versions: 1 = 0.3–0.4 builds, 2 = 0.5 (new data layout, first-run setup). Before a
+//! file written by another schema version is rewritten, a copy is kept in `Settings\Backups\`,
+//! so neither an update nor going back to an older build can lose settings.
 
 use std::path::{Path, PathBuf};
 
@@ -71,10 +72,13 @@ pub struct AppSettings {
     pub minimize_to_tray: bool,
 }
 
+/// Current settings schema version.
+pub const SCHEMA_VERSION: u32 = 2;
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: SCHEMA_VERSION,
             capture_root: default_root(),
             replay_enabled: false,
             replay_secs: 120,
@@ -114,14 +118,23 @@ impl Default for AppSettings {
     }
 }
 
-/// `G:\Videos\Captures` when the media drive's Videos folder exists (where this workstation keeps
-/// footage), else the user's `Videos\Captures`. Never a new folder at a drive root.
+/// `<Videos>\Captures`, where `<Videos>` is the user's Windows Videos folder (which follows the
+/// user if they moved it to another drive). First-run setup shows it and offers to change it.
 pub fn default_root() -> String {
-    if Path::new("G:\\Videos").is_dir() {
-        return "G:\\Videos\\Captures".into();
-    }
-    let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".into());
-    format!("{home}\\Videos\\Captures")
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{FOLDERID_Videos, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+    let videos = unsafe {
+        SHGetKnownFolderPath(&FOLDERID_Videos, KF_FLAG_DEFAULT, None).ok().map(|p| {
+            let s = p.to_string().unwrap_or_default();
+            CoTaskMemFree(Some(p.0 as *const _));
+            s
+        })
+    };
+    let videos = videos.filter(|v| !v.is_empty()).unwrap_or_else(|| {
+        let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".into());
+        format!("{home}\\Videos")
+    });
+    format!("{}\\Captures", videos.trim_end_matches('\\'))
 }
 
 impl AppSettings {
@@ -195,62 +208,70 @@ impl AppSettings {
     }
 }
 
-pub fn data_dir() -> PathBuf {
-    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
-    if let Some(dir) = exe_dir.map(|d| d.join("data")) {
-        if std::fs::create_dir_all(&dir).is_ok() && writable(&dir) {
-            return dir;
-        }
-    }
-    let local = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
-    let dir = PathBuf::from(local).join("CAPTURE");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
-}
-
-fn writable(dir: &Path) -> bool {
-    let probe = dir.join(".write-test");
-    let ok = std::fs::write(&probe, b"ok").is_ok();
-    let _ = std::fs::remove_file(probe);
-    ok
-}
-
-/// Loads settings without ever losing them:
-/// - Missing file -> settings from the newest older portable build next to this one
-///   (`..\CAPTURE-<version>\data\settings.json`, copied, never moved), else defaults.
+/// Loads settings without ever losing them. `dir` is the `Data\Settings` folder; `app_dir`
+/// (the folder holding CAPTURE.exe) is used to find an earlier portable copy beside it.
+/// - Missing file -> settings from the newest other portable copy next to this one
+///   (`..\CAPTURE-<version>\Data\Settings\settings.json`, or `..\CAPTURE-<version>\data\settings.json`
+///   from 0.3–0.4), copied, never moved; else defaults.
 /// - Readable file -> used, and copied to `settings.json.bak` (last known good).
 /// - A file where only some values are unreadable (e.g. written by a different version) ->
 ///   every readable value is kept and only the bad ones fall back to defaults.
 /// - A file that is not JSON at all -> the last known good backup, else defaults.
 ///   In both damaged cases the original is kept as `settings.json.bad-<time>` first.
+/// - A file from another schema version -> a copy goes to `Backups\` before it is upgraded.
 /// A UTF-8 BOM (Notepad/PowerShell) is accepted.
-pub fn load(dir: &Path) -> AppSettings {
+pub fn load(dir: &Path, app_dir: Option<&Path>) -> AppSettings {
+    let _ = std::fs::create_dir_all(dir);
     let path = dir.join("settings.json");
     if !path.exists() {
-        if let Some(from) = import_previous(dir) {
+        if let Some(from) = app_dir.and_then(|a| import_previous(a, dir)) {
             eprintln!("settings: copied from {}", from.display());
         }
     }
     let Ok(bytes) = std::fs::read(&path) else { return AppSettings::default() };
-    match parse(&bytes) {
+    let s = match parse(&bytes) {
         Parsed::Ok(s) => {
             let _ = std::fs::copy(&path, dir.join("settings.json.bak"));
-            s.sanitized()
+            s
         }
         Parsed::Partial(s, bad) => {
             keep_damaged(dir, &path);
             eprintln!("settings.json: kept every readable value; reset {bad:?} to defaults");
-            s.sanitized()
+            s
         }
         Parsed::Unreadable(e) => {
             keep_damaged(dir, &path);
             eprintln!("settings.json unreadable ({e})");
             match std::fs::read(dir.join("settings.json.bak")).map(|b| parse(&b)) {
-                Ok(Parsed::Ok(s) | Parsed::Partial(s, _)) => s.sanitized(),
+                Ok(Parsed::Ok(s) | Parsed::Partial(s, _)) => s,
                 _ => AppSettings::default(),
             }
         }
+    };
+    migrate(dir, &path, s).sanitized()
+}
+
+/// Upgrade a file written by another schema version, after keeping a copy of it in `Backups\`.
+fn migrate(dir: &Path, path: &Path, mut s: AppSettings) -> AppSettings {
+    if s.version == SCHEMA_VERSION {
+        return s;
     }
+    let backups = dir.join("Backups");
+    let _ = std::fs::create_dir_all(&backups);
+    let note = if s.version > SCHEMA_VERSION { "-from-newer-build" } else { "" };
+    let name = format!("settings-v{}{note}-{}.json", s.version, unix_secs());
+    if std::fs::copy(path, backups.join(&name)).is_ok() {
+        eprintln!("settings: schema v{} -> v{SCHEMA_VERSION}; previous file kept as Backups\\{name}", s.version);
+    }
+    // v1 -> v2: no value changes. People who already dismissed the 0.3/0.4 welcome card are not
+    // asked the first-run questions again (`first_run_done` carries over).
+    s.version = SCHEMA_VERSION;
+    let _ = save(dir, &s);
+    s
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 enum Parsed {
@@ -290,22 +311,21 @@ fn parse(bytes: &[u8]) -> Parsed {
 /// Keep a damaged settings file for inspection, under a name that never overwrites an
 /// earlier one.
 fn keep_damaged(dir: &Path, path: &Path) {
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let _ = std::fs::copy(path, dir.join(format!("settings.json.bad-{secs}")));
+    let _ = std::fs::copy(path, dir.join(format!("settings.json.bad-{}", unix_secs())));
 }
 
-/// First run of a new portable version: copy the settings of the most recently used
-/// `CAPTURE-*` folder beside this one, so an update keeps microphone, hotkeys, folders, games
-/// and every other choice. Only reads the old folder.
-fn import_previous(dir: &Path) -> Option<PathBuf> {
-    let exe_dir = dir.parent()?; // <...>\CAPTURE-0.3.1  (dir = <exe folder>\data)
-    let parent = exe_dir.parent()?;
+/// First run of a new portable copy: copy the settings of the most recently used `CAPTURE*`
+/// folder beside this one, so a new version keeps microphone, hotkeys, folders, games and every
+/// other choice. Only reads the old folder. Understands the 0.5 layout
+/// (`Data\Settings\settings.json`) and the 0.3–0.4 one (`data\settings.json`).
+fn import_previous(app_dir: &Path, dir: &Path) -> Option<PathBuf> {
+    let parent = app_dir.parent()?;
     let newest = std::fs::read_dir(parent)
         .ok()?
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p != exe_dir && p.file_name().is_some_and(|n| n.to_string_lossy().to_ascii_uppercase().starts_with("CAPTURE")))
-        .map(|p| p.join("data").join("settings.json"))
+        .filter(|p| p != app_dir && p.is_dir() && p.file_name().is_some_and(|n| n.to_string_lossy().to_ascii_uppercase().starts_with("CAPTURE")))
+        .flat_map(|p| [p.join("Data").join("Settings").join("settings.json"), p.join("data").join("settings.json")])
         .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
         .filter(|(_, p)| std::fs::read(p).is_ok_and(|b| !matches!(parse(&b), Parsed::Unreadable(_))))
         .max_by_key(|(t, _)| *t)?
@@ -316,6 +336,7 @@ fn import_previous(dir: &Path) -> Option<PathBuf> {
 
 /// Write-then-rename so a crash mid-write never leaves corrupt settings.
 pub fn save(dir: &Path, s: &AppSettings) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
     let tmp = dir.join("settings.json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(s).unwrap())?;
     std::fs::rename(tmp, dir.join("settings.json"))
@@ -349,10 +370,10 @@ mod tests {
     fn bom_is_accepted_and_corrupt_file_falls_back_to_last_good_copy() {
         let dir = temp("bom");
         std::fs::write(dir.join("settings.json"), b"\xEF\xBB\xBF{\"replay_secs\": 300}").unwrap();
-        assert_eq!(load(&dir).replay_secs, 300);
+        assert_eq!(load(&dir, None).replay_secs, 300);
         assert!(dir.join("settings.json.bak").exists(), "last known good copy kept");
         std::fs::write(dir.join("settings.json"), b"{ not json").unwrap();
-        assert_eq!(load(&dir).replay_secs, 300, "restored from the last good copy, not reset");
+        assert_eq!(load(&dir, None).replay_secs, 300, "restored from the last good copy, not reset");
         assert!(has_bad_copy(&dir), "damaged file kept for inspection");
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -364,7 +385,7 @@ mod tests {
         let body = r#"{"replay_secs": 300, "mic_enabled": true, "mic_device": "{0.0.1}.{abc}", "save_hotkey": "Alt+F9",
                        "target": {"kind": "spaceship"}, "quality": 7, "start_with_windows": true}"#;
         std::fs::write(dir.join("settings.json"), body).unwrap();
-        let s = load(&dir);
+        let s = load(&dir, None);
         assert_eq!((s.replay_secs, s.mic_enabled, s.mic_device.as_deref(), s.save_hotkey.as_str()), (300, true, Some("{0.0.1}.{abc}"), "Alt+F9"));
         assert!(s.start_with_windows);
         assert_eq!(s.target, TargetPref::Auto);
@@ -376,15 +397,37 @@ mod tests {
     #[test]
     fn a_new_version_folder_copies_the_previous_versions_settings() {
         let root = temp("update");
-        let old = root.join("CAPTURE-0.3.0").join("data");
-        let new = root.join("CAPTURE-0.3.1").join("data");
+        // 0.4 layout beside a 0.5 copy
+        let old = root.join("CAPTURE-0.4.1").join("data");
+        let app = root.join("CAPTURE-0.5.0");
+        let new = app.join("Data").join("Settings");
         std::fs::create_dir_all(&old).unwrap();
-        std::fs::create_dir_all(&new).unwrap();
-        std::fs::write(old.join("settings.json"), r#"{"mic_enabled": true, "replay_secs": 600}"#).unwrap();
-        let s = load(&new);
+        std::fs::write(old.join("settings.json"), r#"{"version": 1, "mic_enabled": true, "replay_secs": 600}"#).unwrap();
+        let s = load(&new, Some(&app));
         assert!(s.mic_enabled && s.replay_secs == 600);
         assert!(old.join("settings.json").exists(), "the old folder is never changed");
+        // 0.5 layout beside a newer copy
+        let app2 = root.join("CAPTURE-0.5.1");
+        let s2 = load(&app2.join("Data").join("Settings"), Some(&app2));
+        assert!(s2.mic_enabled && s2.replay_secs == 600);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_older_schema_is_backed_up_before_it_is_upgraded() {
+        let dir = temp("schema");
+        std::fs::write(dir.join("settings.json"), r#"{"version": 1, "replay_secs": 300, "first_run_done": true}"#).unwrap();
+        let s = load(&dir, None);
+        assert_eq!((s.version, s.replay_secs, s.first_run_done), (SCHEMA_VERSION, 300, true));
+        let backups: Vec<_> = std::fs::read_dir(dir.join("Backups")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert!(backups.iter().any(|n| n.starts_with("settings-v1-")), "{backups:?}");
+        let on_disk: AppSettings = serde_json::from_slice(&std::fs::read(dir.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(on_disk.version, SCHEMA_VERSION);
+        // A file from a newer build is kept too before this build rewrites it.
+        std::fs::write(dir.join("settings.json"), r#"{"version": 9, "replay_secs": 400}"#).unwrap();
+        assert_eq!(load(&dir, None).replay_secs, 400);
+        assert!(std::fs::read_dir(dir.join("Backups")).unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("settings-v9-from-newer-build")));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -46,6 +46,11 @@ export interface Settings {
   minimize_to_tray: boolean;
 }
 
+/** This copy of CAPTURE (app/src-tauri/src/main.rs `AppInfo`). */
+export interface AppInfo { version: string; installed: boolean; app_dir: string; data_dir: string; logs_dir: string; data_fallback: boolean }
+export interface PathIssue { which: 'capture_root' | 'buffer_root'; path: string }
+export interface StagedUpdate { version: string; current: string; order: -1 | 0 | 1 }
+
 export interface GameRule { exe: string; replay_secs: number | null; quality: Quality | null; game_audio: boolean | null }
 
 export interface AudioDevice { id: string; name: string; is_default: boolean; is_virtual: boolean; muted?: boolean; volume?: number | null }

@@ -10,6 +10,7 @@
   import SourcePicker from '../components/SourcePicker.svelte';
   import AudioSources from '../components/AudioSources.svelte';
   import RecentClips from '../components/RecentClips.svelte';
+  import FirstRun from '../components/FirstRun.svelte';
 
   let { onnavigate }: { onnavigate: (p: 'home' | 'replay' | 'library' | 'settings') => void } = $props();
 
@@ -45,18 +46,24 @@
 
 <div class="home">
   {#if !s.first_run_done}
-    <section class="banner info welcome">
-      <Icon name="info" size={18} />
-      <div class="grow">
-        <b>Welcome to CAPTURE.</b> Clips go to <span class="mono">{s.capture_root}</span>
-        (<button class="link" onclick={changeFolder}>change</button>). Turn recording on and play.
-        <kbd>{s.save_hotkey || '—'}</kbd> saves the last {fmtDuration(s.replay_secs)},
-        <kbd>{s.hotkeys.marker || '—'}</kbd> adds a marker, <kbd>{s.hotkeys.overlay || '—'}</kbd> opens the overlay.
-        Your microphone stays off unless you turn it on. Nothing leaves this PC.
-      </div>
-      <button class="btn sm" onclick={() => updateSettings({ first_run_done: true })}>Got it</button>
-    </section>
+    <FirstRun />
   {/if}
+
+  {#each app.pathIssues as issue (issue.which)}
+    <section class="banner warn" data-test="path-issue">
+      <Icon name="alert" size={18} />
+      <div class="grow">
+        <b>{issue.which === 'capture_root' ? 'Your recordings folder isn’t available' : 'Your temporary footage folder isn’t available'}</b>:
+        <span class="mono">{issue.path}</span>. Its drive isn’t connected to this PC. CAPTURE keeps this setting, so it works again when the drive is back,
+        {issue.which === 'capture_root' ? 'but it can’t save until then.' : 'but replay can’t buffer until then.'}
+      </div>
+      {#if issue.which === 'capture_root'}
+        <button class="btn sm" onclick={changeFolder}>Choose folder…</button>
+      {:else}
+        <button class="btn sm" onclick={() => updateSettings({ buffer_root: null })}>Use the recordings folder</button>
+      {/if}
+    </section>
+  {/each}
 
   {#if (e?.leftover_buffer_bytes ?? 0) > 0}
     <section class="banner warn">
@@ -155,7 +162,6 @@
 
 <style>
   .home { display: flex; flex-direction: column; gap: var(--s4); }
-  .welcome { font-size: var(--fs-sm); line-height: 1.7; }
 
   .hero { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--s6); align-items: center;
           padding: var(--s6); border-radius: var(--r-lg); background: var(--surface); position: relative; overflow: hidden; }

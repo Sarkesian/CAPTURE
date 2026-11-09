@@ -1,9 +1,9 @@
 // Windows lifecycle test against the real CAPTURE.exe (an isolated copy; never your own install).
 //
-//   node scripts/e2e-lifecycle.mjs <buildDir containing CAPTURE.exe + capture-worker.exe + DLLs> <workDir>
+//   node scripts/e2e-lifecycle.mjs <payloadDir (dist\CAPTURE-<version>)> <workDir>
 //
-// <workDir>\CAPTURE-0.3.0\data\settings.json is created as "the previous version" and
-// <workDir>\CAPTURE-0.3.1\ as the new one, to check that an update keeps settings.
+// <workDir>\CAPTURE-0.4.1\data\settings.json (the 0.4 layout) is created as "the previous version"
+// and <workDir>\CAPTURE-0.5.0\ as the new one, to check that a new portable copy keeps settings.
 // Touches only CAPTURE's own per-user startup entry (HKCU\...\Run\CAPTURE), and restores it.
 import { execFileSync, spawn } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -18,13 +18,13 @@ const RUN = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
 const runEntry = () => ps(`(Get-ItemProperty '${RUN}' -Name CAPTURE -ErrorAction SilentlyContinue).CAPTURE`);
 const savedEntry = runEntry();
 
-const oldDir = path.join(work, 'CAPTURE-0.3.0');
-const app = path.join(work, 'CAPTURE-0.3.1');
+const oldDir = path.join(work, 'CAPTURE-0.4.1');
+const app = path.join(work, 'CAPTURE-0.5.0');
 const capRoot = path.join(work, 'captures');
 rmSync(work, { recursive: true, force: true });
 mkdirSync(path.join(oldDir, 'data'), { recursive: true });
 mkdirSync(app, { recursive: true });
-for (const f of ['CAPTURE.exe', 'capture-worker.exe', 'avcodec-62.dll', 'avformat-62.dll', 'avutil-60.dll', 'swresample-6.dll', 'swscale-9.dll']) cpSync(path.join(build, f), path.join(app, f));
+cpSync(build, app, { recursive: true, filter: src => !/^[\\/]data([\\/]|$)/i.test(src.slice(build.length)) });
 const previous = { capture_root: capRoot, replay_enabled: false, replay_secs: 600, mic_enabled: true, mic_device: '{0.0.1.00000000}.{test-mic}', other_enabled: true,
   save_hotkey: 'Alt+F9', games: ['MyGame.exe'], per_game: [{ exe: 'MyGame.exe', replay_secs: 300, quality: null, game_audio: null }], first_run_done: true, close_to_tray: true };
 writeFileSync(path.join(oldDir, 'data', 'settings.json'), JSON.stringify(previous));
@@ -119,7 +119,7 @@ try {
   s = await settings();
   check(s.replay_secs === 300 && s.minimize_to_tray, 'settings survived the restart');
   check(s.start_with_windows && runEntry() === `"${exe}" --tray`, `stale startup entry repointed to this copy; toggle shows On`);
-  check(existsSync(path.join(app, 'data', 'settings.json.bak')), 'last-known-good settings backup exists');
+  check(existsSync(path.join(app, 'Data', 'Settings', 'settings.json.bak')), 'last-known-good settings backup exists');
 
   // 7. Engine crash: restarted automatically, configuration re-applied.
   const before = procs('capture-worker')[0];
@@ -131,7 +131,7 @@ try {
   check(await waitUntil(() => procs('capture-worker').length === 0, 15000), 'UI killed -> engine exits on its own (no orphan)');
 
   // 9. Damaged settings file: values kept where readable, original kept for inspection.
-  const sp = path.join(app, 'data', 'settings.json');
+  const sp = path.join(app, 'Data', 'Settings', 'settings.json');
   const cur = JSON.parse(readFileSync(sp, 'utf8'));
   writeFileSync(sp, JSON.stringify({ ...cur, quality: 'ultra-mega', target: 42 }));
   launch('--tray');

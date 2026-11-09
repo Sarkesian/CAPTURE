@@ -3,7 +3,10 @@
 //! `capture-worker.exe`, supervised by [`worker::Worker`].
 
 mod library;
+mod owned;
+mod paths;
 mod settings;
+mod update;
 mod worker;
 
 use std::path::{Path, PathBuf};
@@ -31,10 +34,33 @@ struct Tray {
 struct AppState {
     worker: Arc<Worker>,
     settings: Mutex<AppSettings>,
-    data_dir: PathBuf,
+    paths: paths::Paths,
     last_state: Mutex<Option<EngineState>>,
     engine_down: Mutex<Option<String>>,
     tray: Mutex<Option<Tray>>,
+    /// One-time messages for the UI (update finished or failed).
+    notices: Mutex<Vec<String>>,
+    /// Version of a verified update waiting in `Data\Cache\Update\Staged`.
+    staged: Mutex<Option<String>>,
+}
+
+/// What this copy of CAPTURE is and where it keeps its files (Settings › Advanced).
+#[derive(Serialize)]
+struct AppInfo {
+    version: String,
+    installed: bool,
+    app_dir: String,
+    data_dir: String,
+    logs_dir: String,
+    data_fallback: bool,
+}
+
+/// A saved folder that is not usable on this PC right now (drive unplugged, CAPTURE moved to
+/// another computer). The setting is kept; the user decides whether to change it.
+#[derive(Serialize)]
+struct PathIssue {
+    which: &'static str,
+    path: String,
 }
 
 #[derive(Serialize)]
@@ -44,6 +70,39 @@ struct Bootstrap {
     default_root: String,
     last_state: Option<EngineState>,
     engine_down: Option<String>,
+    app: AppInfo,
+    path_issues: Vec<PathIssue>,
+    notices: Vec<String>,
+}
+
+fn app_info(p: &paths::Paths) -> AppInfo {
+    AppInfo {
+        version: env!("CAPTURE_VERSION").to_string(),
+        installed: p.installed,
+        app_dir: p.app_dir.to_string_lossy().into_owned(),
+        data_dir: p.data.to_string_lossy().into_owned(),
+        logs_dir: p.logs.to_string_lossy().into_owned(),
+        data_fallback: p.data_fallback,
+    }
+}
+
+/// The drive (or network share) a folder lives on is present. The folder itself may not exist
+/// yet: CAPTURE creates it when it first saves.
+fn location_available(dir: &str) -> bool {
+    Path::new(dir.trim()).ancestors().filter(|a| !a.as_os_str().is_empty()).last().is_some_and(|root| root.exists())
+}
+
+fn path_issues(s: &AppSettings) -> Vec<PathIssue> {
+    let mut v = Vec::new();
+    if !s.capture_root.trim().is_empty() && !location_available(&s.capture_root) {
+        v.push(PathIssue { which: "capture_root", path: s.capture_root.clone() });
+    }
+    if let Some(b) = s.buffer_root.as_deref().filter(|b| !b.trim().is_empty()) {
+        if !location_available(b) {
+            v.push(PathIssue { which: "buffer_root", path: b.to_string() });
+        }
+    }
+    v
 }
 
 fn apply(state: &AppState) {
@@ -53,18 +112,96 @@ fn apply(state: &AppState) {
 }
 
 fn persist(state: &AppState, s: &AppSettings) -> Result<(), String> {
-    settings::save(&state.data_dir, s).map_err(|e| format!("Could not save settings: {e}"))
+    settings::save(&state.paths.settings, s).map_err(|e| format!("Could not save settings: {e}"))
 }
 
 #[tauri::command]
-fn bootstrap(state: State<AppState>) -> Bootstrap {
+fn bootstrap(window: tauri::WebviewWindow, state: State<AppState>) -> Bootstrap {
+    let s = state.settings.lock().unwrap().clone();
+    // One-time notices belong to the main window, not the hidden overlay.
+    let notices = if window.label() == "main" { std::mem::take(&mut *state.notices.lock().unwrap()) } else { Vec::new() };
     Bootstrap {
-        settings: state.settings.lock().unwrap().clone(),
-        data_dir: state.data_dir.to_string_lossy().into_owned(),
+        path_issues: path_issues(&s),
+        settings: s,
+        data_dir: state.paths.data.to_string_lossy().into_owned(),
         default_root: settings::default_root(),
         last_state: state.last_state.lock().unwrap().clone(),
         engine_down: state.engine_down.lock().unwrap().clone(),
+        app: app_info(&state.paths),
+        notices,
     }
+}
+
+#[tauri::command]
+fn check_paths(state: State<AppState>) -> Vec<PathIssue> {
+    path_issues(&state.settings.lock().unwrap())
+}
+
+/// Open one of CAPTURE's own folders in Explorer.
+#[tauri::command]
+fn open_app_folder(state: State<AppState>, which: String) -> Result<(), String> {
+    let p = &state.paths;
+    let dir = match which.as_str() {
+        "data" => &p.data,
+        "logs" => &p.logs,
+        "app" => &p.app_dir,
+        "resources" => &p.resources,
+        _ => return Err("Unknown folder".into()),
+    };
+    let _ = std::fs::create_dir_all(dir);
+    std::process::Command::new("explorer").arg(dir).spawn().map(|_| ()).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct StagedUpdate {
+    version: String,
+    current: String,
+    /// -1 older, 0 same, 1 newer than the running version.
+    order: i8,
+}
+
+/// Check a downloaded release zip and get it ready to install. Changes nothing in the app folder.
+#[tauri::command]
+async fn stage_update(app: AppHandle, path: String) -> Result<StagedUpdate, String> {
+    let state = app.state::<AppState>();
+    let p = state.paths.clone();
+    let m = tauri::async_runtime::spawn_blocking(move || update::stage(Path::new(&path), &p)).await.map_err(|e| e.to_string())??;
+    let current = env!("CAPTURE_VERSION").to_string();
+    let order = match update::cmp_versions(&m.version, &current) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    };
+    *state.staged.lock().unwrap() = Some(m.version.clone());
+    Ok(StagedUpdate { version: m.version, current, order })
+}
+
+/// Install the staged update: back up settings, hand over to the updater and quit. Refused
+/// while a recording is running or a clip is being saved, so nothing is interrupted.
+#[tauri::command]
+fn apply_update(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let Some(version) = state.staged.lock().unwrap().clone() else {
+        return Err("Choose an update file first.".into());
+    };
+    if let Some(st) = state.last_state.lock().unwrap().as_ref() {
+        if st.session_secs.is_some() {
+            return Err("A recording is running. Stop it first, then install the update.".into());
+        }
+        if st.saves_in_progress > 0 {
+            return Err("A clip is being saved. Try again in a moment.".into());
+        }
+    }
+    let s = state.settings.lock().unwrap().clone();
+    persist(&state, &s)?;
+    let backups = state.paths.settings.join("Backups");
+    let _ = std::fs::create_dir_all(&backups);
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    std::fs::copy(state.paths.settings.join("settings.json"), backups.join(format!("settings-before-{version}-{stamp}.json")))
+        .map_err(|e| format!("Could not back up settings before updating: {e}"))?;
+    update::launch_apply(&state.paths)?;
+    eprintln!("{} update: handing over to the {version} updater", paths::timestamp());
+    quit(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -136,13 +273,16 @@ fn entry_exe(cmd: &str) -> PathBuf {
 
 /// At launch: make the toggle show what Windows will actually do, and keep a working entry
 /// working after CAPTURE was moved to a new folder (the old exe is gone). An entry that points
-/// to another existing copy of CAPTURE is left alone.
+/// to another existing copy of CAPTURE is left alone, and so is one whose drive is simply not
+/// connected right now (a portable copy on a USB drive): CAPTURE never takes it over.
 fn reconcile_startup(s: &mut AppSettings) -> bool {
     let entry = startup_entry();
     let mut changed = s.start_with_windows != entry.is_some();
     s.start_with_windows = entry.is_some();
     if let (Some(cmd), Ok(me)) = (entry, std::env::current_exe()) {
-        if !entry_exe(&cmd).exists() && write_startup(true, &me).is_ok() {
+        let target = entry_exe(&cmd);
+        let drive_present = target.ancestors().filter(|a| !a.as_os_str().is_empty()).last().is_some_and(|r| r.exists());
+        if drive_present && !target.exists() && write_startup(true, &me).is_ok() {
             eprintln!("startup entry pointed to a missing {cmd}; now {}", me.display());
             changed = true;
         }
@@ -537,19 +677,189 @@ fn build_tray(app: &AppHandle) -> tauri::Result<Tray> {
     Ok(Tray { icon, status, toggle, save })
 }
 
-fn main() {
-    let data_dir = settings::data_dir();
-    let mut loaded = settings::load(&data_dir);
-    if reconcile_startup(&mut loaded) {
-        let _ = settings::save(&data_dir, &loaded);
+const SINGLE_INSTANCE_MUTEX: windows::core::PCWSTR = windows::core::w!("app.capture.local-sim"); // tauri-plugin-single-instance: "<identifier>-sim"
+
+fn context() -> tauri::Context<tauri::Wry> {
+    tauri::generate_context!()
+}
+
+/// A native message box, for the few things that must be said before (or without) the app
+/// window: no WebView2, a read-only folder, the uninstaller's questions.
+fn message(title: &str, text: &str, style: windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE) -> i32 {
+    use windows::core::HSTRING;
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    unsafe { MessageBoxW(None, &HSTRING::from(text), &HSTRING::from(title), style | MB_SETFOREGROUND | MB_TOPMOST).0 }
+}
+
+fn instance_running() -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+    match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, SINGLE_INSTANCE_MUTEX) } {
+        Ok(h) => {
+            let _ = unsafe { CloseHandle(h) };
+            true
+        }
+        Err(_) => false,
     }
-    let worker = Worker::new();
+}
+
+/// WebView2 is part of Windows 11 and of current Windows 10. A fixed-version runtime shipped in
+/// `Runtime\WebView2\` (optional, see scripts/package-portable.ps1) is used instead when present.
+fn webview2_version(p: &paths::Paths) -> Option<String> {
+    use webview2_com::Microsoft::Web::WebView2::Win32::GetAvailableCoreWebView2BrowserVersionString;
+    use windows::core::{HSTRING, PCWSTR, PWSTR};
+    let fixed = p.runtime.join("WebView2");
+    let folder = fixed.join("msedgewebview2.exe").is_file().then(|| HSTRING::from(fixed.as_os_str()));
+    if let Some(f) = &folder {
+        std::env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", f.to_os_string());
+    }
+    let mut out = PWSTR::null();
+    let arg = folder.as_ref().map(|f| PCWSTR(f.as_ptr())).unwrap_or(PCWSTR::null());
+    unsafe {
+        GetAvailableCoreWebView2BrowserVersionString(arg, &mut out).ok()?;
+        if out.is_null() {
+            return None;
+        }
+        let v = out.to_string().ok();
+        windows::Win32::System::Com::CoTaskMemFree(Some(out.0 as *const _));
+        v
+    }
+}
+
+/// `--uninstall-ask-data` / `--uninstall-cleanup temp|all [--silent]`, run by the uninstaller
+/// before it removes the program files. Works on CAPTURE's own recordings only (see owned.rs).
+fn uninstall_main(args: &[String], app_dir: &Path) -> i32 {
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    let paths::Resolved::Ready(p) = paths::resolve(app_dir) else { return 0 };
+    if !p.settings.join("settings.json").exists() {
+        return 0; // never configured: CAPTURE never recorded anything
+    }
+    let s = settings::load(&p.settings, None);
+    let buffer = s.buffer_root.as_deref().map(PathBuf::from);
+    let scan = owned::scan(Path::new(&s.capture_root), buffer.as_deref());
+    let silent = args.iter().any(|a| a == "--silent");
+    if args.iter().any(|a| a == "--uninstall-ask-data") {
+        if scan.recordings.is_empty() && scan.temporary.is_empty() {
+            message("Uninstall CAPTURE", &owned::describe(&scan), MB_OK | MB_ICONINFORMATION);
+            return IDNO.0;
+        }
+        let text = format!("{}\nRemove these files?", owned::describe(&scan));
+        return message("Uninstall CAPTURE: remove recordings?", &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+    }
+    let all = args.iter().position(|a| a == "--uninstall-cleanup").and_then(|i| args.get(i + 1)).is_some_and(|m| m == "all");
+    let failed = owned::remove(&scan, all);
+    eprintln!("uninstall cleanup ({}): {} item(s) could not be removed", if all { "all" } else { "temp" }, failed.len());
+    if !failed.is_empty() && !silent {
+        let list: Vec<String> = failed.iter().take(8).map(|(p, e)| format!("    {} ({e})", p.display())).collect();
+        let more = if failed.len() > 8 { format!("\n    …and {} more", failed.len() - 8) } else { String::new() };
+        message("Uninstall CAPTURE", &format!("These files could not be removed, probably because another program has them open. You can delete them yourself:\n\n{}{more}", list.join("\n")), MB_OK | MB_ICONWARNING);
+    }
+    i32::from(!failed.is_empty())
+}
+
+fn main() {
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    let args: Vec<String> = std::env::args().collect();
+    // Updater mode: this exe is a staged release replacing the app's program files.
+    if args.get(1).map(String::as_str) == Some("--apply-update") {
+        std::process::exit(update::apply_main(&args[2..]));
+    }
+    let app_dir = paths::app_dir();
+    if args.iter().any(|a| a == "--uninstall-ask-data" || a == "--uninstall-cleanup") {
+        std::process::exit(uninstall_main(&args, &app_dir));
+    }
+    // CAPTURE already runs: hand this launch's arguments (a plain launch, `--tray`, `--quit`)
+    // to it and exit, without touching any files.
+    if instance_running() {
+        let _ = tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|_, _, _| {})).build(context());
+        return;
+    }
+    if args.iter().any(|a| a == "--quit") {
+        return; // nothing to quit
+    }
+    if paths::running_from_zip_preview(&app_dir) {
+        message("CAPTURE", "CAPTURE is running from inside the zip file, so it can't find its other files.\n\nRight-click the zip and choose Extract All, then open CAPTURE.exe from the extracted folder.", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    let p = match paths::resolve(&app_dir) {
+        paths::Resolved::Ready(p) => p,
+        paths::Resolved::NeedsConsent { app_dir, fallback } => {
+            let text = format!(
+                "CAPTURE keeps its settings in a Data folder next to CAPTURE.exe, but Windows does not allow changes in\n\n    {}\n\nBest: move the CAPTURE folder somewhere you can write to (for example D:\\Apps\\CAPTURE), or reinstall CAPTURE there.\n\nOr choose Yes to keep CAPTURE's data for this Windows account in\n\n    {}\n\nYes: use that folder.   No: quit.",
+                app_dir.display(),
+                fallback.display()
+            );
+            if message("CAPTURE can't save its settings here", &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES.0 {
+                return;
+            }
+            match paths::accept_fallback(&app_dir, &fallback) {
+                Ok(p) => p,
+                Err(e) => {
+                    message("CAPTURE", &format!("CAPTURE could not create {}: {e}", fallback.display()), MB_OK | MB_ICONERROR);
+                    return;
+                }
+            }
+        }
+    };
+    let mut notices = Vec::new();
+    if !p.data_fallback {
+        paths::normalize_data_case(&p.app_dir);
+    }
+    let legacy = if p.data_fallback { p.data.parent().unwrap().to_path_buf() } else { p.data.clone() };
+    let migrated = paths::migrate_legacy(&legacy, &p);
+    let obsolete = paths::remove_legacy_program_files(&p);
+    if let Err(e) = p.create_dirs() {
+        message("CAPTURE", &format!("CAPTURE could not create its data folder {}: {e}", p.data.display()), MB_OK | MB_ICONERROR);
+        return;
+    }
+    paths::init_logging(&p);
+    eprintln!(
+        "{} CAPTURE {} starting ({}) app={} data={}{}",
+        paths::timestamp(),
+        env!("CAPTURE_VERSION"),
+        if p.installed { "installed" } else { "portable" },
+        p.app_dir.display(),
+        p.data.display(),
+        if migrated { " (moved 0.4 data into the 0.5 layout)" } else { "" }
+    );
+    if obsolete > 0 {
+        eprintln!("removed {obsolete} program file(s) left over from the 0.4 folder layout");
+    }
+    paths::use_private_temp(&p);
+    match webview2_version(&p) {
+        Some(v) => eprintln!("WebView2 {v}"),
+        None => {
+            message(
+                "CAPTURE needs Microsoft Edge WebView2",
+                "CAPTURE's window uses Microsoft Edge WebView2, which is part of Windows 11 and current Windows 10, but it is missing or damaged on this PC.\n\nInstall the \"Evergreen\" WebView2 Runtime from Microsoft (search for \"WebView2 Runtime\" on microsoft.com), then open CAPTURE again.",
+                MB_OK | MB_ICONERROR,
+            );
+            return;
+        }
+    }
+    match update::on_startup(&p) {
+        update::Startup::Resume => return,
+        update::Startup::Updated { from, to } => notices.push(format!("CAPTURE was updated from {from} to {to}. Your settings and recordings were kept.")),
+        update::Startup::Failed(m) => notices.push(m),
+        update::Startup::Nothing => {}
+    }
+    let mut loaded = settings::load(&p.settings, Some(&p.app_dir));
+    if reconcile_startup(&mut loaded) {
+        let _ = settings::save(&p.settings, &loaded);
+    }
+    let webview_dir = p.webview.clone();
+    let worker_exe = p.worker_exe();
+    let worker = Worker::new(worker_exe.clone(), worker_exe.parent().unwrap_or(&p.app_dir).to_path_buf());
 
     tauri::Builder::default()
         // A second launch never starts a second engine: it brings the running one forward.
-        // The sign-in launch (`--tray`) while CAPTURE already runs stays silent.
+        // The sign-in launch (`--tray`) while CAPTURE already runs stays silent. `--quit` (used
+        // by the installer and uninstaller) closes it the same way as Quit in the tray: saves
+        // in progress finish first.
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            if !args.iter().any(|a| a == "--tray") {
+            if args.iter().any(|a| a == "--quit") {
+                quit(app);
+            } else if !args.iter().any(|a| a == "--tray") {
                 show_window(app);
             }
         }))
@@ -558,10 +868,12 @@ fn main() {
         .manage(AppState {
             worker: worker.clone(),
             settings: Mutex::new(loaded),
-            data_dir: data_dir.clone(),
+            paths: p.clone(),
             last_state: Mutex::new(None),
             engine_down: Mutex::new(None),
             tray: Mutex::new(None),
+            notices: Mutex::new(notices),
+            staged: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             bootstrap,
@@ -582,10 +894,16 @@ fn main() {
             show_main,
             delete_clip,
             rename_clip,
-            set_start_with_windows
+            set_start_with_windows,
+            check_paths,
+            open_app_folder,
+            stage_update,
+            apply_update
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
+            // This is now the only CAPTURE running: safe to tidy its temp folder.
+            paths::clean_temp(&app.state::<AppState>().paths);
             // Started from Windows sign-in: stay in the tray until opened.
             let start_hidden = std::env::args().any(|a| a == "--tray");
             let dark_bg = tauri::window::Color(0x12, 0x14, 0x18, 0xff);
@@ -595,7 +913,7 @@ fn main() {
                 .title("CAPTURE")
                 .inner_size(1120.0, 780.0)
                 .min_inner_size(720.0, 540.0)
-                .data_directory(data_dir.join("webview"))
+                .data_directory(webview_dir.clone())
                 .build()?;
             if start_hidden {
                 set_page_visible(&window, false);
@@ -610,7 +928,7 @@ fn main() {
                 .skip_taskbar(true)
                 .resizable(false)
                 .visible(false)
-                .data_directory(data_dir.join("webview"))
+                .data_directory(webview_dir.clone())
                 .build()?;
             set_page_visible(&overlay, false);
             overlay.on_window_event(|e| {
@@ -679,7 +997,7 @@ fn main() {
             refresh_tray(&handle);
             Ok(())
         })
-        .build(tauri::generate_context!())
+        .build(context())
         .expect("failed to build CAPTURE")
         .run(|app, ev| {
             if let tauri::RunEvent::ExitRequested { api, code, .. } = ev {

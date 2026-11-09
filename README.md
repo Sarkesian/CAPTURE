@@ -6,7 +6,8 @@ for editing.
 
 **Status:** v0.3: instant replay, overlay with review timeline and markers, sessions, screenshots, separate
 game/mic/voice-chat tracks, editor audio files, library. See `docs/STATUS.md` for every requirement and its evidence.
-Build with `scripts\package-portable.ps1` → `dist\CAPTURE-<version>\CAPTURE.exe`. User guide: `docs/QUICKSTART.md`.
+Build with `scripts\package-portable.ps1` (portable zip) and `scriptsuild-installer.ps1` (setup.exe). Layout, updates,
+uninstall and test results: `docs/DISTRIBUTION.md`. User guide: `docs/QUICKSTART.md`.
 
 | Doc | Purpose |
 |---|---|
@@ -14,6 +15,7 @@ Build with `scripts\package-portable.ps1` → `dist\CAPTURE-<version>\CAPTURE.ex
 | `docs/spec/CAPTURE_Agent_Prompt.md` | Build brief |
 | `docs/PHASE0_CAPABILITY_REPORT.md` | What was measured on this machine |
 | `docs/ADR-0001-capture-architecture.md` | Native WGC + WASAPI + LGPL libav, chosen over libobs |
+| `docs/DISTRIBUTION.md` | Portable/installer architecture, data locations, updates, uninstall, compatibility |
 | `docs/STATUS.md` | **Current status: every requirement, tested evidence, gaps** |
 | `docs/spec/CAPTURE_Overlay_Addendum.md` | Overlay & replay spec |
 | `docs/OVERLAY_REPORT.md` | Overlay milestone report |
@@ -27,7 +29,9 @@ Build with `scripts\package-portable.ps1` → `dist\CAPTURE-<version>\CAPTURE.ex
 powershell -ExecutionPolicy Bypass -File scripts\fetch-deps.ps1   # pinned FFmpeg LGPL + libclang into third_party\
 $env:RUSTUP_HOME='D:\Programs\Rust\rustup'; $env:CARGO_HOME='D:\Programs\Rust\cargo'
 cargo test --workspace                                              # unit tests
-powershell -ExecutionPolicy Bypass -File scripts\package-portable.ps1   # -> dist\CAPTURE-<version>\
+powershell -ExecutionPolicy Bypass -File scripts\package-portable.ps1   # -> dist\CAPTURE-<version>\ + portable zip
+powershell -ExecutionPolicy Bypass -File scriptsuild-installer.ps1    # -> dist\CAPTURE-<version>-setup.exe
+node scripts\e2e-distribution.mjs <version> D:\some\work\dir          # portable + installer end to end
 ```
 
 | Path | What |

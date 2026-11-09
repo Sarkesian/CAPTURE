@@ -8,9 +8,9 @@ $game = 'D:\Programs\itch\Games\faultheart\FAULTHEART.exe'
 $run = "$root\test-output\run-shots"; $cap = "$root\test-output\cap-shots"
 Remove-Item -Recurse -Force $run, $cap -ErrorAction SilentlyContinue
 Copy-Item -Recurse "$root\dist\CAPTURE-$Version" $run
-Remove-Item -Recurse -Force "$run\data" -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force "$run\data" | Out-Null
-'{ "capture_root": "ROOT", "replay_enabled": true, "replay_secs": 60, "first_run_done": true, "mic_enabled": true, "voice_enabled": true }'.Replace('ROOT', ($cap -replace '\\', '\\')) | Set-Content -Encoding utf8 "$run\data\settings.json"
+Remove-Item -Recurse -Force "$run\Data" -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force "$run\Data\Settings" | Out-Null
+'{ "capture_root": "ROOT", "replay_enabled": true, "replay_secs": 60, "first_run_done": true, "mic_enabled": true, "voice_enabled": true }'.Replace('ROOT', ($cap -replace '\\', '\\')) | Set-Content -Encoding utf8 "$run\Data\Settings\settings.json"
 $g = Start-Process $game -WorkingDirectory (Split-Path $game) -PassThru
 Start-Sleep 5
 $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = '--remote-debugging-port=9333'
