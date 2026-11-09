@@ -72,6 +72,14 @@
   </div>
   {#if s.markers.sound}
     <div class="field">
+      <label class="grow" for="mdev">Play the sound on</label>
+      <select id="mdev" value={s.markers.sound_device ?? ''} onfocus={() => engine('list_audio')} onchange={ev => updateSettings({ markers: { ...s.markers, sound_device: (ev.target as HTMLSelectElement).value || null } })}>
+        <option value="">Windows default output</option>
+        {#each app.outputs as d (d.id)}<option value={d.id}>{d.name}</option>{/each}
+        {#if s.markers.sound_device && !app.outputs.some(d => d.id === s.markers.sound_device)}<option value={s.markers.sound_device}>Chosen device (not connected: the default is used)</option>{/if}
+      </select>
+    </div>
+    <div class="field">
       <label class="grow" for="mvol">Sound volume</label>
       <input id="mvol" type="range" min="0" max="1" step="0.05" value={s.markers.sound_volume} onchange={ev => updateSettings({ markers: { ...s.markers, sound_volume: Number((ev.target as HTMLInputElement).value) } })} />
     </div>
@@ -148,6 +156,11 @@
     <button onclick={openCaptureFolder}>Open</button>
   </div>
   <p class="muted small">Changing the folder does not move existing clips.</p>
+  <div class="field">
+    <div class="grow"><div>Temporary buffer location</div><div class="mono muted ellipsis">{s.buffer_root ? `${s.buffer_root}\Buffer` : `${s.capture_root}\Buffer (same as capture folder)`}</div></div>
+    <button onclick={async () => { const dir = await open({ directory: true, title: 'Folder for temporary footage' }); if (typeof dir === 'string') updateSettings({ buffer_root: dir }); }}>Change…</button>
+    {#if s.buffer_root}<button onclick={() => updateSettings({ buffer_root: null })}>Use capture folder</button>{/if}
+  </div>
   <div class="field">
     <label class="grow" for="cap">Temporary buffer limit (GB)</label>
     <input id="cap" type="number" min="1" max="2000" step="1" value={s.buffer_cap_gb} onchange={ev => updateSettings({ buffer_cap_gb: num(ev) })} />

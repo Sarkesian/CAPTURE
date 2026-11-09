@@ -62,6 +62,8 @@ pub struct AppSettings {
     pub notices: Notices,
     /// Overlay size in percent (90 / 100 / 115).
     pub overlay_scale: u32,
+    /// Optional separate folder for temporary footage.
+    pub buffer_root: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -98,6 +100,7 @@ impl Default for AppSettings {
             encoder: EncoderChoice::Auto,
             notices: Notices::default(),
             overlay_scale: 100,
+            buffer_root: None,
         }
     }
 }
@@ -115,6 +118,7 @@ impl AppSettings {
     pub fn engine_config(&self) -> EngineConfig {
         EngineConfig {
             capture_root: self.capture_root.clone(),
+            buffer_root: self.buffer_root.clone().filter(|b| !b.trim().is_empty()),
             replay_secs: self.replay_secs,
             target: match &self.target {
                 TargetPref::None => CaptureTarget::None,

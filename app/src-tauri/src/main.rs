@@ -73,6 +73,11 @@ fn update_settings(app: AppHandle, state: State<AppState>, settings: AppSettings
     if s.capture_root != state.settings.lock().unwrap().capture_root {
         validate_destination(&s.capture_root)?;
     }
+    if let Some(b) = s.buffer_root.as_deref().filter(|b| !b.trim().is_empty()) {
+        if Some(b) != state.settings.lock().unwrap().buffer_root.as_deref() {
+            validate_destination(b)?;
+        }
+    }
     persist(&state, &s)?;
     let replay_changed = state.settings.lock().unwrap().replay_enabled != s.replay_enabled;
     *state.settings.lock().unwrap() = s.clone();

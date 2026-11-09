@@ -22,6 +22,8 @@ const KEEP_SLACK_SECS: f64 = 6.0;
 
 pub struct Settings {
     pub root: PathBuf,
+    /// Where `Buffer\` lives.
+    pub buffer: PathBuf,
     pub game_name: String,
     pub exe: String,
     pub pid: u32,
@@ -256,7 +258,7 @@ impl Pipeline {
         }
         let info = encoder.info.clone();
 
-        let buffer = storage::buffer_dir(&s.root);
+        let buffer = s.buffer.clone();
         let session_dir = buffer.join(format!("{}_{}", storage::local_stamp(), std::process::id()));
         std::fs::create_dir_all(&session_dir).map_err(|e| format!("Cannot write to the capture folder: {e}"))?;
 

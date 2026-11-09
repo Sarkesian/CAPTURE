@@ -20,6 +20,7 @@ export const app = $state({
   clipInfo: {} as Record<string, { thumb: string | null; duration: number | null }>,
   tab: 'capture' as 'capture' | 'library' | 'settings',
   inputs: [] as AudioDevice[],
+  outputs: [] as AudioDevice[],
   apps: [] as AudioApp[],
   micTest: null as { phase: string; peak: number; message: string | null } | null,
   /** Bumped whenever files in the capture folder change (saves, stems, screenshots). */
@@ -104,6 +105,7 @@ function onEngine(m: EngineMessage) {
       break;
     case 'audio_devices':
       app.inputs = m.data.inputs;
+      app.outputs = m.data.outputs;
       app.apps = m.data.apps;
       break;
     case 'stems_done':

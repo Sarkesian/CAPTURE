@@ -13,6 +13,14 @@ pub fn buffer_dir(root: &Path) -> PathBuf {
     root.join("Buffer")
 }
 
+/// The buffer folder for a configuration: `<buffer_root>\Buffer` if set, else `<root>\Buffer`.
+pub fn buffer_dir_for(root: &Path, buffer_root: Option<&str>) -> PathBuf {
+    match buffer_root.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(b) => Path::new(b).join("Buffer"),
+        None => buffer_dir(root),
+    }
+}
+
 pub fn clips_dir(root: &Path, game: &str) -> PathBuf {
     root.join("Clips").join(folder_name(game))
 }

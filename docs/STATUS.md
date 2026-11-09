@@ -50,7 +50,9 @@ Legend: ✅ done and tested on this machine · 🟡 done, but only partly verifi
 | Notices (each type can be switched off), overlay size | ✅ | |
 | Library: Clips/Sessions/Screenshots, thumbnails, rename, delete to Recycle Bin, editor audio files | ✅ | screenshots `test-output\shots-ui` |
 | Per-game preferences | ✅ | protocol unit test + UI |
-| Choosing the chime's playback device; separate paths for buffer/sessions/screenshots; migrating old files when the folder changes | ❌ | Chime plays on the default output. One capture root with fixed subfolders. Old files are never moved. |
+| Choosing the chime's playback device | ✅ | Settings › Markers. Chime on the monitor output: 0 samples on the default speakers, −12 dB on the chosen device. |
+| Separate temporary-buffer location | ✅ | Settings › Storage. Segments in the chosen folder, clips in the capture folder, emptied on exit. |
+| Separate Sessions/Screenshots paths; migrating old files when the folder changes | ❌ | One capture root with fixed subfolders. Old files are never moved (by design; no migration tool). |
 | Overlay opacity, controller shortcuts, favourites, hover thumbnails | ❌ | Optional items, not built |
 
 ## Storage, privacy, packaging

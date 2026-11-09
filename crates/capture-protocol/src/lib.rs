@@ -197,6 +197,8 @@ pub struct MarkerConfig {
     pub sound: bool,
     /// 0.0..=1.0
     pub sound_volume: f32,
+    /// Output device for the chime (endpoint ID); `None` = Windows default output.
+    pub sound_device: Option<String>,
     /// Keep footage around each marker from being overwritten while the session runs.
     pub protect: bool,
     pub protect_before_secs: u32,
@@ -205,7 +207,7 @@ pub struct MarkerConfig {
 
 impl Default for MarkerConfig {
     fn default() -> Self {
-        Self { sound: true, sound_volume: 0.35, protect: true, protect_before_secs: 30, protect_after_secs: 15 }
+        Self { sound: true, sound_volume: 0.35, sound_device: None, protect: true, protect_before_secs: 30, protect_after_secs: 15 }
     }
 }
 
@@ -239,6 +241,10 @@ pub struct Marker {
 pub struct EngineConfig {
     /// Root folder that holds `Buffer`, `Clips`, `Sessions`, `Data`.
     pub capture_root: String,
+    /// Optional separate folder for the temporary buffer (e.g. a faster drive). Its `Buffer`
+    /// subfolder is used; `None` = `<capture_root>\Buffer`.
+    #[serde(default)]
+    pub buffer_root: Option<String>,
     pub replay_secs: u32,
     pub target: CaptureTarget,
     pub quality: Quality,

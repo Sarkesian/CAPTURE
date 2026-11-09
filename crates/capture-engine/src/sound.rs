@@ -33,12 +33,12 @@ pub fn chime_samples(volume: f32) -> Vec<f32> {
 }
 
 /// Fire-and-forget: plays on the default output device on its own thread.
-pub fn play_chime(volume: f32) {
+pub fn play_chime(volume: f32, device: Option<String>) {
     if volume <= 0.0 {
         return;
     }
     std::thread::spawn(move || {
-        if let Err(e) = play_samples(&chime_samples(volume)) {
+        if let Err(e) = play_on(&chime_samples(volume), device.as_deref()) {
             eprintln!("chime: {e}");
         }
     });
@@ -47,10 +47,20 @@ pub fn play_chime(volume: f32) {
 /// Play interleaved 48 kHz stereo float samples on the default output, blocking until done.
 /// Streams through a 200 ms buffer, so any length works.
 pub fn play_samples(samples: &[f32]) -> windows::core::Result<()> {
+    play_on(samples, None)
+}
+
+/// As `play_samples`, on a chosen output (falls back to the default output if that device is
+/// gone: a missing *output* for a notification sound is harmless, unlike a missing microphone).
+pub fn play_on(samples: &[f32], device: Option<&str>) -> windows::core::Result<()> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-        let dev = en.GetDefaultAudioEndpoint(eRender, eConsole)?;
+        let chosen = device.and_then(|id| en.GetDevice(&windows::core::HSTRING::from(id)).ok()).filter(|d| d.GetState().map(|s| s == DEVICE_STATE_ACTIVE).unwrap_or(false));
+        let dev = match chosen {
+            Some(d) => d,
+            None => en.GetDefaultAudioEndpoint(eRender, eConsole)?,
+        };
         let client: IAudioClient = dev.Activate(CLSCTX_ALL, None)?;
         let fmt = WAVEFORMATEX {
             wFormatTag: 3,

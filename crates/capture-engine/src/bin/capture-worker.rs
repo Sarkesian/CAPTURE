@@ -31,7 +31,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("--chime") {
         let v = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(0.6);
-        capture_engine::sound::play_chime(v);
+        capture_engine::sound::play_chime(v, args.get(3).cloned());
         std::thread::sleep(Duration::from_millis(600));
         return;
     }

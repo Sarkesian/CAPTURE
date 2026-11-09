@@ -284,6 +284,7 @@ impl Engine {
                     || old.capture_cursor != cfg.capture_cursor
                     || !old.audio.same_sources(&cfg.audio)
                     || old.capture_root != cfg.capture_root
+                    || old.buffer_root != cfg.buffer_root
                     || self.pipeline.as_ref().is_some_and(|p| {
                         let (a, b) = (old.for_game(&p.shared.target_exe), cfg.for_game(&p.shared.target_exe));
                         a.quality != b.quality || a.audio.game_audio != b.audio.game_audio
@@ -451,7 +452,7 @@ impl Engine {
         };
         let m = p.shared.add_marker(label, &mcfg);
         if mcfg.sound {
-            sound::play_chime(mcfg.sound_volume);
+            sound::play_chime(mcfg.sound_volume, mcfg.sound_device.clone());
         }
         let detail = match (&m.note, m.footage) {
             (Some(n), _) => n.clone(),
@@ -669,7 +670,8 @@ impl Engine {
 
     fn leftover_dirs(&self, root: &Path) -> Vec<PathBuf> {
         let current = self.current_session();
-        std::fs::read_dir(storage::buffer_dir(root))
+        let buffer_root = self.cfg.as_ref().and_then(|c| c.buffer_root.clone());
+        std::fs::read_dir(storage::buffer_dir_for(root, buffer_root.as_deref()))
             .into_iter()
             .flatten()
             .flatten()
@@ -796,7 +798,8 @@ fn settings_for_window(cfg: &EngineConfig, w: &WindowTarget, detected_by: Option
     let root = base_settings(cfg)?;
     let audio = audio_sources(cfg, Some((w.pid, &w.exe)));
     Ok(Settings {
-        root,
+        root: root.clone(),
+        buffer: storage::buffer_dir_for(&root, cfg.buffer_root.as_deref()),
         game_name: w.app_name.clone(),
         exe: w.exe.clone(),
         pid: w.pid,
@@ -846,7 +849,8 @@ fn resolve(cfg: &EngineConfig) -> Result<Settings, Unresolved> {
             let m = mons.iter().find(|m| m.target.index == *index).ok_or_else(|| failed("That display is not connected."))?;
             let audio = audio_sources(cfg, None);
             Ok(Settings {
-                root,
+                root: root.clone(),
+                buffer: storage::buffer_dir_for(&root, cfg.buffer_root.as_deref()),
                 game_name: "Desktop".into(),
                 exe: String::new(),
                 pid: 0,
