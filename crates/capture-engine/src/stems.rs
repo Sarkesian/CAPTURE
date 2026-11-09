@@ -53,9 +53,12 @@ impl Drop for Out {
 pub fn export(clip: &Path) -> Result<StemResult, String> {
     let stem = clip.file_stem().ok_or("Not a clip file")?.to_string_lossy().into_owned();
     let folder = clip.with_file_name(format!("{stem}_Audio"));
+    // Only a folder this call created may be cleaned up after a failure: an earlier export
+    // (or files the user put there) must never be deleted.
+    let created = !folder.exists();
     std::fs::create_dir_all(&folder).map_err(|e| format!("Cannot create {}: {e}", folder.display()))?;
     let r = unsafe { export_inner(clip, &folder) };
-    if r.is_err() {
+    if r.is_err() && created {
         let _ = std::fs::remove_dir_all(&folder);
     }
     r
@@ -251,6 +254,6 @@ mod tests {
     fn stem_names_are_plain() {
         assert_eq!(super::file_name_for("Game Audio"), "GameAudio.wav");
         assert_eq!(super::file_name_for("Voice Chat"), "VoiceChat.wav");
-        assert_eq!(super::file_name_for("Other Desktop"), "OtherDesktop.wav");
+        assert_eq!(super::file_name_for("All Desktop Audio"), "AllDesktopAudio.wav");
     }
 }

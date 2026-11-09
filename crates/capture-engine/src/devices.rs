@@ -19,6 +19,26 @@ pub fn name_of(dev: &IMMDevice) -> String {
     }
 }
 
+/// Windows' own mute switch and level (0..1) for an endpoint, as shown in Sound settings.
+/// CAPTURE only reads these; it never changes them.
+pub fn endpoint_level(dev: &IMMDevice) -> Option<(bool, f32)> {
+    unsafe {
+        let v: windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume = dev.Activate(CLSCTX_ALL, None).ok()?;
+        Some((v.GetMute().ok()?.as_bool(), v.GetMasterVolumeLevelScalar().ok()?))
+    }
+}
+
+/// Plain-language reason a microphone records silence because of Windows settings, if any.
+pub fn mic_level_problem(name: &str, muted: bool, volume: f32) -> Option<String> {
+    if muted {
+        Some(format!("Windows has {name} muted, so it records silence. Unmute it in Windows Sound settings › Input (CAPTURE never changes it)."))
+    } else if volume <= 0.001 {
+        Some(format!("{name} is set to 0% in Windows Sound settings › Input, so it records silence."))
+    } else {
+        None
+    }
+}
+
 fn id_of(dev: &IMMDevice) -> String {
     unsafe { dev.GetId().ok().and_then(|p| p.to_string().ok()).unwrap_or_default() }
 }
@@ -41,7 +61,8 @@ pub fn list(flow: EDataFlow) -> Vec<AudioDevice> {
         for i in 0..coll.GetCount().unwrap_or(0) {
             if let Ok(d) = coll.Item(i) {
                 let (id, name) = (id_of(&d), name_of(&d));
-                out.push(AudioDevice { is_default: id == default, is_virtual: is_virtual(&name), id, name });
+                let (muted, volume) = endpoint_level(&d).map_or((false, None), |(m, v)| (m, Some(v)));
+                out.push(AudioDevice { is_default: id == default, is_virtual: is_virtual(&name), id, name, muted, volume });
             }
         }
         out.sort_by_key(|d| (!d.is_default, d.is_virtual, d.name.clone()));

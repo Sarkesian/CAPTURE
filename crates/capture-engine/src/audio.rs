@@ -2,7 +2,7 @@
 //! `Preview Mix` + one isolated, unprocessed track per source.
 //!
 //! Sources: the game (process loopback of its process tree), a microphone (a specific capture
-//! device), a voice-chat app (process loopback of that app's tree) and "Other Desktop"
+//! device), a voice-chat app (process loopback of that app's tree) and "All Desktop Audio"
 //! (everything except CAPTURE). Each source runs on its own thread and *retries* on failure
 //! (device unplugged, app not running yet, app restarted) without ever switching to a
 //! different device.
@@ -114,6 +114,12 @@ pub(crate) struct TrackBuf {
     source: String,
     /// Level-only monitor: samples are measured but not stored.
     pub(crate) discard: bool,
+    /// A reason the source records silence although it is connected (Windows has the
+    /// microphone muted or at 0%). Not an error: capture keeps running and clears it itself.
+    hint: Option<String>,
+    /// When the device was (re)connected, and whether any non-zero sample arrived since.
+    connected_at: Option<Instant>,
+    heard_since_connect: bool,
 }
 
 impl TrackBuf {
@@ -164,6 +170,7 @@ impl TrackBuf {
         let p = s.iter().fold(0f32, |m, x| m.max(x.abs()));
         if p > 0.0 {
             self.signal_seen = true;
+            self.heard_since_connect = true;
         }
         if self.peak_at.is_none_or(|t| t.elapsed() > Duration::from_millis(100)) || p > self.peak {
             self.peak = p;
@@ -192,6 +199,28 @@ impl TrackBuf {
 
     pub(crate) fn error(&self) -> Option<String> {
         self.error.clone()
+    }
+
+    /// What to tell the user about this source: a failure, a Windows setting that silences
+    /// it, or (microphones only) a connected device that has sent nothing but digital zeros
+    /// for 5 s. A real microphone always has some noise, so pure zeros mean it is muted
+    /// somewhere (hardware switch, headset off, driver), never just a quiet room.
+    pub(crate) fn problem(&self) -> Option<String> {
+        if self.error.is_some() {
+            return self.error.clone();
+        }
+        if self.hint.is_some() {
+            return self.hint.clone();
+        }
+        let silent_mic = self.mode == "microphone"
+            && !self.heard_since_connect
+            && self.connected_at.is_some_and(|t| t.elapsed() > Duration::from_secs(5));
+        silent_mic.then(|| {
+            format!(
+                "{} is connected but sends complete silence. Check its mute button or switch, that the headset is on, and Windows Sound settings › Input.",
+                self.source
+            )
+        })
     }
 
     pub(crate) fn take_samples(&mut self) -> Vec<f32> {
@@ -309,7 +338,7 @@ impl AudioPipeline {
                 source: if muted { format!("{} (muted)", b.source) } else { b.source.clone() },
                 peak: b.live_peak(),
                 signal_seen: b.signal_seen,
-                error: b.error.clone(),
+                error: b.problem(),
             });
         }
         v
@@ -524,7 +553,9 @@ fn float_format() -> WAVEFORMATEX {
 /// Returns the client, stream flags, mode, description, and the process to watch (if any):
 /// process loopback keeps delivering silence after its target exits, so the capture loop must
 /// notice the exit itself and reconnect (to the app's next instance).
-fn open(spec: &SourceSpec) -> Result<(IAudioClient, u32, &'static str, String, Option<u32>), String> {
+type Opened = (IAudioClient, u32, &'static str, String, Option<u32>, Option<Endpoints::IAudioEndpointVolume>);
+
+fn open(spec: &SourceSpec) -> Result<Opened, String> {
     let base = AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
     let loopback = base | AUDCLNT_STREAMFLAGS_LOOPBACK;
     match spec {
@@ -534,6 +565,7 @@ fn open(spec: &SourceSpec) -> Result<(IAudioClient, u32, &'static str, String, O
             "process-loopback-exclude",
             "everything you hear, except CAPTURE's own sounds".into(),
             None,
+            None,
         )),
         SourceSpec::Process { pid } => Ok((
             process_loopback_client(*pid, true).map_err(|e| format!("Could not capture this app's audio ({e})"))?,
@@ -541,6 +573,7 @@ fn open(spec: &SourceSpec) -> Result<(IAudioClient, u32, &'static str, String, O
             "process-loopback",
             format!("process {pid} and its child processes"),
             Some(*pid),
+            None,
         )),
         SourceSpec::App { exe } => {
             let pid = devices::root_process(exe).ok_or_else(|| format!("{exe} isn't running. It will be recorded as soon as it starts."))?;
@@ -550,6 +583,7 @@ fn open(spec: &SourceSpec) -> Result<(IAudioClient, u32, &'static str, String, O
                 "process-loopback",
                 format!("{exe} (process {pid}) and its child processes"),
                 Some(pid),
+                None,
             ))
         }
         SourceSpec::Mic { device_id } => unsafe {
@@ -566,13 +600,21 @@ fn open(spec: &SourceSpec) -> Result<(IAudioClient, u32, &'static str, String, O
             };
             let name = devices::name_of(&dev);
             let client = dev.Activate::<IAudioClient>(CLSCTX_ALL, None).map_err(|_| format!("{name} could not be opened. Is another app using it exclusively?"))?;
-            Ok((client, base, "microphone", name, None))
+            let level = dev.Activate::<Endpoints::IAudioEndpointVolume>(CLSCTX_ALL, None).ok();
+            Ok((client, base, "microphone", name, None, level))
         },
     }
 }
 
 fn capture_source(spec: &SourceSpec, buf: &Mutex<TrackBuf>, t0_qpc: u64, stop: &AtomicBool) -> Result<(), String> {
-    let (client, flags, mode, source, watch) = open(spec)?;
+    let (client, flags, mode, source, watch, level) = open(spec)?;
+    let level_hint = |name: &str| {
+        level.as_ref().and_then(|v| unsafe {
+            let (m, l) = (v.GetMute().ok()?.as_bool(), v.GetMasterVolumeLevelScalar().ok()?);
+            devices::mic_level_problem(name, m, l)
+        })
+    };
+    let mut level_checked = Instant::now();
     let watched = watch.and_then(|pid| unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid).ok() }).map(HandleGuard);
     let fmt = float_format();
     unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 200_000, 0, &fmt, None) }.map_err(|e| e.to_string())?;
@@ -584,8 +626,11 @@ fn capture_source(spec: &SourceSpec, buf: &Mutex<TrackBuf>, t0_qpc: u64, stop: &
     {
         let mut b = buf.lock().unwrap();
         b.mode = mode.into();
-        b.source = source;
+        b.hint = level_hint(&source);
+        b.source = source.clone();
         b.error = None;
+        b.connected_at = Some(Instant::now());
+        b.heard_since_connect = false;
     }
     let lost = |what: &str| match spec {
         SourceSpec::Mic { .. } => format!("The microphone stopped ({what}). Reconnect it; CAPTURE will pick it up again."),
@@ -594,6 +639,12 @@ fn capture_source(spec: &SourceSpec, buf: &Mutex<TrackBuf>, t0_qpc: u64, stop: &
     };
     while !stop.load(Ordering::Relaxed) {
         unsafe { WaitForSingleObject(ev, 100) };
+        if level.is_some() && level_checked.elapsed() >= Duration::from_secs(1) {
+            // The user may unmute it in Windows while we record: follow it live.
+            level_checked = Instant::now();
+            let h = level_hint(&source);
+            buf.lock().unwrap().hint = h;
+        }
         if let Some(h) = &watched {
             if unsafe { WaitForSingleObject(h.0, 0) } == WAIT_OBJECT_0 {
                 unsafe {
@@ -743,6 +794,28 @@ mod tests {
     }
 
     #[test]
+    fn silent_microphone_is_explained_and_clears_when_sound_arrives() {
+        let mut b = TrackBuf { mode: "microphone".into(), source: "Mic X".into(), ..Default::default() };
+        b.connected_at = Some(Instant::now());
+        assert_eq!(b.problem(), None, "no verdict during the first seconds");
+        b.connected_at = Some(Instant::now() - Duration::from_secs(6));
+        b.push(0, None, 4800); // AUDCLNT_BUFFERFLAGS_SILENT packets
+        b.push(4800, Some(&vec![0.0f32; 480 * CH]), 480); // digital zeros
+        assert!(b.problem().unwrap().contains("complete silence"));
+        b.hint = devices::mic_level_problem("Mic X", true, 0.5);
+        assert!(b.problem().unwrap().contains("Windows has Mic X muted"), "a named Windows mute wins");
+        b.hint = None;
+        b.push(5280, Some(&vec![0.001f32; 480 * CH]), 480); // room noise
+        assert_eq!(b.problem(), None);
+        // Loopback sources are often silent for good reasons: never flagged.
+        let mut g = TrackBuf { mode: "process-loopback".into(), ..Default::default() };
+        g.connected_at = Some(Instant::now() - Duration::from_secs(60));
+        assert_eq!(g.problem(), None);
+        assert!(devices::mic_level_problem("M", false, 0.0).unwrap().contains("0%"));
+        assert_eq!(devices::mic_level_problem("M", false, 0.3), None);
+    }
+
+    #[test]
     fn soft_clip_is_transparent_then_bounded() {
         assert_eq!(soft_clip(0.5), 0.5);
         assert_eq!(soft_clip(-0.9), -0.9);
@@ -756,9 +829,9 @@ mod tests {
             Source { spec: SourceSpec::Process { pid: 1 }, role: Role::Game, label: "Game Audio".into(), in_mix: true },
             Source { spec: SourceSpec::Mic { device_id: None }, role: Role::Mic, label: "Microphone".into(), in_mix: true },
             Source { spec: SourceSpec::App { exe: "Discord.exe".into() }, role: Role::Voice, label: "Voice Chat".into(), in_mix: true },
-            Source { spec: SourceSpec::AllExceptCapture, role: Role::Other, label: "Other Desktop".into(), in_mix: false },
+            Source { spec: SourceSpec::AllExceptCapture, role: Role::Other, label: "All Desktop Audio".into(), in_mix: false },
         ];
-        assert_eq!(track_names(&srcs), ["Preview Mix", "Game Audio", "Microphone", "Voice Chat", "Other Desktop"]);
+        assert_eq!(track_names(&srcs), ["Preview Mix", "Game Audio", "Microphone", "Voice Chat", "All Desktop Audio"]);
         assert_eq!(MixParams::default().gain(Role::Other), 0.0);
     }
 }

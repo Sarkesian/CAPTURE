@@ -274,6 +274,11 @@ pub struct EngineConfig {
     pub buffer_cap_bytes: u64,
     /// Buffering pauses when free space on the capture drive falls below this.
     pub min_free_bytes: u64,
+    /// After every saved clip/session with more than one audio track, also write the
+    /// synchronized per-track WAV files ("editor audio files"). Off by default: the MP4
+    /// already holds every track, and the WAVs roughly double the audio's disk use.
+    #[serde(default)]
+    pub editor_audio_files: bool,
 }
 
 fn yes() -> bool {
@@ -300,7 +305,7 @@ pub struct AudioConfig {
     pub voice_enabled: bool,
     #[serde(default)]
     pub voice_app: Option<String>,
-    /// "Other Desktop": everything you hear except CAPTURE. Overlaps game and voice chat, so it
+    /// "All Desktop Audio" (formerly "Other Desktop"): everything you hear except CAPTURE. Overlaps game and voice chat, so it
     /// is kept as its own track and NOT added to Preview Mix (no doubled sound).
     #[serde(default)]
     pub other_enabled: bool,
@@ -343,6 +348,13 @@ pub struct AudioDevice {
     /// Virtual devices (e.g. "Steam Streaming Microphone") are labelled so they are never
     /// mistaken for a real microphone.
     pub is_virtual: bool,
+    /// Windows' own mute switch for this device (Sound settings). A muted microphone records
+    /// silence, so the UI says so instead of showing a flat meter.
+    #[serde(default)]
+    pub muted: bool,
+    /// Windows' level for this device, 0..1 (None if unknown).
+    #[serde(default)]
+    pub volume: Option<f32>,
 }
 
 /// An app that currently has an audio session (i.e. can be picked as voice chat).

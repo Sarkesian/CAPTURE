@@ -42,11 +42,13 @@ export interface Settings {
   notices: { recording_started: boolean; saved: boolean; marker: boolean; problems: boolean };
   overlay_scale: number;
   buffer_root: string | null;
+  editor_audio_files: boolean;
+  minimize_to_tray: boolean;
 }
 
 export interface GameRule { exe: string; replay_secs: number | null; quality: Quality | null; game_audio: boolean | null }
 
-export interface AudioDevice { id: string; name: string; is_default: boolean; is_virtual: boolean }
+export interface AudioDevice { id: string; name: string; is_default: boolean; is_virtual: boolean; muted?: boolean; volume?: number | null }
 export interface AudioApp { exe: string; name: string }
 export interface MicLevel { device: string; peak: number; error: string | null }
 

@@ -15,7 +15,7 @@
   const gameT = $derived(track(display ? 'System Audio' : 'Game Audio'));
   const micT = $derived(track('Microphone'));
   const voiceT = $derived(track('Voice Chat'));
-  const otherT = $derived(track('Other Desktop'));
+  const otherT = $derived(track('All Desktop Audio'));
   const defaultMic = $derived(app.inputs.find(d => d.is_default));
   const chosenMissing = $derived(!!s.mic_device && app.inputs.length > 0 && !app.inputs.some(d => d.id === s.mic_device));
   const micPeak = $derived(micT ? micT.peak : (e?.mic_monitor?.peak ?? 0));
@@ -73,7 +73,7 @@
       {#if s.mic_enabled}
         <select aria-label="Microphone" value={s.mic_device ?? ''} onchange={ev => updateSettings({ mic_device: (ev.target as HTMLSelectElement).value || null })}>
           <option value="">Windows default{defaultMic ? ` (now: ${defaultMic.name})` : ''}</option>
-          {#each app.inputs as d (d.id)}<option value={d.id}>{d.name}{d.is_virtual ? ' — virtual device' : ''}</option>{/each}
+          {#each app.inputs as d (d.id)}<option value={d.id}>{d.name}{d.is_virtual ? ' — virtual device' : ''}{d.muted ? ' — muted in Windows' : ''}</option>{/each}
           {#if chosenMissing}<option value={s.mic_device}>Your chosen microphone — disconnected</option>{/if}
         </select>
         {#if micError}<div class="small warn">{micError}</div>
@@ -120,12 +120,12 @@
 
   {#if !compact && !display}
     <div class="src">
-      <Toggle checked={s.other_enabled} label="Other computer audio" onchange={v => updateSettings({ other_enabled: v })} />
+      <Toggle checked={s.other_enabled} label="All computer audio" onchange={v => updateSettings({ other_enabled: v })} />
       <div class="body">
-        <div class="title">Other computer audio</div>
+        <div class="title">All computer audio (extra track)</div>
         <div class="muted small">Everything you hear, as an extra track for editing. It also contains the game and voice chat, so it is not added to Preview Mix.</div>
       </div>
-      {#if s.other_enabled}<div class="meter"><Meter peak={otherT?.peak ?? 0} label="Other audio level" /></div>{/if}
+      {#if s.other_enabled}<div class="meter"><Meter peak={otherT?.peak ?? 0} label="All computer audio level" /></div>{/if}
     </div>
   {/if}
 </div>

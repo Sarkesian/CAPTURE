@@ -35,7 +35,7 @@ impl Monitor {
 
     pub fn level(&self) -> MicLevel {
         let b = self.buf.lock().unwrap();
-        MicLevel { device: self.device.clone(), peak: (b.live_peak() * 100.0).round() / 100.0, error: b.error() }
+        MicLevel { device: self.device.clone(), peak: (b.live_peak() * 100.0).round() / 100.0, error: b.problem() }
     }
 }
 
@@ -68,9 +68,9 @@ pub fn test(device: Option<String>, phase: impl Fn(&str, f32, Option<String>)) {
     }
     stop.store(true, Ordering::SeqCst);
     let _ = worker.join();
-    let (samples, err) = {
+    let (samples, err, problem) = {
         let mut b = buf.lock().unwrap();
-        (b.take_samples(), b.error())
+        (b.take_samples(), b.error(), b.problem())
     };
     if samples.is_empty() {
         phase("failed", 0.0, Some(err.unwrap_or_else(|| "No sound arrived from the microphone.".into())));
@@ -81,7 +81,10 @@ pub fn test(device: Option<String>, phase: impl Fn(&str, f32, Option<String>)) {
         phase(
             "failed",
             peak,
-            Some("The microphone sent only silence. Check that it isn't muted (hardware switch or Windows settings) and that this is the device you speak into.".into()),
+            // A Windows mute / 0% level is named exactly; otherwise the generic checklist.
+            Some(problem.unwrap_or_else(|| {
+                "The microphone sent only silence. Check that it isn't muted (hardware switch or Windows settings) and that this is the device you speak into.".into()
+            })),
         );
         return;
     }

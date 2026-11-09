@@ -392,10 +392,14 @@ impl Engine {
         let emit = self.emit.clone();
         let overlay = self.overlay.clone().filter(|_| self.cfg.as_ref().is_some_and(|c| c.overlay));
         let game = p.shared.game_name.clone();
+        let stems = self.editor_audio_files();
         let requested = p.stop_session(
             move |r| {
                 let (ev, n) = match r {
                     Ok((clip, _)) => {
+                        if stems {
+                            export_stems_after_save(&emit, &clip);
+                        }
                         let n = Notice { kind: Kind::Saved, title: format!("Session saved · {}", fmt_secs(clip.duration_secs)), detail: game };
                         (Event::SaveFinished(clip), n)
                     }
@@ -483,12 +487,16 @@ impl Engine {
         let flags = self.cfg.as_ref().map(|c| (c.overlay && c.notices.saved, c.overlay && c.notices.problems)).unwrap_or((false, false));
         let overlay = self.overlay.clone();
         let game = p.shared.game_name.clone();
+        let stems = self.editor_audio_files();
         let requested = p.request_save(
             range,
             SaveKind::Clip,
             move |r| {
                 let (ev, notice) = match r {
                     Ok((clip, requested)) => {
+                        if stems {
+                            export_stems_after_save(&emit, &clip);
+                        }
                         let short = clip.duration_secs + 1.0 < requested;
                         let detail = if short {
                             format!("{game} · only {} was buffered", fmt_secs(clip.duration_secs))
@@ -711,6 +719,34 @@ impl Engine {
     }
 }
 
+impl Engine {
+    fn editor_audio_files(&self) -> bool {
+        self.cfg.as_ref().is_some_and(|c| c.editor_audio_files)
+    }
+}
+
+/// "Create separate audio files for editors": after a verified save, write the per-track WAVs
+/// on a background thread (never delays the save or the next one). Only for clips that have
+/// separate tracks; a clip with just Preview Mix gains nothing from a WAV copy.
+fn export_stems_after_save(emit: &Emit, clip: &SavedClip) {
+    if clip.audio_tracks.len() < 2 {
+        return;
+    }
+    let (emit, path) = (emit.clone(), clip.path.clone());
+    std::thread::spawn(move || {
+        let ev = match stems::export(Path::new(&path)) {
+            Ok(r) => Event::StemsDone {
+                path,
+                folder: Some(r.folder.to_string_lossy().into_owned()),
+                files: r.files.iter().map(|f| f.to_string_lossy().into_owned()).collect(),
+                error: None,
+            },
+            Err(e) => Event::StemsDone { path, folder: None, files: vec![], error: Some(e) },
+        };
+        emit(Message::new(None, ev));
+    });
+}
+
 /// Hotkey bindings handled by the worker (every action has a working implementation).
 pub fn bindings(cfg: &EngineConfig) -> hotkey::Bindings {
     vec![
@@ -763,7 +799,7 @@ fn base_settings(cfg: &EngineConfig) -> Result<PathBuf, Unresolved> {
 
 /// Audio sources for a session. `game = Some((pid, exe))` for a game/app window, `None` for
 /// whole-display capture (where "System Audio" already contains everything, so voice chat is
-/// kept as its own track but not added to the mix again, and Other Desktop would be identical).
+/// kept as its own track but not added to the mix again, and All Desktop Audio would be identical).
 pub fn audio_sources(cfg: &EngineConfig, game: Option<(u32, &str)>) -> Vec<Source> {
     let a = &cfg.audio;
     let mut v = Vec::new();
@@ -783,7 +819,7 @@ pub fn audio_sources(cfg: &EngineConfig, game: Option<(u32, &str)>) -> Vec<Sourc
         v.push(Source { spec: SourceSpec::App { exe }, role: Role::Voice, label: "Voice Chat".into(), in_mix });
     }
     if a.other_enabled && !(display && a.game_audio) {
-        v.push(Source { spec: SourceSpec::AllExceptCapture, role: Role::Other, label: "Other Desktop".into(), in_mix: false });
+        v.push(Source { spec: SourceSpec::AllExceptCapture, role: Role::Other, label: "All Desktop Audio".into(), in_mix: false });
     }
     v
 }

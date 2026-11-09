@@ -34,7 +34,7 @@ await waitFor(m => m.event === 'state' && m.data.status === 'buffering');
 await sleep(4000);
 let st = state();
 console.log('tracks:', st.tracks.map(t => `${t.name} [${t.mode}] ${t.source}${t.error ? ' ERROR ' + t.error : ''}`).join('\n        '));
-check(st.tracks.map(t => t.name).join(',') === 'Preview Mix,Game Audio,Microphone,Voice Chat,Other Desktop', 'five tracks in contract order');
+check(st.tracks.map(t => t.name).join(',') === 'Preview Mix,Game Audio,Microphone,Voice Chat,All Desktop Audio', 'five tracks in contract order');
 const frames0 = st.frames_captured;
 
 // Live mute: no pipeline restart (frames keep counting, same session).
