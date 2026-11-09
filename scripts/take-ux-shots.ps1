@@ -17,7 +17,7 @@ $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = '--remote-debugging-port=9333'
 $p = Start-Process "$run\CAPTURE.exe" -WorkingDirectory $run -PassThru
 Remove-Item Env:\WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
 Start-Sleep 25  # let some replay accumulate
-# Save one clip so Home, Library and the overlay show real thumbnails.
+# Save one clip so Home, Library and the overlay show real clips.
 $code = "const pg=(await (await fetch('http://127.0.0.1:9333/json')).json()).find(t=>t.type==='page'&&!t.url.includes('#overlay'));const ws=new WebSocket(pg.webSocketDebuggerUrl);await new Promise(r=>ws.addEventListener('open',r,{once:true}));ws.send(JSON.stringify({id:1,method:'Runtime.evaluate',params:{expression:'window.__TAURI_INTERNALS__.invoke(\'save_replay\')',awaitPromise:true}}));ws.addEventListener('message',()=>process.exit(0));"
 Set-Content -Encoding utf8 "$root\test-output\save.mjs" $code
 node "$root\test-output\save.mjs"

@@ -121,9 +121,8 @@
         <article class="item" class:open={menu === c.path}>
           <div class="thumb">
             <button class="tbtn" aria-label="{c.kind === 'screenshot' ? 'Open' : 'Play'} {c.name}" onclick={() => openPath(c.path)}>
-              {#if c.kind === 'screenshot'}<img src={convertFileSrc(c.path)} alt="" loading="lazy" />
-              {:else if info?.thumb}<img src={convertFileSrc(info.thumb)} alt="" loading="lazy" />{/if}
-              <span class="play"><Icon name={c.kind === 'screenshot' ? 'search' : 'play'} size={20} /></span>
+              {#if c.kind === 'screenshot'}<img src={convertFileSrc(c.path)} alt="" loading="lazy" />{/if}
+              <span class="play" class:video={c.kind !== 'screenshot'}><Icon name={c.kind === 'screenshot' ? 'search' : 'play'} size={20} /></span>
             </button>
             {#if info?.duration}<span class="dur">{fmtDuration(info.duration)}</span>{/if}
             <div class="hover">
@@ -188,6 +187,8 @@
   .hover { position: absolute; top: 6px; right: 6px; display: flex; gap: 4px; opacity: 0; transition: opacity var(--t-fast) var(--ease); }
   .item:hover .hover, .item:focus-within .hover, .item.open .hover { opacity: 1; }
   .item:hover .play, .tbtn:focus-visible .play { opacity: 1; }
+  .play.video { opacity: 1; background: none; color: var(--text-2); }
+  .item:hover .play.video, .tbtn:focus-visible .play.video { color: var(--text); }
   .chip { width: 28px; height: 28px; display: grid; place-items: center; border: none; border-radius: var(--r-sm); background: rgba(0, 0, 0, 0.65); color: #fff; cursor: pointer; }
   .chip:hover { background: rgba(0, 0, 0, 0.85); }
   .menu { position: absolute; top: 38px; right: 6px; z-index: 5; min-width: 220px; padding: var(--s1); border-radius: var(--r-md);

@@ -1,7 +1,7 @@
 # CAPTURE
 
 Windows-first, local-first game recording and instant replay. Press a hotkey and get a normal MP4 in
-`Captures\Clips\<Game>\`, with a playable Preview Mix plus separate Game / Microphone / Voice Chat tracks
+`Captures\<Game>\Clips\`, with a playable Preview Mix plus separate Game / Microphone / Voice Chat tracks
 for editing.
 
 **Status:** v0.3: instant replay, overlay with review timeline and markers, sessions, screenshots, separate

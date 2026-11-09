@@ -1,5 +1,5 @@
 //! Screenshots: the current captured frame (already cropped to the game) saved as a PNG in
-//! `Screenshots\<Game>\`. Uses the live capture texture, so no second capture is started.
+//! `<Game>\Screenshots\`. Uses the live capture texture, so no second capture is started.
 
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
@@ -13,7 +13,7 @@ use crate::gpu::Gpu;
 use crate::{storage, wgc};
 
 pub fn screenshots_dir(root: &Path, game: &str) -> PathBuf {
-    root.join("Screenshots").join(storage::folder_name(game))
+    storage::screenshots_dir(root, game)
 }
 
 /// Copy `latest` to the CPU and write it as PNG. Returns the file path.

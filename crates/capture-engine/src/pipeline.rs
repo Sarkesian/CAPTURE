@@ -400,7 +400,7 @@ impl Pipeline {
         true
     }
 
-    /// Finish the session: saves [start, now] to `Sessions\<Game>\`. The pin is released once
+    /// Finish the session: saves [start, now] to `<Game>\Sessions\`. The pin is released once
     /// the save has protected its own segments.
     pub fn stop_session(&self, done: impl FnOnce(Result<(SavedClip, f64), String>) + Send + 'static, save_id: u64) -> Option<f64> {
         let start = self.shared.session_start.lock().unwrap().take()?;

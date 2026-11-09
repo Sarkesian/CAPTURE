@@ -15,7 +15,8 @@ const ps = s => execFileSync('powershell', ['-NoProfile', '-Command', s]).toStri
 const KEY = `Add-Type -Namespace W -Name K -MemberDefinition '[DllImport("user32.dll")] public static extern void keybd_event(byte k, byte s, uint f, System.UIntPtr e);'`;
 const altKey = vk => ps(`${KEY}; [W.K]::keybd_event(0x12,0,0,[UIntPtr]::Zero); [W.K]::keybd_event(${vk},0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 60; [W.K]::keybd_event(${vk},0,2,[UIntPtr]::Zero); [W.K]::keybd_event(0x12,0,2,[UIntPtr]::Zero)`);
 const overlayVisible = () => ps(`Add-Type -Namespace W -Name V -MemberDefinition '[DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern System.IntPtr FindWindow(string c, string t); [DllImport("user32.dll")] public static extern bool IsWindowVisible(System.IntPtr h);'; [W.V]::IsWindowVisible([W.V]::FindWindow([NullString]::Value, 'CAPTURE overlay'))`) === 'True';
-const files = sub => { const d = path.join(root, sub); if (!existsSync(d)) return []; return readdirSync(d, { recursive: true }).filter(f => String(f).endsWith('.mp4')); };
+// <root>\<Game>\<sub>\*.mp4 (each game folder holds Clips / Sessions / Screenshots).
+const files = sub => existsSync(root) ? readdirSync(root, { recursive: true }).map(String).filter(f => f.endsWith('.mp4') && f.split(path.sep).at(-2) === sub && !f.startsWith('Buffer')) : [];
 
 async function page(match) {
   for (let i = 0; i < 60; i++) {
@@ -59,7 +60,7 @@ const clips0 = files('Clips').length;
 await sleep(2500);
 check(await click(ov, 'Save Replay'), 'Save Replay clicked');
 check(await waitFor(async () => files('Clips').length > clips0, 20000), `replay clip written (${files('Clips').length} clips)`);
-check(await waitFor(async () => (await ov.js(`document.querySelectorAll('.clip img').length`)) > 0, 15000), 'recent clip thumbnail shown');
+check(await waitFor(async () => (await ov.js(`document.querySelectorAll('.clip .dur').length`)) > 0, 15000), 'recent clip shown with its duration');
 await ov.shot('2-overlay-saved');
 
 // 3) Review Recording: real playback of buffered footage, marker on the timeline, range save.

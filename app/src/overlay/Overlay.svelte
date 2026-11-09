@@ -123,7 +123,7 @@
           onchange={v => updateSettings({ quality: v })} />
       </div>
       <div class="field audio-full"><AudioSources /></div>
-      <div class="field"><span class="grow">Marker sound</span><Toggle checked={s.markers.sound} label="Marker sound" onchange={v => updateSettings({ markers: { ...s.markers, sound: v } })} /></div>
+      <div class="field"><span class="grow">Hotkey sound</span><Toggle checked={s.markers.sound} label="Hotkey sound" onchange={v => updateSettings({ markers: { ...s.markers, sound: v } })} /></div>
       <div class="field"><span class="grow">On-screen notices</span><Toggle checked={s.notify_on_save} label="On-screen notices" onchange={v => updateSettings({ notify_on_save: v })} /></div>
       <div class="field">
         <div class="grow"><div>Saving to</div><div class="mono faint xs ellipsis">{s.capture_root}</div></div>
@@ -193,7 +193,6 @@
             {@const info = app.clipInfo[c.path]}
             <article class="clip">
               <button class="thumb" aria-label="Play {c.name}" onclick={() => { playing = c; view = 'player'; }}>
-                {#if info?.thumb}<img src={convertFileSrc(info.thumb)} alt="" />{/if}
                 <span class="play"><Icon name="play" size={18} /></span>
                 {#if info?.duration}<span class="dur">{fmtDuration(info.duration)}</span>{/if}
               </button>
@@ -271,9 +270,8 @@
   .clips { display: grid; grid-template-columns: repeat(3, minmax(0, 240px)); gap: var(--s3); margin-top: var(--s2); }
   .clip { display: flex; flex-direction: column; gap: var(--s1); min-width: 0; }
   .thumb { position: relative; padding: 0; aspect-ratio: 16 / 9; overflow: hidden; border: none; border-radius: var(--r-md); background: var(--surface-2); cursor: pointer; }
-  .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
-  .play { position: absolute; inset: 0; display: grid; place-items: center; color: #fff; background: rgba(0, 0, 0, 0.35); opacity: 0; transition: opacity var(--t-fast) var(--ease); }
-  .thumb:hover .play, .thumb:focus-visible .play { opacity: 1; }
+  .play { position: absolute; inset: 0; display: grid; place-items: center; color: var(--text-2); transition: color var(--t-fast) var(--ease); }
+  .thumb:hover .play, .thumb:focus-visible .play { color: var(--text); }
   .dur { position: absolute; right: 6px; bottom: 6px; background: rgba(0, 0, 0, 0.72); color: #fff; font-size: var(--fs-xs); padding: 0 6px; border-radius: 4px; }
   .meta { gap: 2px; min-width: 0; }
   .meta .grow { min-width: 0; }

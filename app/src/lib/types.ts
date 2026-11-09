@@ -112,7 +112,7 @@ export type EngineMessage = { v: number; re?: number } & (
   | { event: 'marker_added'; data: Marker }
   | { event: 'review_ready'; data: Review }
   | { event: 'review_failed'; data: { message: string } }
-  | { event: 'clip_info'; data: { path: string; thumb: string | null; duration_secs: number | null; error: string | null } }
+  | { event: 'clip_info'; data: { path: string; duration_secs: number | null; error: string | null } }
   | { event: 'audio_devices'; data: { inputs: AudioDevice[]; outputs: AudioDevice[]; apps: AudioApp[] } }
   | { event: 'stems_done'; data: { path: string; folder: string | null; files: string[]; error: string | null } }
   | { event: 'screenshot_saved'; data: { path: string } }

@@ -163,8 +163,8 @@
         </div>
       {/if}
       <div class="field">
-        <div class="lbl"><div>Play a sound when a marker is added</div><div class="hint">Kept out of your recordings. A microphone near your speakers can still hear it.</div></div>
-        <Toggle checked={s.markers.sound} label="Marker sound" onchange={v => updateSettings({ markers: { ...s.markers, sound: v } })} />
+        <div class="lbl"><div>Play a sound when a hotkey works</div><div class="hint">Instant confirmation when you save a clip, add a marker, take a screenshot or start/stop a session. Kept out of your recordings. A microphone near your speakers can still hear it.</div></div>
+        <Toggle checked={s.markers.sound} label="Hotkey sound" onchange={v => updateSettings({ markers: { ...s.markers, sound: v } })} />
       </div>
       {#if s.markers.sound}
         <div class="field sub">

@@ -12,6 +12,7 @@ pub mod mic;
 pub mod mux;
 pub mod overlay;
 pub mod pipeline;
+pub mod probe;
 pub mod ring;
 pub mod save;
 pub mod shot;
@@ -19,7 +20,6 @@ pub mod sound;
 pub mod stems;
 pub mod storage;
 pub mod targets;
-pub mod thumb;
 pub mod video;
 pub mod wgc;
 
@@ -116,7 +116,7 @@ impl Engine {
                 && match kind {
                     Kind::Recording => c.notices.recording_started,
                     Kind::Saved if title.starts_with("Marker") => c.notices.marker,
-                    Kind::Saved => c.notices.saved,
+                    Kind::Working | Kind::Saved => c.notices.saved,
                     Kind::Failed => c.notices.problems,
                 }
         });
@@ -124,6 +124,14 @@ impl Engine {
             if let Some(o) = &self.overlay {
                 o.show(Notice { title, detail, kind });
             }
+        }
+    }
+
+    /// Short confirmation sound the moment a hotkey action is accepted (uses the same
+    /// "confirmation sound" setting, device and volume as markers). Never recorded.
+    fn ack_sound(&self) {
+        if let Some(m) = self.cfg.as_ref().map(|c| &c.markers).filter(|m| m.sound) {
+            sound::play_chime(m.sound_volume, m.sound_device.clone());
         }
     }
 
@@ -214,17 +222,11 @@ impl Engine {
                 });
             }
             Command::ClipInfo { path } => {
-                let root = self.cfg.as_ref().map(|c| PathBuf::from(&c.capture_root)).unwrap_or_default();
                 let emit = self.emit.clone();
                 std::thread::spawn(move || {
-                    let ev = match thumb::clip_info(&root, Path::new(&path)) {
-                        Ok(i) => Event::ClipInfo {
-                            path,
-                            thumb: Some(i.thumb.to_string_lossy().into_owned()),
-                            duration_secs: Some(i.duration_secs),
-                            error: None,
-                        },
-                        Err(e) => Event::ClipInfo { path, thumb: None, duration_secs: None, error: Some(e) },
+                    let ev = match probe::duration_secs(Path::new(&path)) {
+                        Ok(d) => Event::ClipInfo { path, duration_secs: Some(d), error: None },
+                        Err(e) => Event::ClipInfo { path, duration_secs: None, error: Some(e) },
                     };
                     emit(Message::new(re, ev));
                 });
@@ -285,6 +287,10 @@ impl Engine {
     fn configure(&mut self, cfg: EngineConfig) {
         if let Some(h) = &self.hotkey {
             h.set(bindings(&cfg));
+        }
+        if self.cfg.as_ref().is_none_or(|old| old.capture_root != cfg.capture_root) && !cfg.capture_root.trim().is_empty() {
+            // Older versions kept `<root>\Clips\<Game>`; move those into `<root>\<Game>\Clips`.
+            storage::migrate_layout(Path::new(&cfg.capture_root));
         }
         let restart = match &self.cfg {
             Some(old) => {
@@ -386,6 +392,7 @@ impl Engine {
         };
         if p.start_session() {
             let game = p.shared.game_name.clone();
+            self.ack_sound();
             self.notice(Kind::Recording, format!("Recording session · {game}"), "Press the same key again to stop and save it".into());
         }
     }
@@ -403,6 +410,7 @@ impl Engine {
         let emit = self.emit.clone();
         let overlay = self.overlay.clone().filter(|_| self.cfg.as_ref().is_some_and(|c| c.overlay));
         let game = p.shared.game_name.clone();
+        let game_now = game.clone();
         let stems = self.editor_audio_files();
         let requested = p.stop_session(
             move |r| {
@@ -427,6 +435,8 @@ impl Engine {
             id,
         );
         if let Some(secs) = requested {
+            self.ack_sound();
+            self.notice(Kind::Working, format!("Saving session · {}", fmt_secs(secs)), game_now);
             self.send(re, Event::SaveStarted { save_id: id, requested_secs: secs });
         }
     }
@@ -438,6 +448,7 @@ impl Engine {
         };
         match shot::save(&p.gpu, &p.capture, &p.shared.root, &p.shared.game_name) {
             Ok(path) => {
+                self.ack_sound();
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 self.notice(Kind::Saved, "Screenshot saved".into(), name);
                 self.send(re, Event::ScreenshotSaved { path: path.to_string_lossy().into_owned() });
@@ -498,6 +509,7 @@ impl Engine {
         let flags = self.cfg.as_ref().map(|c| (c.overlay && c.notices.saved, c.overlay && c.notices.problems)).unwrap_or((false, false));
         let overlay = self.overlay.clone();
         let game = p.shared.game_name.clone();
+        let game_now = game.clone();
         let stems = self.editor_audio_files();
         let requested = p.request_save(
             range,
@@ -530,6 +542,10 @@ impl Engine {
             },
             id,
         );
+        // Immediate feedback: the key press is confirmed now; "Clip saved" replaces this notice
+        // once the file is written and verified.
+        self.ack_sound();
+        self.notice(Kind::Working, format!("Saving clip · last {}", fmt_secs(requested)), game_now);
         self.send(re, Event::SaveStarted { save_id: id, requested_secs: requested });
     }
 
@@ -784,7 +800,7 @@ pub fn bindings(cfg: &EngineConfig) -> hotkey::Bindings {
     ]
 }
 
-/// Save a leftover session folder (crash / power loss) as `Clips\<Game>\..._Recovered.mp4`.
+/// Save a leftover session folder (crash / power loss) as `<Game>\Clips\..._Recovered.mp4`.
 /// Damaged segments are skipped; the folder is only deleted by the caller after success.
 fn recover_session(root: &Path, dir: &Path) -> Result<PathBuf, String> {
     let manifest: serde_json::Value = std::fs::read(dir.join("session.json"))

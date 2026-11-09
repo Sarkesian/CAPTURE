@@ -105,7 +105,7 @@ fn validate_destination(root: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Let the webviews play/view files inside the capture folder only (reviews, clips, thumbs).
+/// Let the webviews play/view files inside the capture folder only (reviews, clips, screenshots).
 fn allow_media(app: &AppHandle, root: &str) {
     if !root.trim().is_empty() {
         let _ = app.asset_protocol_scope().allow_directory(root, true);

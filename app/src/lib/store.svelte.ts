@@ -17,7 +17,7 @@ export const app = $state({
   review: null as Review | null,
   reviewLoading: false,
   reviewError: null as string | null,
-  clipInfo: {} as Record<string, { thumb: string | null; duration: number | null }>,
+  clipInfo: {} as Record<string, { duration: number | null }>,
   tab: 'home' as 'home' | 'replay' | 'library' | 'settings',
   inputs: [] as AudioDevice[],
   outputs: [] as AudioDevice[],
@@ -127,7 +127,7 @@ function onEngine(m: EngineMessage) {
       app.micTest = m.data;
       break;
     case 'clip_info':
-      app.clipInfo[m.data.path] = { thumb: m.data.thumb, duration: m.data.duration_secs };
+      app.clipInfo[m.data.path] = { duration: m.data.duration_secs };
       break;
   }
 }
@@ -153,7 +153,7 @@ export const releaseReview = () => { app.review = null; return engine('release_r
 export const saveRange = (start: number, end: number) => engine('save_range', { start, end });
 export function requestClipInfo(path: string) {
   if (!(path in app.clipInfo)) {
-    app.clipInfo[path] = { thumb: null, duration: null };
+    app.clipInfo[path] = { duration: null };
     engine('clip_info', { path });
   }
 }

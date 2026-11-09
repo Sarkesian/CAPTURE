@@ -1,11 +1,14 @@
 //! Capture-root layout, safe names and disk-space queries.
 //!
 //! ```text
-//! <root>\Buffer\<session>\seg_000001.ts   disposable ring (cap enforced)
-//! <root>\Clips\<Game Name>\YYYY-MM-DD_HH-MM-SS_<Game>_Clip.mp4   permanent, never auto-deleted
-//! <root>\Sessions\<Game Name>\...          (Phase 3)
-//! <root>\Data\                             small rebuildable settings/index
+//! <root>\Buffer\<session>\seg_000001.ts                     disposable ring (cap enforced)
+//! <root>\<Game Name>\Clips\YYYY-MM-DD_HH-MM-SS_<Game>_Clip.mp4  permanent, never auto-deleted
+//! <root>\<Game Name>\Sessions\...
+//! <root>\<Game Name>\Screenshots\...
 //! ```
+//!
+//! Each game folder is the parent of everything recorded for that game. Folder names that
+//! would collide with CAPTURE's own top-level folders (`Buffer`) get a trailing `_`.
 
 use std::path::{Path, PathBuf};
 
@@ -21,12 +24,56 @@ pub fn buffer_dir_for(root: &Path, buffer_root: Option<&str>) -> PathBuf {
     }
 }
 
+/// Sub-folders inside each game folder, in display order.
+pub const KINDS: [&str; 3] = ["Clips", "Sessions", "Screenshots"];
+
+/// `<root>\<Game>` — the parent folder for all of a game's recordings.
+pub fn game_dir(root: &Path, game: &str) -> PathBuf {
+    root.join(folder_name(game))
+}
+
 pub fn clips_dir(root: &Path, game: &str) -> PathBuf {
-    root.join("Clips").join(folder_name(game))
+    game_dir(root, game).join("Clips")
 }
 
 pub fn sessions_dir(root: &Path, game: &str) -> PathBuf {
-    root.join("Sessions").join(folder_name(game))
+    game_dir(root, game).join("Sessions")
+}
+
+pub fn screenshots_dir(root: &Path, game: &str) -> PathBuf {
+    game_dir(root, game).join("Screenshots")
+}
+
+/// One-time move from the old layout (`<root>\Clips|Sessions|Screenshots\<Game>\*`) to the
+/// game-first layout (`<root>\<Game>\Clips|Sessions|Screenshots\*`), and removal of the old
+/// `Data	humbs` cache. Files are renamed (same volume), never overwritten: a name already
+/// taken in the new folder stays where it is. Old folders are removed only once empty.
+/// Returns the number of entries moved.
+pub fn migrate_layout(root: &Path) -> usize {
+    let mut moved = 0;
+    for kind in KINDS {
+        let old_kind = root.join(kind);
+        let Ok(games) = std::fs::read_dir(&old_kind) else { continue };
+        for g in games.flatten().filter(|e| e.path().is_dir()) {
+            let game = g.file_name().to_string_lossy().into_owned();
+            let dest = game_dir(root, &game).join(kind);
+            for f in std::fs::read_dir(g.path()).into_iter().flatten().flatten() {
+                let target = dest.join(f.file_name());
+                if target.exists() || std::fs::create_dir_all(&dest).is_err() {
+                    continue;
+                }
+                if std::fs::rename(f.path(), &target).is_ok() {
+                    moved += 1;
+                }
+            }
+            let _ = std::fs::remove_dir(g.path()); // only succeeds when empty
+        }
+        let _ = std::fs::remove_dir(&old_kind);
+    }
+    let data = root.join("Data");
+    let _ = std::fs::remove_dir_all(data.join("thumbs"));
+    let _ = std::fs::remove_dir(&data);
+    moved
 }
 
 /// Folder-safe, human-readable name: keeps spaces and most punctuation, strips characters
@@ -50,7 +97,8 @@ pub fn folder_name(name: &str) -> String {
         .any(|r| upper == *r)
         || ((upper.starts_with("COM") || upper.starts_with("LPT"))
             && upper.len() == 4
-            && upper.as_bytes()[3].is_ascii_digit());
+            && upper.as_bytes()[3].is_ascii_digit())
+        || upper == "BUFFER";
     if s.is_empty() {
         "Unknown".into()
     } else if reserved {
@@ -154,6 +202,7 @@ mod tests {
         assert_eq!(folder_name("CON"), "CON_");
         assert_eq!(folder_name("com1"), "com1_");
         assert_eq!(folder_name("Company"), "Company");
+        assert_eq!(folder_name("Buffer"), "Buffer_");
         assert_eq!(folder_name("..."), "Unknown");
         assert_eq!(folder_name(""), "Unknown");
         assert_eq!(folder_name(&"x".repeat(200)).len(), 80);
@@ -165,6 +214,41 @@ mod tests {
             clip_file_name("2026-11-08_14-32-15", "Cyberpunk 2077", "Clip"),
             "2026-11-08_14-32-15_Cyberpunk-2077_Clip.mp4"
         );
+    }
+
+    #[test]
+    fn game_folder_is_the_parent() {
+        let r = Path::new(r"G:\Captures");
+        assert_eq!(clips_dir(r, "The Witcher 3"), Path::new(r"G:\Captures\The Witcher 3\Clips"));
+        assert_eq!(sessions_dir(r, "The Witcher 3"), Path::new(r"G:\Captures\The Witcher 3\Sessions"));
+        assert_eq!(screenshots_dir(r, "The Witcher 3"), Path::new(r"G:\Captures\The Witcher 3\Screenshots"));
+    }
+
+    #[test]
+    fn migrate_moves_old_layout_and_drops_thumbs() {
+        let root = std::env::temp_dir().join(format!("capture-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Clips").join("Game A").join("x_Audio")).unwrap();
+        std::fs::write(root.join("Clips").join("Game A").join("x.mp4"), b"1").unwrap();
+        std::fs::create_dir_all(root.join("Screenshots").join("Game A")).unwrap();
+        std::fs::write(root.join("Screenshots").join("Game A").join("s.png"), b"1").unwrap();
+        // A name already taken in the new place is left alone.
+        std::fs::create_dir_all(root.join("Sessions").join("Game B")).unwrap();
+        std::fs::write(root.join("Sessions").join("Game B").join("dup.mp4"), b"old").unwrap();
+        std::fs::create_dir_all(root.join("Game B").join("Sessions")).unwrap();
+        std::fs::write(root.join("Game B").join("Sessions").join("dup.mp4"), b"new").unwrap();
+        std::fs::create_dir_all(root.join("Data").join("thumbs")).unwrap();
+        std::fs::write(root.join("Data").join("thumbs").join("t.jpg"), b"1").unwrap();
+
+        assert_eq!(migrate_layout(&root), 3);
+        assert!(root.join("Game A").join("Clips").join("x.mp4").is_file());
+        assert!(root.join("Game A").join("Clips").join("x_Audio").is_dir());
+        assert!(root.join("Game A").join("Screenshots").join("s.png").is_file());
+        assert!(!root.join("Clips").exists() && !root.join("Screenshots").exists());
+        assert_eq!(std::fs::read(root.join("Game B").join("Sessions").join("dup.mp4")).unwrap(), b"new");
+        assert!(root.join("Sessions").join("Game B").join("dup.mp4").is_file(), "never overwritten");
+        assert!(!root.join("Data").exists());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

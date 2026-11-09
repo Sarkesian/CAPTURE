@@ -16,7 +16,8 @@ const waitFor = async (pred, ms = 30000) => { const u = Date.now() + ms; while (
 const state = () => [...events].reverse().find(m => m.event === 'state')?.data;
 let fail = 0;
 const check = (ok, what) => { console.log(`${ok ? 'PASS' : 'FAIL'}  ${what}`); if (!ok) fail++; };
-const files = sub => { const d = path.join(root, sub); return existsSync(d) ? readdirSync(d, { recursive: true }).filter(f => String(f).endsWith('.mp4')).map(f => path.join(d, String(f))) : []; };
+// <root>\<Game>\<sub>\*.mp4 (each game folder holds Clips / Sessions / Screenshots).
+const files = sub => existsSync(root) ? readdirSync(root, { recursive: true }).map(String).filter(f => f.endsWith('.mp4') && f.split(path.sep).at(-2) === sub && !f.startsWith('Buffer')) : [];
 
 const base = { capture_root: root, replay_secs: 20, target: { kind: 'display', index: 0 }, quality: 'balanced', fps: 60, capture_cursor: false,
   audio: { game_audio: true }, save_hotkey: '', overlay: false, buffer_cap_bytes: 4e9, min_free_bytes: 5e9 };

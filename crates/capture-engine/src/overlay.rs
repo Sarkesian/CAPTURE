@@ -20,6 +20,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Recording,
+    /// Hotkey accepted, work in progress ("Saving clip…"). Shown the moment the key is pressed.
+    Working,
     Saved,
     Failed,
 }
@@ -176,6 +178,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if let Some(n) = CURRENT.lock().unwrap().clone() {
                 let dot = match n.kind {
                     Kind::Recording => rgb(239, 68, 68),
+                    Kind::Working => rgb(96, 165, 250),
                     Kind::Saved => rgb(52, 211, 153),
                     Kind::Failed => rgb(251, 191, 36),
                 };

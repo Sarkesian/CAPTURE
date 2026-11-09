@@ -58,11 +58,11 @@ pub enum Command {
     MicMonitor { enabled: bool, #[serde(default)] device: Option<String> },
     /// Record ~3 s from the microphone, then play it back on the default output.
     MicTest { #[serde(default)] device: Option<String> },
-    /// Save the current captured frame as PNG in Screenshots\<Game>\.
+    /// Save the current captured frame as PNG in <Game>\Screenshots\.
     Screenshot,
     /// "Editor audio files": synchronized WAV per isolated track next to the clip.
     ExportStems { path: String },
-    /// Thumbnail + duration for a saved clip (answered with `ClipInfo`).
+    /// Duration of a saved clip (answered with `ClipInfo`).
     ClipInfo { path: String },
     ListTargets,
     GetState,
@@ -89,7 +89,7 @@ pub enum Event {
     MarkerAdded(Marker),
     ReviewReady(Review),
     ReviewFailed { message: String },
-    ClipInfo { path: String, thumb: Option<String>, duration_secs: Option<f64>, error: Option<String> },
+    ClipInfo { path: String, duration_secs: Option<f64>, error: Option<String> },
     AudioDevices { inputs: Vec<AudioDevice>, outputs: Vec<AudioDevice>, apps: Vec<AudioApp> },
     /// Real audio levels since the previous `Levels` message (peak and RMS, linear 0..1).
     Levels { tracks: Vec<Level>, mic_monitor: Option<Level> },
@@ -244,7 +244,7 @@ pub struct Marker {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EngineConfig {
-    /// Root folder that holds `Buffer`, `Clips`, `Sessions`, `Data`.
+    /// Root folder that holds `Buffer` and one folder per game (`<Game>\Clips|Sessions|Screenshots`).
     pub capture_root: String,
     /// Optional separate folder for the temporary buffer (e.g. a faster drive). Its `Buffer`
     /// subfolder is used; `None` = `<capture_root>\Buffer`.

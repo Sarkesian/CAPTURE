@@ -1,4 +1,4 @@
-//! Filesystem-backed library: `<root>\Clips|Sessions|Screenshots\<Game>\*`. No private index:
+//! Filesystem-backed library: `<root>\<Game>\Clips|Sessions|Screenshots\*`. No private index:
 //! the folders are the source of truth, so nothing is lost if CAPTURE's data is deleted.
 
 use std::path::{Path, PathBuf};
@@ -33,10 +33,10 @@ pub fn kind_dir(kind: &str) -> Option<(&'static str, &'static str, &'static str)
 pub fn list(root: &Path, kind: &str, limit: usize) -> Vec<ClipEntry> {
     let mut out = Vec::new();
     let Some((dir, ext, k)) = kind_dir(kind) else { return out };
-    let Ok(games) = std::fs::read_dir(root.join(dir)) else { return out };
+    let Ok(games) = std::fs::read_dir(root) else { return out };
     for g in games.flatten().filter(|e| e.path().is_dir()) {
         let game = g.file_name().to_string_lossy().into_owned();
-        for f in std::fs::read_dir(g.path()).into_iter().flatten().flatten() {
+        for f in std::fs::read_dir(g.path().join(dir)).into_iter().flatten().flatten() {
             let p = f.path();
             if !p.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext)) {
                 continue; // skips in-progress *.partial files and sidecars
