@@ -36,8 +36,10 @@
   const voiceState = $derived<St>(!s.voice_enabled ? 'off' : !s.voice_app ? 'idle' : voiceT?.error ? 'error' : voiceT ? 'live' : 'idle');
   const otherState = $derived<St>(!s.other_enabled ? 'off' : otherT?.error ? 'error' : otherT ? 'live' : 'idle');
 
-  // Level monitor only while the panel is open, the mic is on, and nothing is recording it.
-  const wantMonitor = $derived(s.mic_enabled && !micT);
+  // Level monitor only while the panel is visible, the mic is on, and nothing is recording
+  // it. A hidden window (the overlay, a main window started in the tray) never opens the mic.
+  let pageVisible = $state(!document.hidden);
+  const wantMonitor = $derived(s.mic_enabled && !micT && pageVisible);
   let monitoring = false;
   $effect(() => {
     const want = wantMonitor, dev = s.mic_device;
@@ -45,9 +47,11 @@
     else if (monitoring) { engine('mic_monitor', { enabled: false }); monitoring = false; }
   });
   onMount(() => {
+    const vis = () => { pageVisible = !document.hidden; };
+    document.addEventListener('visibilitychange', vis);
     engine('list_audio');
     const t = setInterval(() => { if (!document.hidden) engine('list_audio'); }, 5000);
-    return () => { clearInterval(t); if (monitoring) engine('mic_monitor', { enabled: false }); };
+    return () => { clearInterval(t); document.removeEventListener('visibilitychange', vis); if (monitoring) engine('mic_monitor', { enabled: false }); };
   });
 
   const vol = (key: 'game' | 'mic' | 'voice', v: number) => updateSettings({ volumes: { ...s.volumes, [key]: v } });

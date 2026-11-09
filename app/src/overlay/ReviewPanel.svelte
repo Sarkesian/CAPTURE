@@ -29,7 +29,10 @@
   onMount(() => {
     prepareReview();
     const onKey = (ev: KeyboardEvent) => {
-      if ((ev.target as HTMLElement)?.tagName === 'INPUT') return;
+      // Leave keys to fields and lists that use them, and Space to a focused button.
+      const t = ev.target as HTMLElement;
+      if (t?.closest?.('input, textarea, select, [contenteditable]')) return;
+      if (ev.key === ' ' && t?.closest?.('button')) return;
       if (ev.key === ' ') { ev.preventDefault(); toggle(); }
       if (ev.key === 'ArrowLeft') { ev.preventDefault(); step(-5); }
       if (ev.key === 'ArrowRight') { ev.preventDefault(); step(5); }

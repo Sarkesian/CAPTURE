@@ -59,7 +59,8 @@ export async function init() {
   for (const n of b.notices) toast(n, n.startsWith('CAPTURE was updated') ? 'ok' : 'error', 12000);
   await listen<EngineMessage>('engine', e => onEngine(e.payload));
   await listen<Settings>('settings', e => { app.settings = e.payload; checkPaths(); });
-  await listen<string>('engine_down', e => { app.engineDown = e.payload; });
+  // The engine's last state is no longer true (no recording, no session, nothing saving).
+  await listen<string>('engine_down', e => { app.engineDown = e.payload; app.engine = null; });
   await listen<string>('goto', e => { app.tab = e.payload as typeof app.tab; refreshClips(); });
   refreshTargets();
   refreshClips();

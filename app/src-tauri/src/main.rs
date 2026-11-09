@@ -1044,6 +1044,8 @@ fn main() {
                 Arc::new(move |m| on_message(&h1, m)),
                 Arc::new(move || apply(&h2.state::<AppState>())),
                 Arc::new(move |msg| {
+                    // What the stopped engine last reported (recording, session, saves) is gone.
+                    *h3.state::<AppState>().last_state.lock().unwrap() = None;
                     *h3.state::<AppState>().engine_down.lock().unwrap() = Some(msg.clone());
                     let _ = h3.emit("engine_down", msg);
                     refresh_tray(&h3);

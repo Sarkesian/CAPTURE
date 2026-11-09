@@ -1,6 +1,6 @@
 <script lang="ts">
   // Library: Clips | Sessions | Screenshots, straight from the capture folder (no private index).
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { convertFileSrc, invoke } from '@tauri-apps/api/core';
   import {
     app, engine, openPath, revealPath, copyPath, openCaptureFolder, deleteClip, requestClipInfo, toast, fmtBytes, fmtDuration,
@@ -21,9 +21,16 @@
   let confirmDelete = $state<string | null>(null);
   let renaming = $state<string | null>(null);
 
+  // Only the newest request may fill the list: a slow answer for the previous tab must not
+  // replace the current one.
+  let req = 0;
   async function load() {
-    try { items = await invoke<ClipEntry[]>('list_clips', { kind }); } catch (e) { toast(String(e), 'error'); }
-    loaded = true;
+    const k = kind, mine = ++req;
+    try {
+      const r = await invoke<ClipEntry[]>('list_clips', { kind: k });
+      if (mine === req) items = r;
+    } catch (e) { if (mine === req) toast(String(e), 'error'); }
+    if (mine === req) loaded = true;
   }
   onMount(() => {
     const close = (ev: Event) => { if (!(ev.target as HTMLElement).closest?.('.menu, .more')) { menu = null; confirmDelete = null; } };
@@ -32,9 +39,9 @@
     window.addEventListener('keydown', esc);
     return () => { window.removeEventListener('pointerdown', close); window.removeEventListener('keydown', esc); };
   });
-  $effect(() => { kind; loaded = false; load(); });
+  $effect(() => { kind; loaded = false; untrack(load); });
   // Refresh when files change (saves, editor audio files, screenshots).
-  $effect(() => { app.libraryVersion; load(); });
+  $effect(() => { app.libraryVersion; untrack(load); });
 
   const games = $derived([...new Set(items.map(c => c.game))].sort((a, b) => a.localeCompare(b)));
   const shown = $derived.by(() => {

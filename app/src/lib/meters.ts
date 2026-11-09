@@ -46,6 +46,10 @@ function ensureListener() {
     kick();
   });
   document.addEventListener('visibilitychange', sync);
+  // A restarted engine has forgotten who wanted levels: subscribe again.
+  listen<{ event: string }>('engine', e => {
+    if (e.payload.event === 'hello') { subscribed = false; sync(); }
+  });
 }
 
 function sync() {
