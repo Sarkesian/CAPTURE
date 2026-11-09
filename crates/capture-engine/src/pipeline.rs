@@ -242,7 +242,18 @@ impl Pipeline {
             SourceKind::Monitor(h) => wgc::Source::Monitor(h),
         };
         let capture = Arc::new(wgc::Capture::start(&gpu, source, s.cursor)?);
-        let encoder = VideoEncoder::open(gpu.clone(), capture.width, capture.height, s.fps, s.quality, s.software_encoder)?;
+        let mut encoder = VideoEncoder::open(gpu.clone(), capture.width, capture.height, s.fps, s.quality, s.software_encoder)?;
+        // A CPU encoder cannot sustain more than ~1080p60 (measured: 4K60 software encode reached
+        // ~48 fps and dropped frames). Cap it at 30 fps above that, and say so, rather than
+        // producing stuttering output.
+        let load = capture.width as u64 * capture.height as u64 * s.fps as u64;
+        if !encoder.info.hardware && s.fps > 30 && load > 1920 * 1080 * 60 {
+            encoder = VideoEncoder::open(gpu.clone(), capture.width, capture.height, 30, s.quality, s.software_encoder)?;
+            encoder.info.rejected.push(format!(
+                "{} fps: too much for a CPU encoder at {}x{}; recording at 30 fps",
+                s.fps, capture.width, capture.height
+            ));
+        }
         let info = encoder.info.clone();
 
         let buffer = storage::buffer_dir(&s.root);
@@ -310,7 +321,7 @@ impl Pipeline {
         };
         let video_thread = {
             let (shared, capture, stop) = (shared.clone(), capture.clone(), stop.clone());
-            let fps = s.fps;
+            let fps = info.fps;
             std::thread::Builder::new()
                 .name("video".into())
                 .spawn(move || run_video(shared, capture, encoder, fps, stop, tx))

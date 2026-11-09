@@ -4,8 +4,9 @@ Windows-first, local-first game recording and instant replay. Press a hotkey and
 `Captures\Clips\<Game>\`, with a playable Preview Mix plus separate Game / Microphone / Voice Chat tracks
 for editing.
 
-**Status:** Phase 1 playtest build. A portable app records instant replays with a Preview Mix plus an isolated Game Audio track.
-Run `dist\CAPTURE-0.1.0\CAPTURE.exe` (build it with `scripts\package-portable.ps1`). See `docs/QUICKSTART.md`.
+**Status:** v0.3: instant replay, overlay with review timeline and markers, sessions, screenshots, separate
+game/mic/voice-chat tracks, editor audio files, library. See `docs/STATUS.md` for every requirement and its evidence.
+Build with `scripts\package-portable.ps1` → `dist\CAPTURE-<version>\CAPTURE.exe`. User guide: `docs/QUICKSTART.md`.
 
 | Doc | Purpose |
 |---|---|
@@ -13,6 +14,9 @@ Run `dist\CAPTURE-0.1.0\CAPTURE.exe` (build it with `scripts\package-portable.ps
 | `docs/spec/CAPTURE_Agent_Prompt.md` | Build brief |
 | `docs/PHASE0_CAPABILITY_REPORT.md` | What was measured on this machine |
 | `docs/ADR-0001-capture-architecture.md` | Native WGC + WASAPI + LGPL libav, chosen over libobs |
+| `docs/STATUS.md` | **Current status: every requirement, tested evidence, gaps** |
+| `docs/spec/CAPTURE_Overlay_Addendum.md` | Overlay & replay spec |
+| `docs/OVERLAY_REPORT.md` | Overlay milestone report |
 | `docs/PHASE1_REPORT.md` | What works now, evidence, limitations, playtest steps |
 | `docs/QUICKSTART.md` | User quick start (also shipped in the build) |
 | `docs/FRAMECUT_IMPORT_CONTRACT.md` | Draft track/stem contract for FrameCut (not implemented there) |
@@ -31,6 +35,8 @@ powershell -ExecutionPolicy Bypass -File scripts\package-portable.ps1   # -> dis
 | `crates/capture-protocol` | Versioned UI <-> worker messages |
 | `crates/capture-engine` | Capture, encode, replay ring, save; `capture-worker` binary |
 | `app/` | Tauri 2 + Svelte 5 UI (`CAPTURE.exe`) |
-| `scripts/e2e-worker.mjs`, `scripts/ui-drive.mjs` | Headless worker scenario and real-UI acceptance drive |
+| `scripts/run-acceptance.ps1` | Real-app acceptance suites (auto detection, overlay) |
+| `scripts/e2e-*.mjs` | Worker-level tests: replay, markers, review, session, audio, stems, crash, low disk |
+| `scripts/soak.mjs` | Long-run soak (memory, CPU, buffer, sync) |
 
 Spikes live in `spikes/`. Their media output goes to `spikes/out/` (git-ignored, because it contains real screen content).
