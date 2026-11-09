@@ -4,10 +4,11 @@ Windows-first, local-first game recording and instant replay. Press a hotkey and
 `Captures\<Game>\Clips\`, with a playable Preview Mix plus separate Game / Microphone / Voice Chat tracks
 for editing.
 
-**Status:** v0.3: instant replay, overlay with review timeline and markers, sessions, screenshots, separate
-game/mic/voice-chat tracks, editor audio files, library. See `docs/STATUS.md` for every requirement and its evidence.
-Build with `scripts\package-portable.ps1` (portable zip) and `scriptsuild-installer.ps1` (setup.exe). Layout, updates,
-uninstall and test results: `docs/DISTRIBUTION.md`. User guide: `docs/QUICKSTART.md`.
+**Status:** v0.5.1 release candidate (not a verified release: unsigned, tested on one PC). Instant replay,
+overlay with review timeline and markers, sessions, screenshots, separate game/mic/voice-chat tracks, editor audio
+files, library, portable folder and per-user installer. See `docs/STATUS.md` for every requirement and its evidence
+and `docs/AUDIT_0.5.1.md` for the release audit.
+Build with `scripts\package-portable.ps1` (payload + zip) and `scripts\build-installer.ps1` (setup.exe). User guide: `docs/QUICKSTART.md`.
 
 | Doc | Purpose |
 |---|---|
@@ -21,6 +22,8 @@ uninstall and test results: `docs/DISTRIBUTION.md`. User guide: `docs/QUICKSTART
 | `docs/OVERLAY_REPORT.md` | Overlay milestone report |
 | `docs/PHASE1_REPORT.md` | What works now, evidence, limitations, playtest steps |
 | `docs/QUICKSTART.md` | User quick start (also shipped in the build) |
+| `docs/DISTRIBUTION.md` | Portable folder, installer, updates, uninstall, what is written where |
+| `docs/AUDIT_0.5.1.md` | Release-candidate audit: defects found and fixed, tests, limits |
 | `docs/FRAMECUT_IMPORT_CONTRACT.md` | Draft track/stem contract for FrameCut (not implemented there) |
 
 ## Dev setup
@@ -30,7 +33,7 @@ powershell -ExecutionPolicy Bypass -File scripts\fetch-deps.ps1   # pinned FFmpe
 $env:RUSTUP_HOME='D:\Programs\Rust\rustup'; $env:CARGO_HOME='D:\Programs\Rust\cargo'
 cargo test --workspace                                              # unit tests
 powershell -ExecutionPolicy Bypass -File scripts\package-portable.ps1   # -> dist\CAPTURE-<version>\ + portable zip
-powershell -ExecutionPolicy Bypass -File scriptsuild-installer.ps1    # -> dist\CAPTURE-<version>-setup.exe
+powershell -ExecutionPolicy Bypass -File scriptsbuild-installer.ps1    # -> dist\CAPTURE-<version>-setup.exe
 node scripts\e2e-distribution.mjs <version> D:\some\work\dir          # portable + installer end to end
 ```
 
@@ -40,7 +43,8 @@ node scripts\e2e-distribution.mjs <version> D:\some\work\dir          # portable
 | `crates/capture-engine` | Capture, encode, replay ring, save; `capture-worker` binary |
 | `app/` | Tauri 2 + Svelte 5 UI (`CAPTURE.exe`) |
 | `scripts/run-acceptance.ps1` | Real-app acceptance suites (auto detection, overlay) |
-| `scripts/e2e-*.mjs` | Worker-level tests: replay, markers, review, session, audio, stems, crash, low disk |
+| `scripts/e2e-*.mjs` | Worker-level tests: replay, markers, review, session, audio, stems, crash, low disk, window closed, resize, colour; `e2e-lifecycle` / `e2e-distribution` drive the packaged app |
+| `scripts/validate-media.mjs` | Independent check of recordings with ffprobe/ffmpeg (full decode, A/V offsets) |
 | `scripts/soak.mjs` | Long-run soak (memory, CPU, buffer, sync) |
 
 Spikes live in `spikes/`. Their media output goes to `spikes/out/` (git-ignored, because it contains real screen content).

@@ -1,4 +1,4 @@
-# CAPTURE distribution: portable folder and Windows installer (v0.5.0)
+# CAPTURE distribution: portable folder and Windows installer (v0.5.1)
 
 One application payload, two ways to get it onto a PC. The installer deploys the exact files of
 the portable zip (verified against the same `manifest.json`), so recording behaviour, features and
@@ -36,7 +36,11 @@ go to the folders chosen in Settings and never into the app folder.
 not silently move its data. A native dialog explains the problem and offers to keep data in
 `%LOCALAPPDATA%\CAPTURE\Data` for that account (remembered in `fallback-for.txt` there) or quit.
 The installer refuses Program Files / Windows folders and drive roots up front, and checks the
-folder is writable without creating anything.
+folder is writable without creating anything. It also refuses a folder that already has a
+`Runtime`, `Resources`, `Data` or `licenses` folder but no `CAPTURE.exe` (another program's
+files), on the folder page and again in the install step for silent installs (exit code 2,
+nothing written). CAPTURE replaces those folders as a whole when updating and its uninstaller
+removes them, so they must be CAPTURE's own. (0.5.0 deleted such folders: fixed in 0.5.1.)
 
 ## Writes outside the app folder (complete list)
 
@@ -77,6 +81,9 @@ Not tested here.
 - Close hides to the tray (recording continues); Quit ends the UI and the engine.
 - Start with Windows = one per-user Run value. A value pointing to a moved copy is repointed on
   launch, but **not** when the target's drive is merely absent (portable copy on a USB drive).
+  A new version folder that imports the previous copy's settings (side-by-side update) also
+  takes over that copy's Run value on its first launch (0.5.1); an entry for any other existing
+  copy is left alone.
 
 ## Settings safety
 - Schema version 2. A file from another schema version is copied to `Settings\Backups\` before it
@@ -126,6 +133,10 @@ Running a newer `setup.exe` also upgrades an installed copy in place.
 - Files that could not be removed (locked) are listed.
 
 ## Test results (this machine, packaged builds)
+0.5.1 (audit pass, see `docs/AUDIT_0.5.1.md`): `e2e-distribution.mjs` **69/69** on the 0.5.1 zip and
+installer (now including the foreign-folder refusal), `e2e-lifecycle.mjs` **20/20** (now including
+the side-by-side Start-with-Windows move). The results below are for 0.5.0.
+
 - Unit tests: 58 pass (20 app: paths, migration, schema backup, ownership, update apply/rollback/
   tamper; 35 engine; 3 protocol).
 - `e2e-distribution.mjs`: **69/69**. Covers: zip = manifest; first run creates only `Data\`;

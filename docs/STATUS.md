@@ -1,11 +1,22 @@
-# CAPTURE status: requirement-by-requirement (v0.4.1)
+# CAPTURE status: requirement-by-requirement (v0.5.1 release candidate)
 
-**Date:** 2026-11-08 · **Branch:** `main` · **Build:** `dist\CAPTURE-0.4.1\` and `dist\CAPTURE-0.4.1-portable.zip`
+**Date:** 2026-11-08 · **Branch:** `audit/rc-hardening` · **Build:** `dist\CAPTURE-0.5.1\`, `dist\CAPTURE-0.5.1-portable.zip`, `dist\CAPTURE-0.5.1-setup.exe`
 **Specs:** `docs/spec/CAPTURE_Design.md`, `docs/spec/CAPTURE_Agent_Prompt.md`, `docs/spec/CAPTURE_Overlay_Addendum.md`, UX/UI overhaul brief (see `docs/UX_AUDIT.md`)
 **Test machine:** Windows 11 Pro 26200, i5-13600KF, 32 GB, RTX 4090 (driver 617.14), 4K@143 Hz.
 
-v0.4.1 = the v0.4.0 UX/UI overhaul plus the stabilization pass (branch `stabilize/post-redesign`, merged after
-the overhaul was committed). Known-good checkpoints: tag `v0.3.0-baseline` (`53ebc58`) and `d289e92` (v0.4.0).
+**0.5.1 = the 0.5.0 distribution work plus a full release audit.** What was found, fixed and tested, the
+test results on the packaged 0.5.1 build, and what remains unverified: **`docs/AUDIT_0.5.1.md`**. The
+distribution (portable + installer): `docs/DISTRIBUTION.md`. The sections below are the requirement
+history from 0.3–0.4.1; where 0.5.1 changed behaviour, the audit report says so.
+
+Changes in 0.5.1 a user can notice:
+- Clips start with sound (previously 0.1–0.6 s of silence at the start).
+- A game that changes resolution or window size is recorded whole (scaled), not cropped.
+- Saving after the game closed is instant and complete, and can be repeated until the next game starts.
+- Auto mode no longer throws the replay away when a launcher briefly comes to the front.
+- Start with Windows moves to a new version folder; settings changes can't undo each other.
+- The installer refuses folders holding another program's `Runtime`/`Resources`/`Data`.
+- Software-encoder clips have correct colour tags; editor WAVs stay in sync across gaps.
 
 ## Stabilization pass (v0.4.1): what changed and how it was verified
 | Area | Change | Evidence |
@@ -114,10 +125,10 @@ Legend: ✅ done and tested on this machine · 🟡 done, but only partly verifi
 ## Storage, privacy, packaging
 | Requirement | Status | Evidence |
 |---|---|---|
-| Nothing bulky on C: | ✅ | Settings + WebView2 profile in `<exe folder>\data`. Search of AppData/Temp/registry found nothing. The startup entry exists only when you enable it. |
+| Nothing bulky on C: | ✅ | Settings + WebView2 profile in `<exe folder>\Data` (0.5 layout). Search of AppData/Temp/registry found nothing. The startup entry exists only when you enable it. |
 | Destination validated before use; files never moved | ✅ | `validate_destination` |
 | Saved clips never auto-deleted; low disk pauses buffering | ✅ | `e2e-lowdisk` 6/6: buffering pauses with a plain message, the running session is finalized, earlier clips are untouched, and buffering resumes when space is back |
-| Portable build + zip; unsigned | ✅ | Windows SmartScreen will warn (no code-signing certificate). There is no installer. |
+| Portable build + zip; unsigned | ✅ | Windows SmartScreen will warn (no code-signing certificate). Per-user installer since 0.5.0 (`docs/DISTRIBUTION.md`). |
 | Third-party licences | ✅ | `docs/THIRD_PARTY.md` (LGPL FFmpeg, unmodified DLLs) |
 
 ## UX/UI overhaul (v0.4.0)
