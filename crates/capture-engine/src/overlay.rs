@@ -34,7 +34,8 @@ pub struct Notice {
 }
 
 const WM_SHOW: u32 = WM_APP + 2;
-const SHOW_MS: u32 = 2800;
+const WM_HIDE_NOW: u32 = WM_APP + 3;
+pub const SHOW_MS: u32 = 2800;
 const ALPHA: u8 = 238;
 
 static CURRENT: Mutex<Option<Notice>> = Mutex::new(None);
@@ -63,6 +64,13 @@ impl Overlay {
         *self.pending.lock().unwrap() = Some(n);
         unsafe {
             let _ = PostThreadMessageW(self.tid, WM_SHOW, WPARAM(0), LPARAM(0));
+        }
+    }
+
+    /// Take the notice off the screen at once (it is continuing inside the game instead).
+    pub fn hide(&self) {
+        unsafe {
+            let _ = PostThreadMessageW(self.tid, WM_HIDE_NOW, WPARAM(0), LPARAM(0));
         }
     }
 }
@@ -116,6 +124,12 @@ fn run(pending: Arc<Mutex<Option<Notice>>>, ready: std::sync::mpsc::Sender<u32>)
                 if let Some(n) = pending.lock().unwrap().take() {
                     present(hwnd, n);
                 }
+                continue;
+            }
+            if msg.hwnd.is_invalid() && msg.message == WM_HIDE_NOW {
+                let _ = KillTimer(Some(hwnd), 1);
+                let _ = KillTimer(Some(hwnd), 2);
+                let _ = ShowWindow(hwnd, SW_HIDE);
                 continue;
             }
             let _ = TranslateMessage(&msg);
@@ -174,49 +188,108 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let dc = BeginPaint(hwnd, &mut ps);
             let mut rc = RECT::default();
             let _ = GetClientRect(hwnd, &mut rc);
-            let bg = CreateSolidBrush(rgb(22, 24, 30));
-            FillRect(dc, &rc, bg);
-            let _ = DeleteObject(bg.into());
             if let Some(n) = CURRENT.lock().unwrap().clone() {
-                let dot = match n.kind {
-                    Kind::Recording => rgb(239, 68, 68),
-                    Kind::Working => rgb(96, 165, 250),
-                    Kind::Saved => rgb(52, 211, 153),
-                    Kind::Failed => rgb(251, 191, 36),
-                };
-                let br = CreateSolidBrush(dot);
-                let old_b = SelectObject(dc, br.into());
-                let old_p = SelectObject(dc, GetStockObject(NULL_PEN));
-                let cy = s(23); // level with the title, however many detail lines follow
-                let _ = Ellipse(dc, s(18), cy - s(7), s(32), cy + s(7));
-                SelectObject(dc, old_p);
-                SelectObject(dc, old_b);
-                let _ = DeleteObject(br.into());
-                SetBkMode(dc, TRANSPARENT);
-                let font = |h: i32, wt: i32| {
-                    CreateFontW(-s(h), 0, 0, 0, wt, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, w!("Segoe UI"))
-                };
-                let f1 = font(16, 600);
-                let f2 = font(13, 400);
-                let draw = |f: HFONT, color: COLORREF, top: i32, bottom: i32, text: &str| {
-                    let old = SelectObject(dc, f.into());
-                    SetTextColor(dc, color);
-                    let mut r = RECT { left: s(44), top, right: rc.right - s(14), bottom };
-                    let mut wide: Vec<u16> = text.encode_utf16().collect();
-                    DrawTextW(dc, &mut wide, &mut r, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-                    SelectObject(dc, old);
-                };
-                draw(f1, rgb(240, 242, 246), s(11), s(34), &n.title);
-                for (i, line) in n.detail.lines().enumerate() {
-                    let top = s(35) + i as i32 * s(19);
-                    draw(f2, rgb(160, 168, 182), top, top + s(21), line);
-                }
-                let _ = DeleteObject(f1.into());
-                let _ = DeleteObject(f2.into());
+                paint(dc, rc, &n, SCALE_PCT.load(Ordering::Relaxed) as i32);
             }
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
+}
+
+/// Size of a notice at `scale` percent.
+fn notice_size(n: &Notice, scale: i32) -> (i32, i32) {
+    let s = |v: i32| v * scale / 100;
+    let extra = n.detail.lines().count().saturating_sub(1) as i32;
+    (s(380), s(66) + extra * s(19))
+}
+
+/// Draw notice `n` into `dc` (the window's client area or an off-screen bitmap of `rc`).
+unsafe fn paint(dc: HDC, rc: RECT, n: &Notice, scale: i32) {
+    let s = |v: i32| v * scale / 100;
+    let bg = CreateSolidBrush(rgb(22, 24, 30));
+    FillRect(dc, &rc, bg);
+    let _ = DeleteObject(bg.into());
+    let dot = match n.kind {
+        Kind::Recording => rgb(239, 68, 68),
+        Kind::Working => rgb(96, 165, 250),
+        Kind::Saved => rgb(52, 211, 153),
+        Kind::Failed => rgb(251, 191, 36),
+    };
+    let br = CreateSolidBrush(dot);
+    let old_b = SelectObject(dc, br.into());
+    let old_p = SelectObject(dc, GetStockObject(NULL_PEN));
+    let cy = s(23); // level with the title, however many detail lines follow
+    let _ = Ellipse(dc, s(18), cy - s(7), s(32), cy + s(7));
+    SelectObject(dc, old_p);
+    SelectObject(dc, old_b);
+    let _ = DeleteObject(br.into());
+    SetBkMode(dc, TRANSPARENT);
+    let font = |h: i32, wt: i32| CreateFontW(-s(h), 0, 0, 0, wt, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, w!("Segoe UI"));
+    let f1 = font(16, 600);
+    let f2 = font(13, 400);
+    let draw = |f: HFONT, color: COLORREF, top: i32, bottom: i32, text: &str| {
+        let old = SelectObject(dc, f.into());
+        SetTextColor(dc, color);
+        let mut r = RECT { left: s(44), top, right: rc.right - s(14), bottom };
+        let mut wide: Vec<u16> = text.encode_utf16().collect();
+        DrawTextW(dc, &mut wide, &mut r, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SelectObject(dc, old);
+    };
+    draw(f1, rgb(240, 242, 246), s(11), s(34), &n.title);
+    for (i, line) in n.detail.lines().enumerate() {
+        let top = s(35) + i as i32 * s(19);
+        draw(f2, rgb(160, 168, 182), top, top + s(21), line);
+    }
+    let _ = DeleteObject(f1.into());
+    let _ = DeleteObject(f2.into());
+}
+
+/// The notice as an image for the in-game hook: BGRA with straight alpha, rounded corners,
+/// the same look and opacity as the window notice. Returns (width, height, pixels).
+pub fn render_bitmap(n: &Notice, scale: u32) -> (u32, u32, Vec<u8>) {
+    let scale = scale.clamp(50, 400) as i32;
+    let (w, h) = notice_size(n, scale);
+    let mut out = vec![0u8; (w * h * 4) as usize];
+    unsafe {
+        let screen = GetDC(None);
+        let dc = CreateCompatibleDC(Some(screen));
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h, // top-down
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        if let Ok(bmp) = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+            let old = SelectObject(dc, bmp.into());
+            paint(dc, RECT { left: 0, top: 0, right: w, bottom: h }, n, scale);
+            let _ = GdiFlush();
+            std::ptr::copy_nonoverlapping(bits as *const u8, out.as_mut_ptr(), out.len());
+            SelectObject(dc, old);
+            let _ = DeleteObject(bmp.into());
+        }
+        let _ = DeleteDC(dc);
+        ReleaseDC(None, screen);
+    }
+    // Rounded corners (radius as the window's region), anti-aliased, at the window's opacity.
+    let r = (9 * scale / 100) as f32;
+    for y in 0..h {
+        for x in 0..w {
+            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+            let cx = px.clamp(r, w as f32 - r);
+            let cy = py.clamp(r, h as f32 - r);
+            let d = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt();
+            let coverage = (r + 0.5 - d).clamp(0.0, 1.0);
+            out[((y * w + x) * 4 + 3) as usize] = (coverage * ALPHA as f32).round() as u8;
+        }
+    }
+    (w as u32, h as u32, out)
 }

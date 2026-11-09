@@ -251,6 +251,9 @@ pub struct Pipeline {
     video_thread: Option<std::thread::JoinHandle<()>>,
     mux_thread: Option<std::thread::JoinHandle<()>>,
     pub(crate) gpu: Arc<Gpu>,
+    /// CAPTURE's in-game hook in the captured game, once loaded (window targets only; never
+    /// for games with anti-cheat). Dropped with the session, which unloads it from the game.
+    pub hook: Arc<Mutex<Option<crate::inject::GameHook>>>,
 }
 
 impl Pipeline {
@@ -360,6 +363,22 @@ impl Pipeline {
                 .spawn(move || run_video(shared, capture, encoder, fps, stop, tx))
                 .unwrap()
         };
+        // Load the in-game hook off this thread (it can take a moment), unless the session has
+        // already ended by the time it is in.
+        let hook = Arc::new(Mutex::new(None));
+        if let (SourceKind::Window(_), pid) = (&s.source, s.pid) {
+            if pid != 0 && in_game_overlay_enabled() {
+                let (slot, stop) = (hook.clone(), stop.clone());
+                let _ = std::thread::Builder::new().name("hook-attach".into()).spawn(move || match crate::inject::GameHook::attach(pid) {
+                    Ok(h) if !stop.load(Ordering::SeqCst) => {
+                        eprintln!("in-game overlay: loaded into process {pid}");
+                        *slot.lock().unwrap() = Some(h);
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("in-game overlay: not used for process {pid}: {e}"),
+                });
+            }
+        }
         Ok(Self {
             shared,
             capture,
@@ -369,6 +388,7 @@ impl Pipeline {
             video_thread: Some(video_thread),
             mux_thread: Some(mux_thread),
             gpu,
+            hook,
         })
     }
 
@@ -495,9 +515,15 @@ fn build_review(shared: &Shared) -> Result<Review, String> {
     }
 }
 
+/// `CAPTURE_IN_GAME_OVERLAY=0` turns the in-game hook off (diagnostics).
+fn in_game_overlay_enabled() -> bool {
+    std::env::var("CAPTURE_IN_GAME_OVERLAY").map_or(true, |v| v != "0")
+}
+
 impl Drop for Pipeline {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        *self.hook.lock().unwrap() = None; // unloads the hook from the game
         if let Some(t) = self.video_thread.take() {
             let _ = t.join();
         }

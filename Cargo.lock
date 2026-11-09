@@ -453,6 +453,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "capture-hook"
+version = "0.1.0"
+dependencies = [
+ "capture-protocol",
+ "iced-x86",
+ "windows",
+]
+
+[[package]]
+name = "capture-inject32"
+version = "0.1.0"
+dependencies = [
+ "windows",
+]
+
+[[package]]
 name = "capture-protocol"
 version = "0.1.0"
 dependencies = [
@@ -1604,6 +1620,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "hook-testapp"
+version = "0.1.0"
+dependencies = [
+ "windows",
+]
+
+[[package]]
 name = "html5ever"
 version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1723,6 +1746,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f31827a206f56af32e590ba56d5d2d085f558508192593743f16b2306495269f"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "iced-x86"
+version = "1.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c23ad4d19dca41180e835ef6fbd2c1ee655777eca086ad80dd517e0513322879"
+dependencies = [
+ "lazy_static",
 ]
 
 [[package]]
@@ -2064,6 +2096,12 @@ dependencies = [
  "bitflags 2.13.2",
  "serde",
 ]
+
+[[package]]
+name = "lazy_static"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "libappindicator"

@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod hook;
+
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Envelope for UI → worker.

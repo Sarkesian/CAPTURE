@@ -7,6 +7,8 @@
 #   CAPTURE.exe                           UI, tray, settings (Tauri 2 + WebView2)
 #   manifest.json                         version + SHA-256/size of every program file
 #   Runtime\capture-worker.exe            capture engine
+#   Runtime\capture-hook.dll, capture-hook32.dll, capture-inject32.exe
+#                                         in-game overlay hook (64/32-bit) and the 32-bit loader
 #   Runtime\av*.dll, sw*.dll              FFmpeg 8.1 LGPL (unmodified, shared)
 #   Runtime\WebView2\                     only with -WebView2Cab (Microsoft Fixed Version runtime)
 #   Resources\QUICKSTART.md, Resources\Licenses\
@@ -29,8 +31,11 @@ if (-not (Test-Path "$root\third_party\ffmpeg\bin\avcodec-62.dll")) {
 Push-Location $root
 try {
     if (-not $SkipBuild) {
-        cargo build --release -p capture-engine --bin capture-worker
+        cargo build --release -p capture-engine --bin capture-worker -p capture-hook
         if ($LASTEXITCODE) { throw 'worker build failed' }
+        # 32-bit games get a 32-bit hook, loaded by a 32-bit helper.
+        cargo build --release -p capture-hook -p capture-inject32 --target i686-pc-windows-msvc
+        if ($LASTEXITCODE) { throw '32-bit hook build failed (rustup target add i686-pc-windows-msvc)' }
         pnpm --dir app install --frozen-lockfile
         if ($LASTEXITCODE) { throw 'pnpm install failed' }
         pnpm --dir app tauri build --no-bundle
@@ -45,6 +50,9 @@ try {
     New-Item -ItemType Directory -Force "$out\Runtime", "$out\Resources\Licenses" | Out-Null
     Copy-Item target\release\CAPTURE.exe $out
     Copy-Item target\release\capture-worker.exe "$out\Runtime"
+    Copy-Item target\release\capture_hook.dll "$out\Runtime\capture-hook.dll"
+    Copy-Item target\i686-pc-windows-msvc\release\capture_hook.dll "$out\Runtime\capture-hook32.dll"
+    Copy-Item target\i686-pc-windows-msvc\release\capture-inject32.exe "$out\Runtime"
     foreach ($dll in 'avcodec-62', 'avformat-62', 'avutil-60', 'swresample-6', 'swscale-9') {
         Copy-Item "third_party\ffmpeg\bin\$dll.dll" "$out\Runtime"
     }

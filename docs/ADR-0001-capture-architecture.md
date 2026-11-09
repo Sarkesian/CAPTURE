@@ -69,3 +69,22 @@ Build **A**: a dedicated native Rust capture worker.
 - AAC: FFmpeg's native `aac` encoder is the default; `aac_mf` (OS-licensed) is the alternative if distribution
   requires it. **Open question for the user before any public release.**
 - No OBS code or binaries ship with CAPTURE. OBS appears in this repository only as an optional spike download.
+
+## Amendment (0.6.0, 2026-11-09): in-game hook for the overlay
+
+Exclusive-fullscreen games bypass the desktop compositor, so no window (the overlay, the notices) can appear over
+them. A tester playing Skyrim in fullscreen saw neither. Decision, made with the user: CAPTURE loads its own hook
+(`capture-hook.dll`, `capture-hook32.dll` through `capture-inject32.exe` for 32-bit games) into the captured game
+and draws inside the game's frames, the way Steam, Discord and NVIDIA overlays do. Video capture is unchanged (WGC).
+
+- **Never into games with anti-cheat** (EAC, BattlEye, Vanguard and others, detected from files next to the game
+  and modules loaded in it): those keep the window overlay and hotkeys. `CAPTURE_IN_GAME_OVERLAY=0` turns it off.
+- **Function hooks, not table patches:** the graphics functions themselves are hooked (`capture-hook/src/detour.rs`),
+  because other overlays give each device a private function table.
+- **Never unloaded:** unloading while other overlays chain through the same functions can crash the game (observed
+  once with Skyrim + Steam overlay). Between sessions the hook is dormant; the game gets a private copy of the DLL so
+  CAPTURE's own files stay replaceable.
+- **One notice, one place:** in the game while the hook draws there, otherwise the notice window, never both.
+- Covered: Direct3D 9 and 11, 32- and 64-bit. Not yet: Direct3D 12, Vulkan, OpenGL (window notices meanwhile).
+  Known limit: notices drawn in the game are also in the recording for their ~3 s.
+- Tests: `scripts/e2e-ingame-overlay.mjs` (test game windowed / exclusive fullscreen, or `attach:<game.exe>`).

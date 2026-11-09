@@ -8,6 +8,7 @@ pub mod detect;
 pub mod devices;
 pub mod gpu;
 pub mod hotkey;
+pub mod inject;
 pub mod mic;
 pub mod mux;
 pub mod overlay;
@@ -26,7 +27,7 @@ pub mod wgc;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use capture_protocol::*;
@@ -58,6 +59,9 @@ pub struct Engine {
     start_error: Option<Unresolved>,
     hotkey: Option<hotkey::HotkeyService>,
     overlay: Option<Arc<Overlay>>,
+    /// The notice now in the notice window and when it appeared: handed over to the in-game hook
+    /// if that starts drawing while the notice is still up (never shown in both places).
+    window_notice: Mutex<Option<(Notice, std::time::Instant)>>,
     emit: Emit,
     next_save_id: u64,
     fps_sample: (Instant, u64),
@@ -102,6 +106,7 @@ impl Engine {
             start_error: None,
             hotkey: None,
             overlay: None,
+            window_notice: Mutex::new(None),
             emit,
             next_save_id: 1,
             fps_sample: (Instant::now(), 0),
@@ -138,10 +143,43 @@ impl Engine {
                 }
         });
         if allowed {
+            let n = Notice { title, detail, kind };
+            // Inside the game when CAPTURE's hook is drawing there (the only way to be seen over
+            // exclusive fullscreen); otherwise the notice window.
+            if let Some(p) = &self.pipeline {
+                if let Some(h) = p.hook.lock().unwrap().as_ref().filter(|h| h.usable()) {
+                    let (w, hh, px) = overlay::render_bitmap(&n, 200);
+                    h.show(w, hh, 200, &px, overlay::SHOW_MS, 300);
+                    return;
+                }
+            }
             if let Some(o) = &self.overlay {
-                o.show(Notice { title, detail, kind });
+                *self.window_notice.lock().unwrap() = Some((n.clone(), std::time::Instant::now()));
+                o.show(n);
             }
         }
+    }
+
+    /// A notice shown in the window just before the in-game hook started drawing (typically
+    /// "Recording …" at the start of a session) moves into the game for the rest of its time:
+    /// over exclusive fullscreen the window cannot be seen at all.
+    fn hand_over_notice(&self) {
+        let mut slot = self.window_notice.lock().unwrap();
+        let Some((n, at)) = slot.as_ref() else { return };
+        let shown = at.elapsed().as_millis() as u32;
+        if shown + 500 >= overlay::SHOW_MS {
+            *slot = None;
+            return;
+        }
+        let Some(p) = &self.pipeline else { return };
+        let guard = p.hook.lock().unwrap();
+        let Some(h) = guard.as_ref().filter(|h| h.usable()) else { return };
+        let (w, hh, px) = overlay::render_bitmap(n, 200);
+        if let Some(o) = &self.overlay {
+            o.hide();
+        }
+        h.show(w, hh, 200, &px, overlay::SHOW_MS - shown, 300);
+        *slot = None;
     }
 
     /// Short confirmation sound the moment a hotkey action is accepted (uses the same
@@ -437,34 +475,34 @@ impl Engine {
         self.next_save_id += 1;
         let emit = self.emit.clone();
         let overlay = self.overlay.clone().filter(|_| self.cfg.as_ref().is_some_and(|c| c.overlay));
+        let hook = p.hook.clone();
         let game = p.shared.game_name.clone();
         let game_now = game.clone();
         let stems = self.editor_audio_files();
         let requested = p.stop_session(
             move |r| {
-                let (ev, n) = match r {
+                // Success was already confirmed when the key was pressed; only a failure is shown.
+                let ev = match r {
                     Ok((clip, _)) => {
                         if stems {
                             export_stems_after_save(&emit, &clip);
                         }
-                        let n = Notice { kind: Kind::Saved, title: format!("Session saved · {}", fmt_secs(clip.duration_secs)), detail: game };
-                        (Event::SaveFinished(clip), n)
+                        let _ = &game;
+                        Event::SaveFinished(clip)
                     }
-                    Err(message) => (
-                        Event::SaveFailed { save_id: id, message: message.clone() },
-                        Notice { kind: Kind::Failed, title: "Session not saved".into(), detail: message },
-                    ),
+                    Err(message) => {
+                        route_notice(overlay.as_ref(), &hook, Notice { kind: Kind::Failed, title: "Session not saved".into(), detail: message.clone() });
+                        Event::SaveFailed { save_id: id, message }
+                    }
                 };
-                if let Some(o) = overlay {
-                    o.show(n);
-                }
                 emit(Message::new(None, ev));
             },
             id,
         );
         if let Some(secs) = requested {
             self.ack_sound();
-            self.notice(Kind::Working, format!("Saving session · {}", fmt_secs(secs)), game_now);
+            // The one notice for this save: confirms the key press at once.
+            self.notice(Kind::Saved, format!("Session saved · {}", fmt_secs(secs)), game_now);
             self.send(re, Event::SaveStarted { save_id: id, requested_secs: secs });
         }
     }
@@ -536,6 +574,7 @@ impl Engine {
         let emit = self.emit.clone();
         let flags = self.cfg.as_ref().map(|c| (c.overlay && c.notices.saved, c.overlay && c.notices.problems)).unwrap_or((false, false));
         let overlay = self.overlay.clone();
+        let hook = p.hook.clone();
         let game = p.shared.game_name.clone();
         let game_now = game.clone();
         let stems = self.editor_audio_files();
@@ -543,37 +582,30 @@ impl Engine {
             range,
             SaveKind::Clip,
             move |r| {
-                let (ev, notice) = match r {
-                    Ok((clip, requested)) => {
+                // Success was already confirmed when the key was pressed; only a failure is shown.
+                let ev = match r {
+                    Ok((clip, _)) => {
                         if stems {
                             export_stems_after_save(&emit, &clip);
                         }
-                        let short = clip.duration_secs + 1.0 < requested;
-                        let detail = if short {
-                            format!("{game} · only {} was buffered", fmt_secs(clip.duration_secs))
-                        } else {
-                            game.clone()
-                        };
-                        let n = Notice { kind: Kind::Saved, title: format!("Clip saved · {}", fmt_secs(clip.duration_secs)), detail };
-                        (Event::SaveFinished(clip), n)
+                        let _ = &game;
+                        Event::SaveFinished(clip)
                     }
                     Err(message) => {
-                        let n = Notice { kind: Kind::Failed, title: "Clip not saved".into(), detail: message.clone() };
-                        (Event::SaveFailed { save_id: id, message }, n)
+                        if flags.1 {
+                            route_notice(overlay.as_ref(), &hook, Notice { kind: Kind::Failed, title: "Clip not saved".into(), detail: message.clone() });
+                        }
+                        Event::SaveFailed { save_id: id, message }
                     }
                 };
-                let show = if notice.kind == Kind::Saved { flags.0 } else { flags.1 };
-                if let (true, Some(o)) = (show, overlay) {
-                    o.show(notice);
-                }
                 emit(Message::new(None, ev));
             },
             id,
         );
-        // Immediate feedback: the key press is confirmed now; "Clip saved" replaces this notice
-        // once the file is written and verified.
+        // The one notice for this save, the moment the key is pressed: the input was taken.
+        // (A failure later shows "Clip not saved".)
         self.ack_sound();
-        self.notice(Kind::Working, format!("Saving clip · last {}", fmt_secs(requested)), game_now);
+        self.notice(Kind::Saved, format!("Clip saved · last {}", fmt_secs(requested)), game_now);
         self.send(re, Event::SaveStarted { save_id: id, requested_secs: requested });
     }
 
@@ -582,6 +614,7 @@ impl Engine {
     /// - Other modes: retry a target that is not running yet, or was closed and reopened.
     /// A session whose window closed stays saveable until a new one starts.
     pub fn tick(&mut self) {
+        self.hand_over_notice();
         if !self.replay_on {
             return;
         }
@@ -1018,6 +1051,20 @@ fn resolve(cfg: &EngineConfig) -> Result<Settings, Unresolved> {
                 mix: mix_of(cfg),
             })
         }
+    }
+}
+
+
+/// Show `n` inside the game when CAPTURE's hook is drawing there, otherwise in the notice
+/// window (one or the other, never both).
+fn route_notice(overlay: Option<&Arc<Overlay>>, hook: &Arc<Mutex<Option<inject::GameHook>>>, n: Notice) {
+    if let Some(h) = hook.lock().unwrap().as_ref().filter(|h| h.usable()) {
+        let (w, hh, px) = overlay::render_bitmap(&n, 200);
+        h.show(w, hh, 200, &px, overlay::SHOW_MS, 300);
+        return;
+    }
+    if let Some(o) = overlay {
+        o.show(n);
     }
 }
 

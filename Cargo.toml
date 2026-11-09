@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/capture-protocol", "crates/capture-engine", "app/src-tauri"]
+members = ["crates/capture-protocol", "crates/capture-engine", "crates/capture-hook", "crates/capture-inject32", "crates/hook-testapp", "app/src-tauri"]
 exclude = ["spikes/audio_spike", "spikes/libav_spike"]
 
 [workspace.package]

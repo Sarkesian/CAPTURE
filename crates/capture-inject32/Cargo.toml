@@ -1,0 +1,16 @@
+[package]
+name = "capture-inject32"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Loads capture-hook32.dll into a 32-bit game (a 64-bit worker cannot do that itself). Built for i686."
+
+[dependencies]
+windows = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_System_Threading",
+] }
