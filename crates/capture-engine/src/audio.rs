@@ -53,7 +53,8 @@ pub enum SourceSpec {
     /// A microphone. `None` = the Windows default input.
     Mic { device_id: Option<String> },
     /// Everything every app plays *except* CAPTURE's own processes (so CAPTURE's confirmation
-    /// sounds can never be recorded). Process loopback in exclude mode.
+    /// sounds and clip playback in its window are never recorded). Process loopback in exclude
+    /// mode on the UI's process tree.
     AllExceptCapture,
 }
 
@@ -138,8 +139,12 @@ impl TrackBuf {
 
     /// Append `frames` interleaved stereo frames captured at timeline index `idx`.
     fn push(&mut self, idx: i64, samples: Option<&[f32]>, frames: usize) {
-        if let (true, Some(s)) = (self.discard, samples) {
-            self.measure(s);
+        if self.discard {
+            // Level only: nothing is ever drained from a monitor, so nothing may be stored
+            // (silent packets included).
+            if let Some(s) = samples {
+                self.measure(s);
+            }
             return;
         }
         if !self.started {
@@ -287,6 +292,12 @@ impl AudioPipeline {
         let names = track_names(&sources);
         let bufs: Vec<_> = sources.iter().map(|_| Arc::new(Mutex::new(TrackBuf::default()))).collect();
         let mix = Arc::new(Mutex::new(mix));
+        // Encoders first: if one cannot open, no capture thread (microphone included) has been
+        // started yet, so nothing is left running behind the error.
+        let mut encoders = Vec::new();
+        for _ in &names {
+            encoders.push(unsafe { AacEncoder::open()? });
+        }
         let mut threads = Vec::new();
         for (src, buf) in sources.iter().cloned().zip(bufs.iter().cloned()) {
             let stop = stop.clone();
@@ -296,10 +307,6 @@ impl AudioPipeline {
                     .spawn(move || source_thread(&src.spec, &buf, t0_qpc, &stop))
                     .unwrap(),
             );
-        }
-        let mut encoders = Vec::new();
-        for _ in &names {
-            encoders.push(unsafe { AacEncoder::open()? });
         }
         let params = encoders.iter().map(|e| (e.params(), e.time_base())).collect();
         if !names.is_empty() {
@@ -600,7 +607,7 @@ fn open(spec: &SourceSpec) -> Result<Opened, String> {
     let loopback = base | AUDCLNT_STREAMFLAGS_LOOPBACK;
     match spec {
         SourceSpec::AllExceptCapture => Ok((
-            process_loopback_client(std::process::id(), false).map_err(|e| format!("Could not capture computer audio ({e})"))?,
+            process_loopback_client(capture_tree_root(), false).map_err(|e| format!("Could not capture computer audio ({e})"))?,
             loopback,
             "process-loopback-exclude",
             "everything you hear, except CAPTURE's own sounds".into(),
@@ -701,7 +708,11 @@ fn capture_source(spec: &SourceSpec, buf: &Mutex<TrackBuf>, t0_qpc: u64, stop: &
             let mut data = std::ptr::null_mut();
             let (mut frames, mut bflags, mut qpc) = (0u32, 0u32, 0u64);
             unsafe { cap.GetBuffer(&mut data, &mut frames, &mut bflags, None, Some(&mut qpc)) }.map_err(|e| lost(&e.message()))?;
-            let idx = clock::qpc100ns_to_samples(qpc, t0_qpc, RATE);
+            // A packet's capture time is at most a buffer or two in the past. A timestamp the
+            // device marks as wrong, or one far from now (0 or garbage from some drivers), would
+            // otherwise make the track silent forever or pad gigabytes of zeros: use the clock.
+            let now_idx = clock::qpc100ns_to_samples(clock::now_100ns(), t0_qpc, RATE);
+            let idx = plausible_index(clock::qpc100ns_to_samples(qpc, t0_qpc, RATE), now_idx, frames, bflags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 != 0);
             let silent = bflags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
             let samples = (!silent).then(|| unsafe { std::slice::from_raw_parts(data as *const f32, frames as usize * CH) });
             buf.lock().unwrap().push(idx, samples, frames as usize);
@@ -712,6 +723,16 @@ fn capture_source(spec: &SourceSpec, buf: &Mutex<TrackBuf>, t0_qpc: u64, stop: &
         let _ = client.Stop();
     }
     Ok(())
+}
+
+/// The timeline index to file a packet at: its own timestamp, unless the device flagged it as
+/// wrong or it is more than 2 s away from the capture clock (then: just before now).
+fn plausible_index(idx: i64, now_idx: i64, frames: u32, flagged: bool) -> i64 {
+    if flagged || (idx - now_idx).abs() > 2 * RATE as i64 {
+        now_idx - frames as i64
+    } else {
+        idx
+    }
 }
 
 struct HandleGuard(HANDLE);
@@ -742,9 +763,17 @@ struct BlobPropVariant {
     data: *const u8,
 }
 
+/// Root of CAPTURE's process tree for exclusion: the UI (`CAPTURE.exe`, which starts this
+/// worker and its WebView2 processes, where clips are played back) when it said so, else this
+/// worker. Excluding only the worker would record a clip played in CAPTURE's window.
+fn capture_tree_root() -> u32 {
+    std::env::var("CAPTURE_UI_PID").ok().and_then(|v| v.parse::<u32>().ok()).filter(|&p| p != 0).unwrap_or_else(std::process::id)
+}
+
 /// `include = true`: the process tree's audio only. `false`: everything except that tree.
 fn process_loopback_client(pid: u32, include: bool) -> windows::core::Result<IAudioClient> {
-    let params = AUDIOCLIENT_ACTIVATION_PARAMS {
+    // On the heap so they can outlive this call if activation times out (see below).
+    let params = Box::new(AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
         Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
             ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
@@ -756,14 +785,14 @@ fn process_loopback_client(pid: u32, include: bool) -> windows::core::Result<IAu
                 },
             },
         },
-    };
-    let pv = BlobPropVariant {
+    });
+    let pv = Box::new(BlobPropVariant {
         vt: 65, // VT_BLOB
         r: [0; 3],
         cb: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
         pad: 0,
-        data: &params as *const _ as *const u8,
-    };
+        data: &*params as *const _ as *const u8,
+    });
     const _: () = assert!(std::mem::size_of::<BlobPropVariant>() == std::mem::size_of::<PROPVARIANT>());
     unsafe {
         let ev = CreateEventW(None, true, false, None)?;
@@ -772,10 +801,18 @@ fn process_loopback_client(pid: u32, include: bool) -> windows::core::Result<IAu
         let op = ActivateAudioInterfaceAsync(
             VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
             &IAudioClient::IID,
-            Some(&pv as *const _ as *const PROPVARIANT),
+            Some(&*pv as *const _ as *const PROPVARIANT),
             &handler,
         )?;
         if WaitForSingleObject(ev, 5000) != WAIT_OBJECT_0 {
+            // The activation may still complete later and then reads `params` and signals
+            // `ev`: keep both alive for good (a few bytes, only on this rare path) instead of
+            // freeing memory and closing a handle that may be reused by then.
+            std::mem::forget(_g);
+            std::mem::forget(handler);
+            std::mem::forget(op);
+            Box::leak(params);
+            Box::leak(pv);
             return Err(windows::core::Error::new(windows::core::HRESULT(0x8000_000Au32 as i32), "activation timed out"));
         }
         let mut hr = windows::core::HRESULT(0);
@@ -805,6 +842,19 @@ mod tests {
         b.push(w - 2000, Some(&s), 480);
         assert_eq!(b.write_pos(), w);
         assert!(b.signal_seen);
+    }
+
+    #[test]
+    fn implausible_device_timestamps_follow_the_clock() {
+        let now = 480_000; // 10 s into the session
+        assert_eq!(plausible_index(now - 960, now, 480, false), now - 960, "normal latency kept");
+        assert_eq!(plausible_index(-1_000_000_000, now, 480, false), now - 480, "qpc = 0");
+        assert_eq!(plausible_index(i64::MAX / 4, now, 480, false), now - 480, "far future");
+        assert_eq!(plausible_index(now - 960, now, 480, true), now - 480, "flagged by the device");
+        // A monitor never stores anything, silent packets included.
+        let mut m = TrackBuf::monitor();
+        m.push(0, None, 4800);
+        assert!(m.data.is_empty());
     }
 
     #[test]
