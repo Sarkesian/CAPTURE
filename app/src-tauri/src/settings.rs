@@ -243,7 +243,12 @@ pub fn load(dir: &Path, app_dir: Option<&Path>) -> AppSettings {
             keep_damaged(dir, &path);
             eprintln!("settings.json unreadable ({e})");
             match std::fs::read(dir.join("settings.json.bak")).map(|b| parse(&b)) {
-                Ok(Parsed::Ok(s) | Parsed::Partial(s, _)) => s,
+                Ok(Parsed::Ok(s) | Parsed::Partial(s, _)) => {
+                    // The damaged file is kept as `.bad-<time>`; put the recovered settings back
+                    // so the next start does not report (and copy) the same damage again.
+                    let _ = save(dir, &s);
+                    s
+                }
                 _ => AppSettings::default(),
             }
         }
@@ -319,6 +324,21 @@ fn keep_damaged(dir: &Path, path: &Path) {
 /// other choice. Only reads the old folder. Understands the 0.5 layout
 /// (`Data\Settings\settings.json`) and the 0.3–0.4 one (`data\settings.json`).
 fn import_previous(app_dir: &Path, dir: &Path) -> Option<PathBuf> {
+    let newest = newest_previous_settings(app_dir)?;
+    std::fs::copy(&newest, dir.join("settings.json")).ok()?;
+    Some(newest)
+}
+
+/// The app folder of the earlier copy whose settings a new copy imports (see `import_previous`).
+pub fn previous_copy(app_dir: &Path) -> Option<PathBuf> {
+    let f = newest_previous_settings(app_dir)?;
+    let settings_dir = f.parent()?;
+    // `<copy>\Data\Settings\settings.json` (0.5+) or `<copy>\data\settings.json` (0.3–0.4)
+    let data = if settings_dir.file_name()?.eq_ignore_ascii_case("Settings") { settings_dir.parent()? } else { settings_dir };
+    data.parent().map(Path::to_path_buf)
+}
+
+fn newest_previous_settings(app_dir: &Path) -> Option<PathBuf> {
     let parent = app_dir.parent()?;
     let newest = std::fs::read_dir(parent)
         .ok()?
@@ -330,7 +350,6 @@ fn import_previous(app_dir: &Path, dir: &Path) -> Option<PathBuf> {
         .filter(|(_, p)| std::fs::read(p).is_ok_and(|b| !matches!(parse(&b), Parsed::Unreadable(_))))
         .max_by_key(|(t, _)| *t)?
         .1;
-    std::fs::copy(&newest, dir.join("settings.json")).ok()?;
     Some(newest)
 }
 
@@ -375,6 +394,8 @@ mod tests {
         std::fs::write(dir.join("settings.json"), b"{ not json").unwrap();
         assert_eq!(load(&dir, None).replay_secs, 300, "restored from the last good copy, not reset");
         assert!(has_bad_copy(&dir), "damaged file kept for inspection");
+        let main = std::fs::read(dir.join("settings.json")).unwrap();
+        assert!(matches!(parse(&main), Parsed::Ok(s) if s.replay_secs == 300), "recovered settings written back");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -403,11 +424,15 @@ mod tests {
         let new = app.join("Data").join("Settings");
         std::fs::create_dir_all(&old).unwrap();
         std::fs::write(old.join("settings.json"), r#"{"version": 1, "mic_enabled": true, "replay_secs": 600}"#).unwrap();
+        assert!(crate::paths::same_path(&previous_copy(&app).unwrap(), &root.join("CAPTURE-0.4.1")));
         let s = load(&new, Some(&app));
         assert!(s.mic_enabled && s.replay_secs == 600);
         assert!(old.join("settings.json").exists(), "the old folder is never changed");
         // 0.5 layout beside a newer copy
         let app2 = root.join("CAPTURE-0.5.1");
+        std::thread::sleep(std::time::Duration::from_millis(50)); // newest by modification time
+        std::fs::write(new.join("settings.json"), r#"{"version": 2, "mic_enabled": true, "replay_secs": 600}"#).unwrap();
+        assert!(crate::paths::same_path(&previous_copy(&app2).unwrap(), &app));
         let s2 = load(&app2.join("Data").join("Settings"), Some(&app2));
         assert!(s2.mic_enabled && s2.replay_secs == 600);
         std::fs::remove_dir_all(&root).unwrap();

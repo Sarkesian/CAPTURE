@@ -275,15 +275,19 @@ fn entry_exe(cmd: &str) -> PathBuf {
 /// working after CAPTURE was moved to a new folder (the old exe is gone). An entry that points
 /// to another existing copy of CAPTURE is left alone, and so is one whose drive is simply not
 /// connected right now (a portable copy on a USB drive): CAPTURE never takes it over.
-fn reconcile_startup(s: &mut AppSettings) -> bool {
+/// Exception: `upgraded_from` is the earlier version folder whose settings this copy just
+/// imported (side-by-side update). Its entry moves to this copy, or Windows would keep starting
+/// the old version at sign-in, and single-instance would then hand this copy's launch to it.
+fn reconcile_startup(s: &mut AppSettings, upgraded_from: Option<&Path>) -> bool {
     let entry = startup_entry();
     let mut changed = s.start_with_windows != entry.is_some();
     s.start_with_windows = entry.is_some();
     if let (Some(cmd), Ok(me)) = (entry, std::env::current_exe()) {
         let target = entry_exe(&cmd);
         let drive_present = target.ancestors().filter(|a| !a.as_os_str().is_empty()).last().is_some_and(|r| r.exists());
-        if drive_present && !target.exists() && write_startup(true, &me).is_ok() {
-            eprintln!("startup entry pointed to a missing {cmd}; now {}", me.display());
+        let from_old_version = upgraded_from.is_some_and(|old| target.parent().is_some_and(|d| paths::same_path(d, old)));
+        if ((drive_present && !target.exists()) || from_old_version) && !paths::same_path(&target, &me) && write_startup(true, &me).is_ok() {
+            eprintln!("startup entry pointed to {cmd}; now {}", me.display());
             changed = true;
         }
     }
@@ -843,8 +847,10 @@ fn main() {
         update::Startup::Failed(m) => notices.push(m),
         update::Startup::Nothing => {}
     }
+    let first_launch = !p.settings.join("settings.json").exists();
     let mut loaded = settings::load(&p.settings, Some(&p.app_dir));
-    if reconcile_startup(&mut loaded) {
+    let upgraded_from = first_launch.then(|| settings::previous_copy(&p.app_dir)).flatten();
+    if reconcile_startup(&mut loaded, upgraded_from.as_deref()) {
         let _ = settings::save(&p.settings, &loaded);
     }
     let webview_dir = p.webview.clone();
