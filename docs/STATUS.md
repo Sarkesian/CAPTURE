@@ -19,7 +19,7 @@ Legend: ✅ done and tested on this machine · 🟡 done, but only partly verifi
 | Steam game tested | ❌ | No Steam game was installed during testing (The Witcher 3 was still installing). The detection rule (`\steamapps\common\`) is unit-tested only. |
 | WGC capture, no injection; client area only for windowed games | ✅ | FAULTHEART 1600×900 without title bar |
 | Constant frame rate output | ✅ | 648 frames in 10.8 s at 60 fps |
-| Encoder probing NVENC → AMF → Media Foundation (hardware → software) with reasons; Software option | 🟡 | NVENC ✅ in use. Software (Media Foundation) ✅, see below. **AMF and Quick Sync could not be tested: there is no AMD or Intel GPU here.** QSV is not implemented. |
+| Encoder probing NVENC → AMF → Media Foundation (hardware → software) with reasons; Software option | 🟡 | NVENC ✅ in use. Software (Media Foundation) ✅: a real 4K clip, capped at 30 fps above 1080p60 because a 4K60 CPU encode measured only ~48 fps. **AMF and Quick Sync could not be tested: there is no AMD or Intel GPU here.** QSV is not implemented. |
 | Exclusive fullscreen / anti-cheat | 🟡 | No hooks are used. If no frames arrive within 5 s, the UI suggests borderless mode or Whole display. Not tested with a real exclusive-fullscreen or anti-cheat game. |
 
 ## Audio
@@ -33,7 +33,7 @@ Legend: ✅ done and tested on this machine · 🟡 done, but only partly verifi
 | Voice-chat app follows restarts | ✅ | process-exit watch; `e2e-audio` restart check |
 | Other Desktop never mixed (no doubling); voice not mixed twice in Whole-display mode | ✅ | `audio_sources` + unit test |
 | Marker chime never recorded | ✅ | −27 dB on the device, −240 dB (absent) in the clip tracks |
-| A/V sync, no drift | ✅ | flash+beep pattern: audio ≈7 ms after video relative to the source baseline; 60 s: no drift. Long run: see soak. |
+| A/V sync, no drift | ✅ | flash+beep pattern: 60 s window capture, audio ≈7 ms after video relative to the source's own baseline. 25 min soak: +33 ms at 5 min and +30 ms at 25 min (raw, including the looping player's own latency): **no drift**. |
 | Editor audio files (48 kHz/24-bit WAV per track, aligned to clip time 0) | ✅ | `e2e-stems`: stems identical in timing to the MP4 tracks |
 | Import into a real editor | 🟡 | FrameCut was not modified (not authorised). Its current importer would use Preview Mix (no doubled sound). Contract: `docs/FRAMECUT_IMPORT_CONTRACT.md`. **Opening a clip in your editor is a playtest item.** |
 
@@ -58,11 +58,17 @@ Legend: ✅ done and tested on this machine · 🟡 done, but only partly verifi
 |---|---|---|
 | Nothing bulky on C: | ✅ | Settings + WebView2 profile in `<exe folder>\data`. Search of AppData/Temp/registry found nothing. The startup entry exists only when you enable it. |
 | Destination validated before use; files never moved | ✅ | `validate_destination` |
-| Saved clips never auto-deleted; low disk pauses buffering | ✅ | see `e2e-lowdisk` |
+| Saved clips never auto-deleted; low disk pauses buffering | ✅ | `e2e-lowdisk` 6/6: buffering pauses with a plain message, the running session is finalized, earlier clips are untouched, and buffering resumes when space is back |
 | Portable build + zip; unsigned | ✅ | Windows SmartScreen will warn (no code-signing certificate). There is no installer. |
 | Third-party licences | ✅ | `docs/THIRD_PARTY.md` (LGPL FFmpeg, unmodified DLLs) |
 
-## Performance (measured)
+## Performance and reliability (measured)
 - Buffering FAULTHEART 1604×946@60: worker 0.19 % CPU, about 100 MB RAM, NVENC 7 %. Game CPU unchanged.
-- Soak and low-disk results: see below.
-- **Not measured:** game FPS impact (needs a frame-time tool such as PresentMon and a demanding game).
+- **25-minute soak** (`scripts/soak.mjs`, window capture, 2 min replay, a save every 5 min): worker memory
+  79 → 85 MB (peak 88, no unbounded growth), 0.31 % CPU average, buffer held at its cap, 6/6 saves at
+  120.2–120.8 s, 0 failures, buffer emptied on exit.
+- Forced kill → recovery: 12.0 s recovered, full decode.
+- Acceptance suites on the final 0.3.0 package: `ui-auto-test` 10/10, `ui-overlay-test` 18/18.
+- Unit tests: 39 pass.
+- **Not measured:** game FPS impact (needs a frame-time tool such as PresentMon and a demanding game), and
+  overhead with the overlay open on a heavy game.
