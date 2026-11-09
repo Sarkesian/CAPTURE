@@ -267,7 +267,7 @@ impl Engine {
                     for d in dirs {
                         match recover_session(&root, &d) {
                             Ok(p) => {
-                                let _ = std::fs::remove_dir_all(&d);
+                                storage::remove_session_dir(&d);
                                 clips.push(p.to_string_lossy().into_owned());
                             }
                             Err(e) => failed.push(format!("{}: {e}", d.display())),
@@ -739,6 +739,7 @@ impl Engine {
             .into_iter()
             .flatten()
             .flatten()
+            .filter(|e| storage::is_session_dir_name(&e.file_name().to_string_lossy()))
             .map(|e| e.path())
             .filter(|p| p.is_dir() && Some(p) != current.as_ref())
             .collect()
@@ -753,10 +754,7 @@ impl Engine {
         let Some(root) = self.cfg.as_ref().map(|c| PathBuf::from(&c.capture_root)) else { return 0 };
         let mut freed = 0;
         for d in self.leftover_dirs(&root) {
-            let size = storage::dir_size(&d);
-            if std::fs::remove_dir_all(&d).is_ok() {
-                freed += size;
-            }
+            freed += storage::remove_session_dir(&d);
         }
         freed
     }

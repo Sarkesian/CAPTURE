@@ -60,7 +60,10 @@ pub fn remux(
     let verified = verify(&partial, track_names.len() as u32);
     let res = match verified {
         Ok(mut v) => {
-            std::fs::rename(&partial, final_path).map_err(|e| format!("Could not finalize clip: {e}"))?;
+            if let Err(e) = std::fs::rename(&partial, final_path) {
+                let _ = std::fs::remove_file(&partial);
+                return Err(format!("Could not finalize clip: {e}"));
+            }
             v.path = final_path.to_path_buf();
             Ok((v, actual_start))
         }

@@ -24,6 +24,50 @@ pub fn buffer_dir_for(root: &Path, buffer_root: Option<&str>) -> PathBuf {
     }
 }
 
+/// Starts with CAPTURE's `YYYY-MM-DD_HH-MM-SS_` stamp followed by at least one character, as
+/// every recording, stem folder and buffer session CAPTURE creates does.
+pub fn is_stamped(name: &str) -> bool {
+    let b = name.as_bytes();
+    b.len() > 20
+        && b[..19].iter().enumerate().all(|(i, c)| match i {
+            4 | 7 | 13 | 16 => *c == b'-',
+            10 => *c == b'_',
+            _ => c.is_ascii_digit(),
+        })
+        && b[19] == b'_'
+}
+
+/// True for a buffer session folder name CAPTURE creates: `YYYY-MM-DD_HH-MM-SS_<pid>`.
+/// The buffer folder may sit inside a broad, user-chosen folder, so cleanup only ever touches
+/// sub-folders with exactly this shape.
+pub fn is_session_dir_name(name: &str) -> bool {
+    is_stamped(name) && name.as_bytes()[20..].iter().all(u8::is_ascii_digit)
+}
+
+/// Files CAPTURE writes inside a buffer session folder.
+pub fn is_session_file(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    (n.starts_with("seg_") && n.ends_with(".ts"))
+        || (n.starts_with("review_") && (n.ends_with(".mp4") || n.ends_with(".mp4.partial")))
+        || matches!(n.as_str(), "session.json" | "markers.json" | "markers.json.tmp")
+}
+
+/// Delete CAPTURE's own files from a buffer session folder, then the folder if that left it
+/// empty. Never recursive: anything else in the folder is kept (and so is the folder).
+/// Returns the bytes freed.
+pub fn remove_session_dir(dir: &Path) -> u64 {
+    let mut freed = 0;
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Ok(m) = e.metadata() else { continue };
+        if m.is_file() && is_session_file(&name) && std::fs::remove_file(e.path()).is_ok() {
+            freed += m.len();
+        }
+    }
+    let _ = std::fs::remove_dir(dir); // only succeeds when empty
+    freed
+}
+
 /// Sub-folders inside each game folder, in display order.
 pub const KINDS: [&str; 3] = ["Clips", "Sessions", "Screenshots"];
 
@@ -58,6 +102,11 @@ pub fn migrate_layout(root: &Path) -> usize {
             let game = g.file_name().to_string_lossy().into_owned();
             let dest = game_dir(root, &game).join(kind);
             for f in std::fs::read_dir(g.path()).into_iter().flatten().flatten() {
+                // Only CAPTURE's own recordings (all start with its timestamp): a broad capture
+                // folder may hold an unrelated `Clips\<something>` folder of the user's.
+                if !is_stamped(&f.file_name().to_string_lossy()) {
+                    continue;
+                }
                 let target = dest.join(f.file_name());
                 if target.exists() || std::fs::create_dir_all(&dest).is_err() {
                     continue;
@@ -70,8 +119,16 @@ pub fn migrate_layout(root: &Path) -> usize {
         }
         let _ = std::fs::remove_dir(&old_kind);
     }
+    // Old thumbnail cache: only its `<clip stem>_<size>_<mtime>.jpg` files, never recursively.
     let data = root.join("Data");
-    let _ = std::fs::remove_dir_all(data.join("thumbs"));
+    let thumbs = data.join("thumbs");
+    for f in std::fs::read_dir(&thumbs).into_iter().flatten().flatten() {
+        let name = f.file_name().to_string_lossy().into_owned();
+        if is_stamped(&name) && name.to_ascii_lowercase().ends_with(".jpg") && f.path().is_file() {
+            let _ = std::fs::remove_file(f.path());
+        }
+    }
+    let _ = std::fs::remove_dir(&thumbs);
     let _ = std::fs::remove_dir(&data);
     moved
 }
@@ -228,27 +285,61 @@ mod tests {
     fn migrate_moves_old_layout_and_drops_thumbs() {
         let root = std::env::temp_dir().join(format!("capture-migrate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("Clips").join("Game A").join("x_Audio")).unwrap();
-        std::fs::write(root.join("Clips").join("Game A").join("x.mp4"), b"1").unwrap();
+        let (clip, stems, shot, dup) = (
+            "2026-01-01_10-00-00_Game-A_Clip.mp4",
+            "2026-01-01_10-00-00_Game-A_Clip_Audio",
+            "2026-01-01_10-00-01_Game-A.png",
+            "2026-01-01_10-00-02_Game-B_Session.mp4",
+        );
+        std::fs::create_dir_all(root.join("Clips").join("Game A").join(stems)).unwrap();
+        std::fs::write(root.join("Clips").join("Game A").join(clip), b"1").unwrap();
         std::fs::create_dir_all(root.join("Screenshots").join("Game A")).unwrap();
-        std::fs::write(root.join("Screenshots").join("Game A").join("s.png"), b"1").unwrap();
+        std::fs::write(root.join("Screenshots").join("Game A").join(shot), b"1").unwrap();
+        // A user's own file in a same-named folder is not CAPTURE's and is not moved.
+        std::fs::write(root.join("Clips").join("Game A").join("holiday.mp4"), b"user").unwrap();
         // A name already taken in the new place is left alone.
         std::fs::create_dir_all(root.join("Sessions").join("Game B")).unwrap();
-        std::fs::write(root.join("Sessions").join("Game B").join("dup.mp4"), b"old").unwrap();
+        std::fs::write(root.join("Sessions").join("Game B").join(dup), b"old").unwrap();
         std::fs::create_dir_all(root.join("Game B").join("Sessions")).unwrap();
-        std::fs::write(root.join("Game B").join("Sessions").join("dup.mp4"), b"new").unwrap();
+        std::fs::write(root.join("Game B").join("Sessions").join(dup), b"new").unwrap();
         std::fs::create_dir_all(root.join("Data").join("thumbs")).unwrap();
-        std::fs::write(root.join("Data").join("thumbs").join("t.jpg"), b"1").unwrap();
+        std::fs::write(root.join("Data").join("thumbs").join("2026-01-01_00-00-00_G_Clip_1_2.jpg"), b"1").unwrap();
+        // ...and a user's own file there keeps the folder.
+        std::fs::write(root.join("Data").join("thumbs").join("cat.jpg"), b"user").unwrap();
 
         assert_eq!(migrate_layout(&root), 3);
-        assert!(root.join("Game A").join("Clips").join("x.mp4").is_file());
-        assert!(root.join("Game A").join("Clips").join("x_Audio").is_dir());
-        assert!(root.join("Game A").join("Screenshots").join("s.png").is_file());
-        assert!(!root.join("Clips").exists() && !root.join("Screenshots").exists());
-        assert_eq!(std::fs::read(root.join("Game B").join("Sessions").join("dup.mp4")).unwrap(), b"new");
-        assert!(root.join("Sessions").join("Game B").join("dup.mp4").is_file(), "never overwritten");
-        assert!(!root.join("Data").exists());
+        assert!(root.join("Game A").join("Clips").join(clip).is_file());
+        assert!(root.join("Game A").join("Clips").join(stems).is_dir());
+        assert!(root.join("Game A").join("Screenshots").join(shot).is_file());
+        assert!(!root.join("Screenshots").exists());
+        assert!(root.join("Clips").join("Game A").join("holiday.mp4").is_file(), "user file untouched");
+        assert_eq!(std::fs::read(root.join("Game B").join("Sessions").join(dup)).unwrap(), b"new");
+        assert!(root.join("Sessions").join("Game B").join(dup).is_file(), "never overwritten");
+        assert!(root.join("Data").join("thumbs").join("cat.jpg").is_file(), "user file untouched");
+        assert!(!root.join("Data").join("thumbs").join("2026-01-01_00-00-00_G_Clip_1_2.jpg").exists());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn session_cleanup_only_touches_capture_files() {
+        assert!(is_session_dir_name("2026-11-08_14-32-15_1234"));
+        assert!(!is_session_dir_name("2026-11-08_14-32-15_"));
+        assert!(!is_session_dir_name("My Projects"));
+        assert!(!is_session_dir_name("2026-11-08_14-32-15_notes"));
+        let dir = std::env::temp_dir().join(format!("capture-sess-{}", std::process::id())).join("2026-11-08_14-32-15_1");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        for f in ["seg_000001.ts", "session.json", "markers.json", "review_001.mp4"] {
+            std::fs::write(dir.join(f), b"12345").unwrap();
+        }
+        std::fs::write(dir.join("mine.txt"), b"keep").unwrap();
+        assert_eq!(remove_session_dir(&dir), 20);
+        assert!(dir.join("mine.txt").is_file() && dir.join("sub").is_dir(), "unrelated content kept");
+        assert!(!dir.join("seg_000001.ts").exists());
+        std::fs::remove_file(dir.join("mine.txt")).unwrap();
+        std::fs::remove_dir(dir.join("sub")).unwrap();
+        remove_session_dir(&dir);
+        assert!(!dir.exists(), "empty folder removed");
     }
 
     #[test]
