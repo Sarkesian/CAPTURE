@@ -25,7 +25,7 @@ Streaming, an in-app full nonlinear editor, cloud synchronization, mandatory use
 - **Privacy by design:** local-only defaults, no silent screen/microphone recording, obvious recording indicators.
 
 ## 2. Primary workflows and acceptance stories
-**First run (target: minimal interaction).** Select a permanent storage folder (recommended `D:\Captures` on this workstation); allow the app to detect a game; choose a microphone using human-readable names; test its meter; choose the default audio output / application sound; enable replay; select a replay duration; assign or accept a hotkey. A short self-test records video and the intended audio tracks, then opens a sample clip. All permissions or access limitations are explained contextually.
+**First run (target: minimal interaction).** Select a permanent storage folder (recommended `G:\Videos\Captures` on this workstation); allow the app to detect a game; choose a microphone using human-readable names; test its meter; choose the default audio output / application sound; enable replay; select a replay duration; assign or accept a hotkey. A short self-test records video and the intended audio tracks, then opens a sample clip. All permissions or access limitations are explained contextually.
 
 **Daily use.** Launch Windows or the app; tray icon shows `Ready`, `Buffering`, `Saving`, `Paused`, or `Needs attention`. When a recognized game is active, a configurable background buffer starts. Press `Save replay`; the app preserves past X minutes and writes a permanent MP4. A notification offers `Open file`, `Open folder`, and `Copy path`. No manual export.
 
@@ -136,10 +136,10 @@ Recommended application shell: **Tauri 2 with a Rust backend and a compact front
 
 ## 7. Replay buffer, storage safety and crash recovery
 ### 7.1 Storage scheme
-Default **user-selectable**, recommended `D:\Captures` for this machine, not a growing hidden cache under `C:\Users\...\AppData`. Allow a portable/uninstalled-friendly layout where system limitations permit. The program may retain a small OS-required settings/integration footprint; any unavoidable files on C: must be documented.
+Default **user-selectable**, recommended `G:\Videos\Captures` for this machine, not a growing hidden cache under `C:\Users\...\AppData`. Allow a portable/uninstalled-friendly layout where system limitations permit. The program may retain a small OS-required settings/integration footprint; any unavoidable files on C: must be documented.
 
 ```text
-D:\Captures\
+G:\Videos\Captures\
   Buffer\                     # disposable/recoverable ring, cap strictly enforced
   Clips\
     Cyberpunk 2077\

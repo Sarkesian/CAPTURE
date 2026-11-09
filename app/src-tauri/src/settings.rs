@@ -114,10 +114,11 @@ impl Default for AppSettings {
     }
 }
 
-/// `D:\Captures` when a D: drive exists (the user's data drive), else `Videos\Captures`.
+/// `G:\Videos\Captures` when the media drive's Videos folder exists (where this workstation keeps
+/// footage), else the user's `Videos\Captures`. Never a new folder at a drive root.
 pub fn default_root() -> String {
-    if Path::new("D:\\").exists() {
-        return "D:\\Captures".into();
+    if Path::new("G:\\Videos").is_dir() {
+        return "G:\\Videos\\Captures".into();
     }
     let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".into());
     format!("{home}\\Videos\\Captures")

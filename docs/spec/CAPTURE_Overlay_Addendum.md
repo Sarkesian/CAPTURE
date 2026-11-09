@@ -199,7 +199,7 @@ Advanced controls should be available but not forced upon ordinary users.
 **Synchronization.** Settings changed in the overlay must appear in the Windows application, and vice versa. There must be one authoritative configuration system, not competing settings stores. Apply changes immediately where safe. Clearly indicate when a recording restart or new session is required.
 
 ## 8. Storage and File Organization
-Preserve CAPTURE's automatic folder management and complete location configurability. Users must be able to choose their own drives and directories. Example: `D:\Captures`.
+Preserve CAPTURE's automatic folder management and complete location configurability. Users must be able to choose their own drives and directories. Example: `G:\Videos\Captures`.
 
 Automatically organize: clips by game; full recordings by game and session; screenshots by game; temporary replay data in a designated buffer directory. Use understandable filenames containing a timestamp and optionally the game name.
 

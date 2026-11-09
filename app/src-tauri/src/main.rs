@@ -96,7 +96,7 @@ fn update_settings(app: AppHandle, state: State<AppState>, settings: AppSettings
 fn validate_destination(root: &str) -> Result<(), String> {
     let p = PathBuf::from(root);
     if !p.is_absolute() {
-        return Err(r"Choose a full folder path (for example D:\Captures).".into());
+        return Err(r"Choose a full folder path (for example G:\Videos\Captures).".into());
     }
     std::fs::create_dir_all(&p).map_err(|e| format!("CAPTURE can't use {root}: {e}"))?;
     let probe = p.join(".capture-write-test");

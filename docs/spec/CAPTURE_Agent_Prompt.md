@@ -12,7 +12,7 @@ The core user journey is:
 2. Choose game/window/display recording through clean, low-friction toggles; ideally games are detected automatically.
 3. Select a microphone from real device names with a level meter and test; select game/system audio and optionally a separate voice-chat app just as easily.
 4. Enable rolling replay, set `Save last X minutes`, and use a configurable global hotkey.
-5. Press hotkey during a game; see a genuine MP4 automatically saved under `D:\Captures\Clips\[Game Name]\`, immediately accessible to any editor without Steam or any mandatory conversion/export step.
+5. Press hotkey during a game; see a genuine MP4 automatically saved under `G:\Videos\Captures\Clips\[Game Name]\`, immediately accessible to any editor without Steam or any mandatory conversion/export step.
 6. Open that clip in an editor and adjust **game audio, microphone, and external voice chat independently**, because they were recorded as separate synchronized streams, not mixed at capture time. Video must be its own editable stream.
 
 A combined preview audio track should make the MP4 sound normal in ordinary players, but do **not** cause duplicated audio in editors. For editor compatibility include an optional `Editor audio files` command that extracts synchronized 48 kHz WAV stems without re-encoding the video. Ensure `Preview Mix` is clearly labeled and automatically muted or excluded when an integrated editor expands isolated tracks.
@@ -32,7 +32,7 @@ A combined preview audio track should make the MP4 sound normal in ordinary play
 ## Non-negotiable functional details
 **Audio:** Microphone is OFF until explicitly enabled. Device selection by friendly name plus stable ID; test meter and clear disconnected state. Separate source selection for game process, system output fallback, external voice-chat process, optional other desktop audio. Use Windows-supported process loopback where available and distinguish it from whole-device loopback. Avoid double capture, feedback and wrong-device fallback. Maintain A/V sync under long recordings and source changes. Capture separate streams even when the main preview mix is present.
 
-**Files:** One standard playable H.264/AAC MP4 for saved clips by default, with video + labeled audio tracks. Use safe filenames and shallow paths under user-chosen capture root. Prefer `D:\Captures` only if the drive exists and user has not chosen another location. Temporary ring footage belongs in `Buffer`; saved clips in `Clips\Game\`; full sessions in `Sessions`. Never auto-delete saved clips. Never trap footage in a private Steam-like export system.
+**Files:** One standard playable H.264/AAC MP4 for saved clips by default, with video + labeled audio tracks. Use safe filenames and shallow paths under user-chosen capture root. Prefer `G:\Videos\Captures` only if the drive exists and user has not chosen another location. Temporary ring footage belongs in `Buffer`; saved clips in `Clips\Game\`; full sessions in `Sessions`. Never auto-delete saved clips. Never trap footage in a private Steam-like export system.
 
 **Replay:** Disk-backed rolling segments with configurable duration, strict temporary cap, free-space reserve, atomic protection of the triggered replay window, asynchronous finalization and verified `Saved` notification. Support hotkey debounce, repeated saves, overlap without deleting in-use segments, shortened replay when the buffer is young, and crash recovery. User must have a one-click route to the actual file.
 

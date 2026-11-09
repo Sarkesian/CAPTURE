@@ -44,10 +44,10 @@ the overlay without leaving the game. Use borderless, or just the keys, which al
 
 ## Your files
 ```
-D:\Captures\Clips\<Game>\…_Clip.mp4         saved replays (never deleted automatically)
-D:\Captures\Sessions\<Game>\…_Session.mp4   full-length recordings
-D:\Captures\Screenshots\<Game>\….png
-D:\Captures\Buffer\                          temporary footage (size-capped, removed on exit)
+G:\Videos\Captures\Clips\<Game>\…_Clip.mp4         saved replays (never deleted automatically)
+G:\Videos\Captures\Sessions\<Game>\…_Session.mp4   full-length recordings
+G:\Videos\Captures\Screenshots\<Game>\….png
+G:\Videos\Captures\Buffer\                          temporary footage (size-capped, removed on exit)
 ```
 A clip is a normal MP4: **Preview Mix** (default, sounds normal anywhere) plus Game Audio / Microphone /
 Voice Chat tracks for editing. In an editor that shows all tracks, mute *Preview Mix*. For editors that
