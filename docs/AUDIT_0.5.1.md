@@ -8,8 +8,9 @@ clean PC, AMD/Intel GPUs, exclusive fullscreen or anti-cheat games. See "Not ver
 ## A. Summary
 Three independent code reviews (engine, audio, app/UI) plus my own review of every file operation found
 **2 release blockers, 10 high-priority and about 20 medium defects**. All P0/P1 defects and the valuable P2s
-are fixed in 16 commits, each with a unit or end-to-end regression test. Six real-app tests were run
-against the **unchanged 0.5.0 build first**, to prove each one actually catches its bug. The
+are fixed in 16 commits, each with a unit or end-to-end regression test. New real-app tests were also run
+against the **unchanged 0.5.0 build** to prove they catch their bug (installer deletion, resize
+crop, closed-window save, missing audio at clip start). The
 packaged 0.5.1 portable zip and installer pass their distribution and lifecycle suites. Recordings were
 checked independently with ffprobe/ffmpeg, not with CAPTURE's own status.
 
@@ -55,21 +56,86 @@ Checked and found correct (no change): clip `.partial` + verify-before-rename, r
 lock, the mux's DTS monotonicity, game-process re-check of reused HWNDs, update zip-slip/manifest checks,
 `owned.rs` uninstall ownership checks, single-instance mutex, tray/close behaviour.
 
-## C. Tests
-See the "Test results" section (filled from the runs below). Skipped and unverified items are listed
-separately and never counted as passes.
+## C. Tests (final pass on the packaged build, commit `a38d9fb`)
+All on `dist\CAPTURE-0.5.1\` (the shipped worker) or the shipped zip/installer, one suite at a time.
+NVENC unless noted. A local `llama-server` was using the GPU (~21 GB VRAM) during testing; whole-display
+4K captures degraded to 24–50 fps for **both** 0.5.0 and 0.5.1 while it was busy, so that is a load
+effect, not a regression.
 
-## D. Performance
-See "Performance". No comparison is claimed where the workload differs from the 0.4.1 measurements.
+| Suite | Result |
+|---|---|
+| Unit tests (`cargo test --workspace`) | **65 passed**, 0 failed (was 58) |
+| Worker suites: markers, review, session, crash recovery, low disk (+ software encoder), drive unplug (`subst`), audio isolation (440/880 Hz), editor WAVs, replay saves, window closed, resize, colour | **12/12 passed** |
+| `validate-media` on every clip those suites saved (full decode, frame count, A/V start/end) | **18/18 valid** |
+| `e2e-lifecycle` (single instance, tray, startup entry, upgrade import + startup move, crash restart, no orphan, damaged settings) | **20/20** |
+| `e2e-distribution` (zip = manifest, first run, record, move, update, damaged update refused, delete; installer: refuses a foreign folder, silent install on D: with spaces, shortcuts, Installed apps, record, tray, upgrade while running, uninstall keeping recordings, reinstall, uninstall with all data) | **all passed** (69 checks in the full run; exit 0 in the final run) |
+| Soak (see D) | **partial: 11.5 of 20 minutes with a live source** (the test window was closed) |
+| `e2e-audio` (needs the game FAULTHEART running) | **not run** |
+| `run-acceptance.ps1`, `ui-auto-test`, `ui-overlay-test`, `ui-perf` (real UI clicks, need a game) | **not run** for 0.5.1. The UI changes in this pass are small (B #24–26) and the frontend builds, but they were not exercised by clicking |
 
-## E. Release artifacts
-See "Artifacts".
+## D. Performance (measured, not estimated)
+- **Soak**, 640×360@60 window capture, 2-min replay, a save every 5 min, packaged 0.5.1: worker memory
+  80 → 85 MB (working set; private 146 → 150 MB), flat from 5.5 min on; CPU 5.3 % of one core (≈0.3 % of the
+  20-thread CPU) while buffering, 0.2 % of one core while waiting; buffer held at 120 s / 5 MB; 5/5 saves
+  120.1–120.7 s, 0 failures, all valid. After the window closed at 11.5 min, the two later saves still held its
+  last 2 minutes (fix #4). 0.4.1's 25-min soak: 79 → 85 MB, 0.31 % CPU: same order, not a like-for-like run.
+- **A/V sync** (flash + beep together every second, 120 pairs per clip): **+17 ms** at 5 min, **+15 ms** at
+  10 min; first/last quarter of each clip +18/+18 and +13/+17 ms: about one frame, **no drift**. Includes the
+  test player's own latency (0.4.1, same method: +30–33 ms).
+- **Clip start**: audio within 0–18 ms of the first video frame (0.5.0: +80–130 ms NVENC, +554 ms software).
+- **Colour**: decoded patches within 2/255 of the source with NVENC and the software encoder.
+- **Not measured**: game frame-time impact on a demanding game (`scripts/frametime.mjs` exists; not run for
+  0.5.1); overlay cost on a heavy game.
+
+## E. Release artifacts (built from `a38d9fb`, version 0.5.1)
+| Artifact | Path | SHA-256 |
+|---|---|---|
+| Payload / runnable portable folder | `dist\CAPTURE-0.5.1\` (136 MB, 10 files; `manifest.json` has each file's SHA-256) | |
+| Portable zip | `dist\CAPTURE-0.5.1-portable.zip` (58 MB) | `cacb27a0f921e9028e470dd344bfadc9a29ef827d6acf3acf0eecbeb12a60a78` |
+| Installer (per user, NSIS) | `dist\CAPTURE-0.5.1-setup.exe` (43 MB) | `19ebce38cbf38cf1919b7efdc5eeceb5727cb9465aa3b86429da03c8ef93a0fb` |
+| Checksums | `dist\SHA256SUMS-0.5.1.txt` | |
+| Docs | `docs/STATUS.md`, `docs/DISTRIBUTION.md`, `docs/QUICKSTART.md` (shipped), `docs/THIRD_PARTY.md` (FFmpeg LGPL notice shipped in `Resources\Licenses`) | |
 
 ## F. Known limitations / not verified
-See "Not verified".
+- **Not a verified release.** Unsigned (SmartScreen warning); no clean-PC, offline or WebView2-missing test;
+  one PC, one GPU (NVIDIA). AMD (AMF) and Intel paths are unchanged and **untested**.
+- **Exclusive fullscreen and anti-cheat games: not tested.** Borderless and windowed are.
+- **Real microphone speech unverified** (the headset on this PC delivers digital silence). Check: Settings ›
+  Audio › Microphone › Test, speak, expect playback and a peak reading.
+- Default-microphone switching (#15), exclusion of CAPTURE's own playback (#10) and the hidden-window mic fix
+  (#24) are implemented and compile, but were **not exercised** with real devices or the real UI.
+- After a resize the picture is scaled with its aspect ratio kept: a game that changes aspect ratio is
+  letterboxed rather than recorded at its new native size.
+- A setting change that restarts recording (quality, fps, encoder, folders, microphone) starts a new buffer:
+  marker-protected footage of the previous one is not carried over ("kept until saved or session ends").
+- All Desktop Audio contains game and voice chat by nature (Windows limit); editors that play every track need
+  Preview Mix muted (unchanged, documented in QUICKSTART).
+- Sleep/wake, Explorer restart and a real sign-in start were not exercised.
+- Under heavy GPU load from another app, recordings can drop frames; CAPTURE counts them but does not warn yet.
 
-## G. Deferred work
-See "Deferred".
+## G. Deferred work (by user impact)
+1. Run the UI acceptance suites and a real game session on 0.5.1 (needs FAULTHEART or another game). Small.
+2. Live microphone speech check with a working headset (needs you). Minutes.
+3. Clean-PC / VM install test, offline and without WebView2. Medium.
+4. Code signing (removes the SmartScreen warning). Needs a certificate.
+5. AMD and Intel hardware; exclusive-fullscreen and anti-cheat titles. Needs hardware and games.
+6. Game frame-time impact on a demanding game with `scripts/frametime.mjs`. Small.
+7. A notice when frames are being dropped under GPU load. Small.
+8. Remaining P3s: mute applied by sample position (up to ~200 ms early/late), 20 ms clock corrections in
+   isolated tracks, WAV stems clip above 0 dBFS (24-bit integer), Preview Mix meter shows the loudest source
+   rather than the sum, `Num0`–`Num9` bindable without a modifier (kept: your own hotkeys use them).
 
 ## H. Safety confirmation
-See "Safety".
+- **Your recordings:** untouched. No test wrote to `G:\Videos\Captures`; every test used disposable folders
+  under `D:\Projects\CAPTURE\test-output\`.
+- **Your settings:** `dist\CAPTURE-0.4.0\data\settings.json` was only read (the tests build a synthetic 0.4
+  folder); a backup copy was taken first.
+- **Stable build recoverable:** tag `v0.5.0-baseline` (`a14a307`); the 0.3.0–0.5.0 folders in `dist\` are unchanged.
+- **Other locations:** tests touched only CAPTURE's own per-user entries (`Run\CAPTURE`, `Uninstall\CAPTURE`,
+  `CAPTURE.lnk`) and restored them. **Exceptions:** one early test attached to and force-closed an already open
+  Notepad (Windows 11 Notepad hosts all windows in one process); tests now only use windows they create, and that
+  clip was deleted. The old 0.5.0 uninstaller window you saw came from reproducing the installer bug in a test folder.
+- **Your Start-with-Windows toggle:** your 0.4.0 settings say it is on, but no CAPTURE Run entry existed when this
+  audit started (likely removed by an earlier test run). CAPTURE shows the real state; turn it on again if wanted.
+- **UI design** unchanged (behaviour fixes only). **No new features or services**: the GPU scaler and lead-in audio
+  are internal fixes; no network access, telemetry or background service was added.
