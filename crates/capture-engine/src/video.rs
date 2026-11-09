@@ -161,6 +161,21 @@ impl VideoEncoder {
                     null_mut(),
                     null(),
                 );
+                if sws.is_null() {
+                    ff::avcodec_free_context(&mut ctx);
+                    return Err("Could not set up colour conversion for the software encoder".into());
+                }
+                // BT.709 limited range, as the stream is tagged (swscale defaults to BT.601).
+                ff::sws_setColorspaceDetails(
+                    sws,
+                    ff::sws_getCoefficients(ff::SWS_CS_DEFAULT),
+                    1,
+                    ff::sws_getCoefficients(ff::SWS_CS_ITU709),
+                    0,
+                    0,
+                    1 << 16,
+                    1 << 16,
+                );
                 Input::Cpu { staging: staging.unwrap(), sws }
             };
             match name {

@@ -139,6 +139,16 @@ unsafe fn remux_inner(segments: &[(PathBuf, f64)], seg0_start: f64, want_start: 
         (*(*ost).codecpar).codec_tag = 0;
         (*ost).time_base = (*ist).time_base;
         let is_video = (*(*ist).codecpar).codec_type == ff::AVMediaType::AVMEDIA_TYPE_VIDEO;
+        // Some encoders (Media Foundation) write no colour information into the H.264 stream.
+        // Untagged HD video is read as BT.601 by some programs and BT.709 by others, so say what
+        // CAPTURE encodes: BT.709, limited range (encoders that do tag, e.g. NVENC, keep theirs).
+        let cp = (*ost).codecpar;
+        if is_video && (*cp).color_space == ff::AVColorSpace::AVCOL_SPC_UNSPECIFIED {
+            (*cp).color_space = ff::AVColorSpace::AVCOL_SPC_BT709;
+            (*cp).color_primaries = ff::AVColorPrimaries::AVCOL_PRI_BT709;
+            (*cp).color_trc = ff::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
+            (*cp).color_range = ff::AVColorRange::AVCOL_RANGE_MPEG;
+        }
         let label = if is_video {
             "Video".to_string()
         } else {
