@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <!-- App icon in the app's own colours (app.css): surface/chrome tile, text-colour mark, and the
+       recording red dot from the sidebar brand mark. Regenerate rasters: tauri icon on this file. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#232832"/>
+      <stop offset="1" stop-color="#121418"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="92" height="92" rx="22" fill="url(#tile)"/>
+  <rect x="4.75" y="4.75" width="90.5" height="90.5" rx="21.25" fill="none" stroke="#3a414e" stroke-width="1.5"/>
+  <path d="M74.95 37.29 A28 28 0 1 1 54.38 22.34" fill="none" stroke="#e8ebf0" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="66.46" cy="27.35" r="5" fill="#ef4b4b"/>
+  <path d="M44.5 39.5 L44.5 60.5 L62 50 Z" fill="#e8ebf0" stroke="#e8ebf0" stroke-width="4" stroke-linejoin="round"/>
+</svg>

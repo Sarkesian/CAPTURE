@@ -1,7 +1,7 @@
 <script lang="ts">
   // Records a key combination. The engine validates and registers it; its result
   // (registered / conflict message) is shown by the parent from engine state.
-  let { value, onchange }: { value: string; onchange: (v: string) => void } = $props();
+  let { value, onchange, label = 'Save' }: { value: string; onchange: (v: string) => void; label?: string } = $props();
   let recording = $state(false);
 
   const named: Record<string, string> = {
@@ -39,7 +39,7 @@
 </script>
 
 <div class="row hk">
-  <button type="button" class="btn key" class:rec={recording} onclick={() => (recording = !recording)} {onkeydown} aria-label="Save hotkey: {value || 'none'}. Activate to record a new one.">
+  <button type="button" class="btn key" class:rec={recording} onclick={() => (recording = !recording)} {onkeydown} aria-label="{label} hotkey: {value || 'none'}. Activate to record a new one.">
     {recording ? 'Press keys… (Esc to cancel)' : value || 'Not set'}
   </button>
   {#if value && !recording}
