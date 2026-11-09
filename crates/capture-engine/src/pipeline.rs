@@ -276,8 +276,19 @@ impl Pipeline {
         let info = encoder.info.clone();
 
         let buffer = s.buffer.clone();
-        let session_dir = buffer.join(format!("{}_{}", storage::local_stamp(), std::process::id()));
-        std::fs::create_dir_all(&session_dir).map_err(|e| format!("Cannot write to the capture folder: {e}"))?;
+        // A folder of its own even when two sessions start within the same second (a quick
+        // settings change): the old session's cleanup must never touch the new one's files.
+        std::fs::create_dir_all(&buffer).map_err(|e| format!("Cannot write to the capture folder: {e}"))?;
+        let base = format!("{}_{}", storage::local_stamp(), std::process::id());
+        let mut n = 0u32;
+        let session_dir = loop {
+            let d = buffer.join(if n == 0 { base.clone() } else { format!("{base}{n:02}") });
+            match std::fs::create_dir(&d) {
+                Ok(()) => break d,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 99 => n += 1,
+                Err(e) => return Err(format!("Cannot write to the capture folder: {e}")),
+            }
+        };
 
         let stop = Arc::new(AtomicBool::new(false));
         let t0 = clock::now_100ns();
@@ -497,6 +508,9 @@ impl Drop for Pipeline {
             let _ = t.join();
         }
         self.shared.dropped.store(true, Ordering::SeqCst);
+        // A review snapshot nobody released (window closed meanwhile) would keep its segments
+        // protected forever and the session folder would linger as "leftover" footage.
+        self.shared.release_review();
         self.shared.cleanup_if_idle();
     }
 }
