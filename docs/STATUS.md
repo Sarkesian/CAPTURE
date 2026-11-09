@@ -16,7 +16,7 @@ Legend: ✅ done and tested on this machine · 🟡 done, but only partly verifi
 | "Saved" only after the file is verified; atomic rename | ✅ | `save.rs` verify + `.partial` |
 | Crash / forced-kill recovery, never erasing without consent | ✅ | `e2e-crash`: 12.0 s recovered after TerminateProcess; recovery banner in UI |
 | Auto game detection without Steam (library folders, user list, fullscreen) + manual app / display | ✅ | `ui-auto-test` on FAULTHEART (itch.io) |
-| Steam game tested | ✅ | **The Witcher 3** (Steam, DX12): auto-detected from the game library folder, 3840×2160 at a true 60 fps in, Game Audio with signal, 20.8 s clip saved (`scripts/e2e-auto-game.mjs`). Note: it ran in borderless/windowed mode; exclusive fullscreen was not exercised. |
+| Steam game tested | ✅ | **The Witcher 3** (Steam, DX12): auto-detected from the game library folder, 3840×2160 at a true 60 fps in, Game Audio with signal, 20.8 s clip saved (`scripts/e2e-auto-game.mjs`). It ran in its default display mode (not changed by me); a game set to true exclusive fullscreen has not been tested. |
 | WGC capture, no injection; client area only for windowed games | ✅ | FAULTHEART 1600×900 without title bar |
 | Constant frame rate output | ✅ | 648 frames in 10.8 s at 60 fps |
 | Encoder probing NVENC → AMF → Media Foundation (hardware → software) with reasons; Software option | 🟡 | NVENC ✅ in use. Software (Media Foundation) ✅: a real 4K clip, capped at 30 fps above 1080p60 because a 4K60 CPU encode measured only ~48 fps. **AMF and Quick Sync could not be tested: there is no AMD or Intel GPU here.** QSV is not implemented. |
