@@ -168,3 +168,26 @@ pub fn monitors() -> Vec<Monitor> {
         })
         .collect()
 }
+
+/// The window covers its whole monitor (exclusive fullscreen, borderless or maximized without
+/// borders): nothing behind it can be seen, so CAPTURE's overlay is shown inside the game.
+pub fn fills_monitor(hwnd: isize) -> bool {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    if hwnd == 0 {
+        return false;
+    }
+    unsafe {
+        let h = HWND(hwnd as *mut _);
+        let mut r = RECT::default();
+        if GetWindowRect(h, &mut r).is_err() {
+            return false;
+        }
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
+            return false;
+        }
+        let m = mi.rcMonitor;
+        r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
+    }
+}
+

@@ -62,6 +62,12 @@ pub enum Command {
     MicTest { #[serde(default)] device: Option<String> },
     /// Save the current captured frame as PNG in <Game>\Screenshots\.
     Screenshot,
+    /// Show the window `hwnd` (CAPTURE's overlay) inside the captured game, live, through the
+    /// in-game hook (`EngineState::in_game`); `None` stops showing it.
+    OverlayMirror { #[serde(default)] hwnd: Option<u64> },
+    /// The overlay was asked for over a fullscreen game where it cannot be shown inside the
+    /// game: tell the player with a notice instead of minimizing the game.
+    OverlayUnavailable,
     /// "Editor audio files": synchronized WAV per isolated track next to the clip.
     ExportStems { path: String },
     /// Duration of a saved clip (answered with `ClipInfo`).
@@ -486,6 +492,14 @@ pub struct EngineState {
     pub mic_monitor: Option<MicLevel>,
     pub leftover_buffer_bytes: u64,
     pub free_bytes: Option<u64>,
+    /// CAPTURE's in-game hook is drawing in the captured game right now: the overlay can be
+    /// shown inside the game (`Command::OverlayMirror`) instead of as a window over it.
+    #[serde(default)]
+    pub in_game: bool,
+    /// The captured game is fullscreen (exclusive, or its window fills the screen): a window
+    /// opened over it would take focus and minimize it.
+    #[serde(default)]
+    pub game_fullscreen: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

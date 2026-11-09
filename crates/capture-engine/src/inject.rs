@@ -174,6 +174,7 @@ impl GameHook {
             let h = hook.header();
             h.detach.store(0, Ordering::Relaxed);
             h.claimed.store(0, Ordering::Relaxed);
+            h.overlay_open.store(0, Ordering::Relaxed);
             h.hook_state.store(proto::state::LOADING, Ordering::Relaxed);
             h.version.store(proto::VERSION, Ordering::Relaxed);
             h.magic.store(proto::MAGIC, Ordering::Release);
@@ -236,6 +237,36 @@ impl GameHook {
         hd.notice_show_ms.store(show_ms, Ordering::Relaxed);
         hd.notice_fade_ms.store(fade_ms, Ordering::Relaxed);
         hd.notice_seq.store(writing + 1, Ordering::Release);
+    }
+
+    /// The game presents in exclusive fullscreen (as DirectX tells the hook).
+    pub fn exclusive(&self) -> bool {
+        self.usable() && self.header().exclusive.load(Ordering::Relaxed) != 0
+    }
+
+    /// Show (or stop showing) CAPTURE's overlay window inside the game. `input` is the window
+    /// that receives the overlay's mouse and keyboard input.
+    pub fn set_overlay(&self, open: bool, hwnd: u64, input: u64) {
+        let h = self.header();
+        h.overlay_hwnd.store(hwnd, Ordering::Relaxed);
+        h.overlay_input_hwnd.store(input, Ordering::Relaxed);
+        h.overlay_open.store(open as u32, Ordering::Release);
+    }
+
+    /// Publish one picture of the overlay window (BGRA rows of `pitch` bytes).
+    pub unsafe fn overlay_frame(&self, w: u32, h: u32, src: *const u8, pitch: usize) {
+        let (w, h) = (w.min(proto::OVERLAY_MAX_W), h.min(proto::OVERLAY_MAX_H));
+        let hd = self.header();
+        let seq = hd.overlay_seq.load(Ordering::Relaxed);
+        let writing = if seq % 2 == 0 { seq + 1 } else { seq + 2 };
+        hd.overlay_seq.store(writing, Ordering::Release);
+        let dst = (self.view.Value as *mut u8).add(proto::OVERLAY_OFFSET);
+        for y in 0..h as usize {
+            std::ptr::copy_nonoverlapping(src.add(y * pitch), dst.add(y * w as usize * 4), w as usize * 4);
+        }
+        hd.overlay_w.store(w, Ordering::Relaxed);
+        hd.overlay_h.store(h, Ordering::Relaxed);
+        hd.overlay_seq.store(writing + 1, Ordering::Release);
     }
 
     /// The hook's last error message, if any.

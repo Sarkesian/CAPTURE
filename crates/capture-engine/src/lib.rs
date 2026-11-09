@@ -10,6 +10,7 @@ pub mod gpu;
 pub mod hotkey;
 pub mod inject;
 pub mod mic;
+pub mod mirror;
 pub mod mux;
 pub mod overlay;
 pub mod pipeline;
@@ -62,6 +63,8 @@ pub struct Engine {
     /// The notice now in the notice window and when it appeared: handed over to the in-game hook
     /// if that starts drawing while the notice is still up (never shown in both places).
     window_notice: Mutex<Option<(Notice, std::time::Instant)>>,
+    /// CAPTURE's overlay window shown inside the game (see `mirror`), while it is open there.
+    mirror: Option<mirror::Mirror>,
     emit: Emit,
     next_save_id: u64,
     fps_sample: (Instant, u64),
@@ -107,6 +110,7 @@ impl Engine {
             hotkey: None,
             overlay: None,
             window_notice: Mutex::new(None),
+            mirror: None,
             emit,
             next_save_id: 1,
             fps_sample: (Instant::now(), 0),
@@ -261,6 +265,23 @@ impl Engine {
                 });
             }
             Command::Screenshot => self.screenshot(re),
+            Command::OverlayUnavailable => {
+                self.notice(Kind::Failed, "Overlay unavailable in fullscreen".into(), "Switch the game to borderless or windowed to use it".into());
+            }
+            Command::OverlayMirror { hwnd } => {
+                self.mirror = None;
+                if let (Some(hwnd), Some(p)) = (hwnd, &self.pipeline) {
+                    if p.hook.lock().unwrap().as_ref().is_some_and(|h| h.usable()) {
+                        match mirror::Mirror::start(hwnd, p.hook.clone()) {
+                            Ok(m) => {
+                                eprintln!("in-game overlay: showing the overlay in the game");
+                                self.mirror = Some(m);
+                            }
+                            Err(e) => eprintln!("in-game overlay: cannot show the overlay in the game: {e}"),
+                        }
+                    }
+                }
+            }
             Command::ExportStems { path } => {
                 let emit = self.emit.clone();
                 std::thread::spawn(move || {
@@ -404,6 +425,7 @@ impl Engine {
     }
 
     fn start_pipeline(&mut self) {
+        self.mirror = None;
         self.stop_session(None);
         self.pipeline = None; // finalize any previous session first
         self.start_error = None;
@@ -701,7 +723,27 @@ impl Engine {
         }
     }
 
+    /// (overlay inside the game possible, game is fullscreen). Inside the game: CAPTURE's hook
+    /// draws there and the game is in exclusive fullscreen or fills its screen. Logged when it
+    /// changes, with the reasons.
+    fn in_game(&mut self) -> (bool, bool) {
+        let (hook, exclusive, fills) = match &self.pipeline {
+            Some(p) => {
+                let g = p.hook.lock().unwrap();
+                (g.as_ref().is_some_and(|h| h.usable()), g.as_ref().is_some_and(|h| h.exclusive()), targets::fills_monitor(p.shared.target_hwnd))
+            }
+            None => (false, false, false),
+        };
+        let fullscreen = exclusive || fills;
+        let now = hook && fullscreen;
+        if self.last_state.as_ref().is_some_and(|s| s.in_game != now) {
+            eprintln!("in-game overlay: {} (hook drawing: {hook}, exclusive fullscreen: {exclusive}, fills its screen: {fills})", if now { "available" } else { "not available" });
+        }
+        (now, fullscreen)
+    }
+
     fn state(&mut self) -> EngineState {
+        let (in_game, game_fullscreen) = self.in_game();
         let hotkeys = self.hotkey.as_ref().map(|h| h.state.lock().unwrap().clone()).unwrap_or_default();
         let hotkey = self.hotkey.as_ref().map(|h| h.state_for(HotkeyAction::SaveReplay)).unwrap_or_default();
         let root = self.cfg.as_ref().map(|c| PathBuf::from(&c.capture_root));
@@ -728,6 +770,8 @@ impl Engine {
             mic_monitor: None,
             leftover_buffer_bytes,
             free_bytes,
+            in_game,
+            game_fullscreen,
         };
         if self.mic_monitor.as_ref().is_some_and(|m| m.started.elapsed().as_secs() > 300) {
             self.mic_monitor = None;

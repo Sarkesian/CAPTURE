@@ -9,12 +9,16 @@
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
 pub const MAGIC: u32 = 0x4B4F_4F48; // "HOOK"
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 4;
 pub const NOTICE_MAX_W: u32 = 1600;
 pub const NOTICE_MAX_H: u32 = 480;
 /// Offset of the notice pixels from the start of the mapping.
 pub const PIXELS_OFFSET: usize = 4096;
-pub const MAPPING_SIZE: usize = PIXELS_OFFSET + (NOTICE_MAX_W * NOTICE_MAX_H * 4) as usize;
+/// The overlay window's picture (BGRA, rows of `overlay_w` pixels), after the notice.
+pub const OVERLAY_OFFSET: usize = PIXELS_OFFSET + (NOTICE_MAX_W * NOTICE_MAX_H * 4) as usize;
+pub const OVERLAY_MAX_W: u32 = 2560;
+pub const OVERLAY_MAX_H: u32 = 1600;
+pub const MAPPING_SIZE: usize = OVERLAY_OFFSET + (OVERLAY_MAX_W * OVERLAY_MAX_H * 4) as usize;
 
 /// Name of the mapping for game process `pid`.
 pub fn mapping_name(pid: u32) -> String {
@@ -56,6 +60,16 @@ pub struct Header {
     /// How long the notice stays fully visible, then how long it fades.
     pub notice_show_ms: AtomicU32,
     pub notice_fade_ms: AtomicU32,
+    /// 1 while CAPTURE's overlay is shown inside the game (the hook then also takes the game's
+    /// mouse and keyboard and forwards them to the overlay window).
+    pub overlay_open: AtomicU32,
+    /// Sequence lock for the overlay picture, as `notice_seq`.
+    pub overlay_seq: AtomicU32,
+    pub overlay_w: AtomicU32,
+    pub overlay_h: AtomicU32,
+    /// The overlay window, and its child that receives input (WebView2's render widget).
+    pub overlay_hwnd: AtomicU64,
+    pub overlay_input_hwnd: AtomicU64,
     // ---- hook -> worker ----
     /// Set by the one hook that serves this session (a game can hold several hook copies, e.g.
     /// from an earlier CAPTURE build): 0 = unclaimed, else that hook's id. Others stay dormant.
@@ -68,6 +82,8 @@ pub struct Header {
     /// Notice (by `notice_seq`) last drawn in the game, and frames it was drawn on.
     pub drawn_seq: AtomicU32,
     pub drawn_frames: AtomicU32,
+    /// 1 when the game presents in exclusive fullscreen (as DirectX reports it).
+    pub exclusive: AtomicU32,
     pub presents: AtomicU64,
     /// QueryPerformanceCounter value at the latest present.
     pub last_present_qpc: AtomicU64,

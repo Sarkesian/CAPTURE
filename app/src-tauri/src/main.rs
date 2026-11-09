@@ -398,9 +398,22 @@ fn toggle_overlay(app: AppHandle) {
 #[tauri::command]
 fn hide_overlay(app: AppHandle) {
     if let Some(w) = app.get_webview_window("overlay") {
-        let _ = w.hide();
-        set_page_visible(&w, false);
+        close_overlay_window(&app, &w);
     }
+}
+
+fn close_overlay_window(app: &AppHandle, w: &tauri::WebviewWindow) {
+    if OVERLAY_IN_GAME.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        let _ = app.state::<AppState>().worker.send(Command::OverlayMirror { hwnd: None });
+        if let Ok(hwnd) = w.hwnd() {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_HIDE);
+            }
+        }
+        let _ = w.set_always_on_top(true);
+    }
+    let _ = w.hide();
+    set_page_visible(w, false);
 }
 
 /// Bring the full settings window forward, optionally on a given tab.
@@ -440,12 +453,49 @@ fn delete_clip(state: State<AppState>, path: String) -> Result<(), String> {
     Ok(())
 }
 
+/// WebView2 switches for both windows (they share one WebView2 environment, so the switches
+/// must be identical): wry's defaults, plus keep drawing while the window is covered. The
+/// overlay is shown inside fullscreen games from a window that sits behind the game, which
+/// WebView2 would otherwise stop drawing as "not visible".
+const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-background-timer-throttling";
+
+/// The overlay is open inside the game (mirrored by the in-game hook), not as a window.
+static OVERLAY_IN_GAME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn toggle_overlay_window(app: &AppHandle) {
     let Some(w) = app.get_webview_window("overlay") else { return };
-    if w.is_visible().unwrap_or(false) {
-        let _ = w.hide();
-        set_page_visible(&w, false);
+    // (Shown inside the game the window was shown directly through Windows, so Tauri does not
+    // know it is visible: our own flag says it is open.)
+    if OVERLAY_IN_GAME.load(std::sync::atomic::Ordering::SeqCst) || w.is_visible().unwrap_or(false) {
+        close_overlay_window(app, &w);
         return;
+    }
+    // Over a game that fills its screen and has CAPTURE's in-game hook, show the overlay inside
+    // the game: no window can be seen over exclusive fullscreen, and taking focus would minimize
+    // the game. The window is shown behind everything, without focus, and mirrored into the game,
+    // which forwards the player's input to it.
+    let (in_game, fullscreen) = app.state::<AppState>().last_state.lock().unwrap().as_ref().map_or((false, false), |s| (s.in_game, s.game_fullscreen));
+    if !in_game && fullscreen {
+        // A window over a fullscreen game would take focus and minimize it: say why instead.
+        eprintln!("overlay: not opened (fullscreen game without the in-game overlay)");
+        let _ = app.state::<AppState>().worker.send(Command::OverlayUnavailable);
+        return;
+    }
+    eprintln!("overlay: opening {}", if in_game { "inside the game" } else { "as a window" });
+    if in_game {
+        if let Ok(hwnd) = w.hwnd() {
+            use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, ShowWindow, HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE};
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+            let _ = w.set_always_on_top(false);
+            set_page_visible(&w, true);
+            OVERLAY_IN_GAME.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = app.state::<AppState>().worker.send(Command::OverlayMirror { hwnd: Some(hwnd.0 as u64) });
+            let _ = app.emit_to("overlay", "overlay_shown", ());
+            return;
+        }
     }
     // Centre on the monitor under the mouse (the one being played on).
     if let Ok(cursor) = app.cursor_position() {
@@ -974,6 +1024,7 @@ fn main() {
                 .inner_size(1120.0, 780.0)
                 .min_inner_size(720.0, 540.0)
                 .data_directory(webview_dir.clone())
+                .additional_browser_args(BROWSER_ARGS)
                 .build()?;
             if start_hidden {
                 set_page_visible(&window, false);
@@ -989,6 +1040,7 @@ fn main() {
                 .resizable(false)
                 .visible(false)
                 .data_directory(webview_dir.clone())
+                .additional_browser_args(BROWSER_ARGS)
                 .build()?;
             set_page_visible(&overlay, false);
             overlay.on_window_event(|e| {
