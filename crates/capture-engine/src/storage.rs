@@ -1,26 +1,51 @@
 //! Capture-root layout, safe names and disk-space queries.
 //!
 //! ```text
-//! <root>\Buffer\<session>\seg_000001.ts                     disposable ring (cap enforced)
+//! <root>\Background Recording\<session>\seg_000001.ts       disposable ring (cap enforced)
 //! <root>\<Game Name>\Clips\YYYY-MM-DD_HH-MM-SS_<Game>_Clip.mp4  permanent, never auto-deleted
 //! <root>\<Game Name>\Sessions\...
 //! <root>\<Game Name>\Screenshots\...
 //! ```
 //!
 //! Each game folder is the parent of everything recorded for that game. Folder names that
-//! would collide with CAPTURE's own top-level folders (`Buffer`) get a trailing `_`.
+//! would collide with CAPTURE's own top-level folders (`Background Recording`, and `Buffer`,
+//! its name before 0.6.1) get a trailing `_`.
 
 use std::path::{Path, PathBuf};
 
+/// The folder that holds the background recording (the footage kept ready for Save Replay and
+/// Replay): named for what it is, so someone who finds it in their recordings knows.
+pub const BACKGROUND_DIR: &str = "Background Recording";
+/// Its name before 0.6.1.
+pub const LEGACY_BACKGROUND_DIR: &str = "Buffer";
+
 pub fn buffer_dir(root: &Path) -> PathBuf {
-    root.join("Buffer")
+    adopt_legacy(root);
+    root.join(BACKGROUND_DIR)
 }
 
-/// The buffer folder for a configuration: `<buffer_root>\Buffer` if set, else `<root>\Buffer`.
+/// The background-recording folder for a configuration: inside `buffer_root` if set, else
+/// inside the recordings folder.
 pub fn buffer_dir_for(root: &Path, buffer_root: Option<&str>) -> PathBuf {
     match buffer_root.map(str::trim).filter(|b| !b.is_empty()) {
-        Some(b) => Path::new(b).join("Buffer"),
+        Some(b) => buffer_dir(Path::new(b)),
         None => buffer_dir(root),
+    }
+}
+
+/// A `Buffer` folder left by an earlier version becomes `Background Recording`, with whatever
+/// footage is still in it (so "leftover footage" from before the update can still be saved).
+/// Only when it is recognizably CAPTURE's: nothing in it but session folders. A folder a
+/// person happens to have named `Buffer` is left alone.
+fn adopt_legacy(parent: &Path) {
+    let (old, new) = (parent.join(LEGACY_BACKGROUND_DIR), parent.join(BACKGROUND_DIR));
+    if new.exists() || !old.is_dir() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&old) else { return };
+    let ours = entries.flatten().all(|e| e.path().is_dir() && is_session_dir_name(&e.file_name().to_string_lossy()));
+    if ours {
+        let _ = std::fs::rename(&old, &new);
     }
 }
 
@@ -44,12 +69,16 @@ pub fn is_session_dir_name(name: &str) -> bool {
     is_stamped(name) && name.as_bytes()[20..].iter().all(u8::is_ascii_digit)
 }
 
+/// Written into a session folder when its recording ended normally: the footage is kept for
+/// Replay until the next game is recorded (a folder without it is from a crash or power loss).
+pub const ENDED_FILE: &str = "ended.json";
+
 /// Files CAPTURE writes inside a buffer session folder.
 pub fn is_session_file(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     (n.starts_with("seg_") && n.ends_with(".ts"))
         || (n.starts_with("review_") && (n.ends_with(".mp4") || n.ends_with(".mp4.partial")))
-        || matches!(n.as_str(), "session.json" | "markers.json" | "markers.json.tmp")
+        || matches!(n.as_str(), "session.json" | "markers.json" | "markers.json.tmp" | ENDED_FILE)
 }
 
 /// Delete CAPTURE's own files from a buffer session folder, then the folder if that left it
@@ -155,7 +184,8 @@ pub fn folder_name(name: &str) -> String {
         || ((upper.starts_with("COM") || upper.starts_with("LPT"))
             && upper.len() == 4
             && upper.as_bytes()[3].is_ascii_digit())
-        || upper == "BUFFER";
+        || upper == "BUFFER"
+        || upper == BACKGROUND_DIR.to_ascii_uppercase();
     if s.is_empty() {
         "Unknown".into()
     } else if reserved {
@@ -260,9 +290,29 @@ mod tests {
         assert_eq!(folder_name("com1"), "com1_");
         assert_eq!(folder_name("Company"), "Company");
         assert_eq!(folder_name("Buffer"), "Buffer_");
+        assert_eq!(folder_name("Background Recording"), "Background Recording_");
         assert_eq!(folder_name("..."), "Unknown");
         assert_eq!(folder_name(""), "Unknown");
         assert_eq!(folder_name(&"x".repeat(200)).len(), 80);
+    }
+
+    #[test]
+    fn an_old_buffer_folder_is_adopted_only_when_it_is_captures() {
+        let root = std::env::temp_dir().join(format!("capture-adopt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // CAPTURE's own: session folders only.
+        let a = root.join("a");
+        std::fs::create_dir_all(a.join("Buffer").join("2026-11-08_10-00-00_1234")).unwrap();
+        assert_eq!(buffer_dir(&a), a.join("Background Recording"));
+        assert!(a.join("Background Recording").join("2026-11-08_10-00-00_1234").is_dir());
+        assert!(!a.join("Buffer").exists());
+        // Someone's own folder that happens to be called Buffer: untouched.
+        let b = root.join("b");
+        std::fs::create_dir_all(b.join("Buffer")).unwrap();
+        std::fs::write(b.join("Buffer").join("notes.txt"), b"mine").unwrap();
+        assert_eq!(buffer_dir(&b), b.join("Background Recording"));
+        assert!(b.join("Buffer").join("notes.txt").is_file());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

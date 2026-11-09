@@ -8,6 +8,9 @@
   const e = $derived(app.engine);
   const s = $derived(app.settings!);
   const live = $derived(e?.status === 'buffering');
+  // The background recording of a game that has closed stays until a new game starts: it can
+  // be watched and clipped just the same.
+  const footage = $derived(!!e?.target_name && (e?.buffered_secs ?? 0) >= 3);
   // Keep the snapshot only while this page is open.
   $effect(() => () => { if (app.review) releaseReview(); });
 </script>
@@ -18,12 +21,14 @@
       <h1>Replay</h1>
       <p class="muted small">
         {#if live}Your last {fmtDuration(e!.buffered_secs)} of {e!.target_name}. Recording continues while you watch.
+        {:else if footage}{e!.target_name} has closed. Its last {fmtDuration(e!.buffered_secs)} stays here until a new game starts.
+        {:else if e?.past_game}Your last background recording of {e.past_game}. It stays here until the next game is recorded.
         {:else}Watch and clip your recent gameplay without stopping the recording.{/if}
       </p>
     </div>
   </header>
 
-  {#if live}
+  {#if live || footage || e?.past_game}
     <ReviewPanel onclose={() => onnavigate?.('home')} />
   {:else}
     <div class="empty">

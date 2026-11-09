@@ -47,7 +47,7 @@ removes them, so they must be CAPTURE's own. (0.5.0 deleted such folders: fixed 
 | What | When | Removed by |
 |---|---|---|
 | `HKCU\...\Run\CAPTURE` | only if Start with Windows is on | the toggle; uninstall (if it points to that copy) |
-| Recording folders (`<root>\<Game>\...`, `<buffer>\Buffer\`) | when recording | user; uninstall "all data" (CAPTURE's own files only) |
+| Recording folders (`<root>\<Game>\...`, `<folder>\Background Recording\`) | when recording | user; uninstall "all data" (CAPTURE's own files only) |
 | Installed only: `HKCU\...\Uninstall\CAPTURE`, `Start Menu\Programs\CAPTURE.lnk`, optional `Desktop\CAPTURE.lnk` | install | uninstall |
 | `%LOCALAPPDATA%\CAPTURE\Data` | only after consenting to the read-only-folder fallback | user |
 | Windows itself (not CAPTURE-controlled): WebView2 runtime's own updates, Windows Error Reporting, Explorer's recent/jump lists, tray icon cache | — | Windows |

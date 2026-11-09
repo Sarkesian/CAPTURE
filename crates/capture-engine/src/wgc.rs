@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use windows::core::{IInspectable, Interface};
 use windows::Foundation::TypedEventHandler;
-use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession};
+use windows::Graphics::Capture::{Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession};
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
@@ -35,6 +35,12 @@ unsafe impl Sync for SendDev {}
 /// With 2, frames were skipped whenever our copy queued behind the game's rendering.
 const POOL_FRAMES: i32 = 4;
 
+// Dropping a WinRT interface is not the same as returning the buffer to WGC.
+struct FrameLease(Direct3D11CaptureFrame);
+impl Drop for FrameLease {
+    fn drop(&mut self) { let _ = self.0.Close(); }
+}
+
 pub enum Source {
     Window(isize),
     Monitor(isize),
@@ -49,8 +55,8 @@ pub struct Latest {
     last_size: SizeInt32,
     /// GPU scaler for frames whose size no longer matches the encoder (created on first need).
     scaler: Option<Scaler>,
-    /// The scaler could not be created on this GPU: fall back to cropping/padding.
-    scaler_failed: bool,
+    /// A capture failure is visible in engine status and retried on the next frame.
+    pub error: Option<String>,
 }
 
 /// Where a `src_w`x`src_h` picture goes inside a `dst_w`x`dst_h` frame: as large as possible
@@ -66,6 +72,18 @@ pub fn fit_rect(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> (u32, u32, u3
     };
     let (w, h) = (w.clamp(1, dst_w), h.clamp(1, dst_h));
     ((dst_w - w) / 2, (dst_h - h) / 2, w, h)
+}
+
+/// Window geometry can advance ahead of the queued WGC frame. Reject incomplete
+/// pictures instead of clamping the new client area into an older surface.
+fn frame_rect(content: SizeInt32, surface: (u32, u32), crop: Option<(i32, i32, i32, i32)>) -> Option<RECT> {
+    let (x, y, w, h) = crop.unwrap_or((0, 0, content.Width, content.Height));
+    let (right, bottom) = (x.checked_add(w)?, y.checked_add(h)?);
+    if x < 0 || y < 0 || w < 16 || h < 16 || right > content.Width || bottom > content.Height
+        || content.Width < 16 || content.Height < 16 || content.Width as u32 > surface.0 || content.Height as u32 > surface.1 {
+        return None;
+    }
+    Some(RECT { left: x, top: y, right, bottom })
 }
 
 /// D3D11 video processor that scales a captured frame into `Latest` (same BGRA format), used
@@ -120,6 +138,8 @@ impl Scaler {
         self.vdev.CreateVideoProcessorInputView(src, &self.en, &id, Some(&mut input))?;
         let (x, y, w, h) = fit_rect((rect.right - rect.left) as u32, (rect.bottom - rect.top) as u32, out_w, out_h);
         let dest = RECT { left: x as i32, top: y as i32, right: (x + w) as i32, bottom: (y + h) as i32 };
+        let target = RECT { left: 0, top: 0, right: out_w as i32, bottom: out_h as i32 };
+        self.vctx.VideoProcessorSetOutputTargetRect(&self.vp, true, Some(&target));
         self.vctx.VideoProcessorSetStreamSourceRect(&self.vp, 0, true, Some(&rect));
         self.vctx.VideoProcessorSetStreamDestRect(&self.vp, 0, true, Some(&dest));
         let mut streams = [D3D11_VIDEO_PROCESSOR_STREAM { Enable: true.into(), pInputSurface: std::mem::ManuallyDrop::new(input), ..Default::default() }];
@@ -200,7 +220,9 @@ impl Capture {
             CreateDirect3D11DeviceFromDXGIDevice(&dxgi).map_err(|e| e.to_string())?.cast().map_err(|e| e.to_string())?
         };
 
-        let latest = Arc::new(Mutex::new(make_latest(gpu, width, height)?));
+        let mut initial = make_latest(gpu, width, height)?;
+        initial.last_size = size; // pool size includes window decorations; encoder size does not
+        let latest = Arc::new(Mutex::new(initial));
         let frames = Arc::new(AtomicU64::new(0));
         let closed = Arc::new(AtomicBool::new(false));
 
@@ -221,14 +243,17 @@ impl Capture {
             // WGC callback thread is safe.
             let ctx = SendCtx(gpu.context.clone(), winrt_device.clone());
             let dev3d = SendDev(gpu.device.clone());
+            let callback = Mutex::new(());
             pool.FrameArrived(&TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(
                 move |pool, _| {
+                    let _callback = callback.lock().unwrap();
                     let ctx = &ctx; // capture the whole Send wrapper, not its fields
                     let (context, dev) = (&ctx.0, &ctx.1);
                     let dev3d = &dev3d.0;
                     let Ok(pool) = pool.ok() else { return Ok(()) };
                     let t_arrive = crate::clock::now_100ns();
-                    let frame = pool.TryGetNextFrame()?;
+                    let lease = FrameLease(pool.TryGetNextFrame()?);
+                    let frame = &lease.0;
                     let content = frame.ContentSize()?;
                     let tex: ID3D11Texture2D = unsafe { frame.Surface()?.cast::<IDirect3DDxgiInterfaceAccess>()?.GetInterface()? };
                     let mut l = latest.lock().unwrap();
@@ -238,61 +263,73 @@ impl Capture {
                         crate::trace::ev("cap", t_arrive, shown, (now - t_arrive) as i64, 0);
                     }
                     if content != l.last_size {
-                        // Size changed (resize, resolution switch): clear stale edges and let the
-                        // pool deliver full-size frames from now on.
-                        unsafe { context.ClearRenderTargetView(&l.rtv, &[0.0, 0.0, 0.0, 1.0]) };
-                        l.last_size = content;
-                        let _ = pool.Recreate(dev, DirectXPixelFormat::B8G8R8A8UIntNormalized, POOL_FRAMES, content);
+                        // ContentSize can already describe the NEW window while its surface
+                        // still has the OLD pool dimensions. Never publish that truncated frame.
+                        // Return all references before Recreate, and retain the last complete
+                        // picture for the CFR clock while Windows delivers the new-size frame.
+                        drop(tex);
+                        drop(lease);
+                        drop(l); // Recreate may wait for Windows; never stall the encoder clock.
+                        if content.Width < 16 || content.Height < 16 { return Ok(()) }
+                        if let Err(e) = pool.Recreate(dev, DirectXPixelFormat::B8G8R8A8UIntNormalized, POOL_FRAMES, content) {
+                            latest.lock().unwrap().error = Some(format!("Could not resize the capture buffers: {e}"));
+                            return Ok(());
+                        }
+                        latest.lock().unwrap().last_size = content;
+                        return Ok(());
                     }
+                    // Minimize/mode switches can have empty content or a surface smaller
+                    // than ContentSize. Keep the complete picture rather than copying garbage.
+                    let mut desc = D3D11_TEXTURE2D_DESC::default();
+                    unsafe { tex.GetDesc(&mut desc) };
                     let crop = window.and_then(client_crop);
-                    let (cx, cy) = match crop {
-                        Some((x, y, _, _)) => (x.max(0) as u32, y.max(0) as u32),
-                        None => (0, 0),
-                    };
-                    let (cw, ch) = (content.Width.max(0) as u32, content.Height.max(0) as u32);
-                    // The picture's size now (client area of a window, or the whole display).
-                    let (sw, sh) = match crop {
-                        Some((_, _, w, h)) => ((w.max(0) as u32).min(cw.saturating_sub(cx)), (h.max(0) as u32).min(ch.saturating_sub(cy))),
-                        None => (cw, ch),
-                    };
+                    if window.is_some() && crop.is_none() { return Ok(()) }
+                    let Some(rect) = frame_rect(content, (desc.Width, desc.Height), crop) else { return Ok(()) };
+                    let (cx, cy) = (rect.left as u32, rect.top as u32);
+                    let (sw, sh) = ((rect.right - rect.left) as u32, (rect.bottom - rect.top) as u32);
                     // Same size as the recording (the usual case): a plain copy below. Otherwise
                     // scale it into the recording size so nothing is cut off or left half-empty.
-                    let resized = (even(sw as i32), even(sh as i32)) != (width, height) && sw >= 16 && sh >= 16;
-                    if resized && !l.scaler_failed {
-                        let (tw, th) = unsafe {
-                            let mut d = D3D11_TEXTURE2D_DESC::default();
-                            tex.GetDesc(&mut d);
-                            (d.Width, d.Height)
-                        };
-                        let rect = RECT { left: cx as i32, top: cy as i32, right: (cx + sw).min(tw) as i32, bottom: (cy + sh).min(th) as i32 };
+                    let resized = (even(sw as i32), even(sh as i32)) != (width, height);
+                    if resized {
+                        let (tw, th) = (desc.Width, desc.Height);
                         if l.scaler.as_ref().is_none_or(|sc| sc.in_size != (tw, th)) {
                             l.scaler = None;
                             match unsafe { Scaler::new(dev3d, context, &l.texture, tw, th, width, height) } {
                                 Ok(sc) => l.scaler = Some(sc),
                                 Err(e) => {
-                                    eprintln!("GPU scaling unavailable ({e}); a resized picture is cropped instead");
-                                    l.scaler_failed = true;
+                                    l.error = Some(format!("Could not scale the resized capture: {e}"));
+                                    return Ok(());
                                 }
                             }
                         }
                         if let Some(sc) = &l.scaler {
-                            if rect.right > rect.left && rect.bottom > rect.top && unsafe { sc.blit(&tex, rect, width, height) }.is_ok() {
-                                l.has_frame = true;
-                                frames.fetch_add(1, Ordering::Relaxed);
-                                return Ok(());
+                            if rect.right > rect.left && rect.bottom > rect.top {
+                                match unsafe { sc.blit(&tex, rect, width, height) } {
+                                    Ok(()) => {
+                                        l.error = None;
+                                        l.has_frame = true;
+                                        frames.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Err(e) => l.error = Some(format!("Could not scale the resized capture: {e}")),
+                                }
                             }
                         }
+                        return Ok(()); // never silently replace a failed scale with cropping
                     }
                     let b = D3D11_BOX {
                         left: cx,
                         top: cy,
                         front: 0,
-                        right: (content.Width.max(0) as u32).min(cx + width),
-                        bottom: (content.Height.max(0) as u32).min(cy + height),
+                        right: (rect.right as u32).min(cx + width),
+                        bottom: (rect.bottom as u32).min(cy + height),
                         back: 1,
                     };
                     if b.right > b.left && b.bottom > b.top {
-                        unsafe { context.CopySubresourceRegion(&l.texture, 0, 0, 0, 0, &tex, 0, Some(&b)) };
+                        unsafe {
+                            context.ClearRenderTargetView(&l.rtv, &[0.0, 0.0, 0.0, 1.0]);
+                            context.CopySubresourceRegion(&l.texture, 0, 0, 0, 0, &tex, 0, Some(&b));
+                        }
+                        l.error = None;
                         l.has_frame = true;
                         frames.fetch_add(1, Ordering::Relaxed);
                     }
@@ -341,12 +378,23 @@ fn make_latest(gpu: &Gpu, width: u32, height: u32) -> Result<Latest, String> {
     unsafe { gpu.device.CreateRenderTargetView(&texture, None, Some(&mut rtv)) }.map_err(|e| e.to_string())?;
     let rtv = rtv.unwrap();
     unsafe { gpu.context.ClearRenderTargetView(&rtv, &[0.0, 0.0, 0.0, 1.0]) };
-    Ok(Latest { texture, rtv, has_frame: false, last_size: SizeInt32 { Width: width as i32, Height: height as i32 }, scaler: None, scaler_failed: false })
+    Ok(Latest { texture, rtv, has_frame: false, last_size: SizeInt32 { Width: width as i32, Height: height as i32 }, scaler: None, error: None })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::fit_rect;
+    use super::*;
+
+    #[test]
+    fn size_transitions_never_publish_a_partial_surface() {
+        let size = SizeInt32 { Width: 1280, Height: 720 };
+        assert!(frame_rect(size, (640, 360), None).is_none(), "new content in an old pool texture");
+        assert!(frame_rect(size, (1280, 720), Some((0, 0, 1920, 1080))).is_none(), "window geometry ahead of content");
+        assert!(frame_rect(size, (1280, 720), Some((10, 30, 1280, 720))).is_none(), "crop extends past content");
+        assert!(frame_rect(size, (1280, 720), Some((0, 0, 0, 0))).is_none(), "minimized");
+        assert!(frame_rect(size, (1920, 1080), None).is_some(), "shrinking content in a larger surface is complete");
+        assert!(frame_rect(size, (1280, 720), Some((1, 30, 1278, 689))).is_some(), "normal odd client size");
+    }
 
     #[test]
     fn resized_picture_fits_with_its_aspect_ratio() {

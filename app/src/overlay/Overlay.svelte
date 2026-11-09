@@ -41,6 +41,8 @@
     }
   });
   const live = $derived(e?.status === 'buffering');
+  // A closed game's background recording stays watchable until a new game starts.
+  const footage = $derived((!!e?.target_name && (e?.buffered_secs ?? 0) >= 3) || !!e?.past_game);
   const presets = [30, 60, 120, 300, 600, 1200];
 
   onMount(() => {
@@ -146,10 +148,10 @@
           <span class="txt"><span class="big">Add Marker</span>
           <span class="sub">Bookmark this moment{hk('add_marker') ? ` · ${hk('add_marker')}` : ''}</span></span>
         </button>
-        <button class="act" disabled={!live} onclick={() => (view = 'review')}>
+        <button class="act" disabled={!footage} onclick={() => (view = 'review')}>
           <Icon name="replay" size={22} />
-          <span class="txt"><span class="big">Review Recording</span>
-          <span class="sub">{e?.markers.length ? `${e.markers.length} marker${e.markers.length > 1 ? 's' : ''} · ` : ''}find a moment, save it</span></span>
+          <span class="txt"><span class="big">Replay</span>
+          <span class="sub">{e?.markers.length ? `${e.markers.length} marker${e.markers.length > 1 ? 's' : ''} · ` : ''}watch the background recording, save a moment</span></span>
         </button>
         <button class="act" class:rec={sessionOn} disabled={!live && !sessionOn} onclick={toggleSession}>
           <span class="recdot" aria-hidden="true"></span>
@@ -217,7 +219,7 @@
         <button class="btn ghost sm" onclick={() => (view = 'quick')}><Icon name="settings" size={15} />Quick settings</button>
         <button class="btn ghost sm" onclick={openCaptureFolder}><Icon name="folder" size={15} />Open folder</button>
         <span class="faint xs grow ellipsis right">
-          {s.capture_root}{e?.free_bytes != null ? ` · ${fmtBytes(e.free_bytes)} free` : ''} · temporary {fmtBytes(e?.buffer_bytes ?? 0)}
+          {s.capture_root}{e?.free_bytes != null ? ` · ${fmtBytes(e.free_bytes)} free` : ''} · background recording {fmtBytes(e?.buffer_bytes ?? 0)}
         </span>
       </footer>
     </div>

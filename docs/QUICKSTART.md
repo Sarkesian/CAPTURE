@@ -24,8 +24,10 @@
 Save Replay · Add Marker · **Review Recording** (watch recent gameplay, click a marker, **Create clip**,
 drag the two handles, **Save clip**; or **Save around** a marker in one click) · Start/Stop Recording ·
 audio rows with live meters and mic mute · recent clips · quick settings · full settings.
-Recording never stops while the overlay is open. Over *exclusive fullscreen* games Windows can't show
-the overlay without leaving the game. Use borderless, or just the keys, which always work.
+Recording never stops while the overlay is open. The overlay is at its best over a game in
+*borderless window*: set that in the game's display options where it has it. Over *exclusive fullscreen*
+CAPTURE draws the overlay inside the game instead (Direct3D 9 and 11 games without anti-cheat), which is
+less sharp; where it can't, a notice and a short falling sound say so, and the keys always work.
 
 ## Audio (Home → Audio; levels and devices in Settings → Audio)
 - **Game sound**: only the game's own sound (*Whole display*: everything you hear except CAPTURE).
@@ -48,7 +50,7 @@ the overlay without leaving the game. Use borderless, or just the keys, which al
 G:\Videos\Captures\<Game>\Clips\…_Clip.mp4         saved replays (never deleted automatically)
 G:\Videos\Captures\<Game>\Sessions\…_Session.mp4   full-length recordings
 G:\Videos\Captures\<Game>\Screenshots\….png
-G:\Videos\Captures\Buffer\                          temporary footage (size-capped, removed on exit)
+G:\Videos\Captures\Background Recording\            the background recording (size-capped; the last game's stays for Replay until the next game)
 ```
 A clip is a normal MP4: **Preview Mix** (default, sounds normal anywhere) plus Game Audio / Microphone /
 Voice Chat tracks for editing. In an editor that shows all tracks, mute *Preview Mix*. For editors that

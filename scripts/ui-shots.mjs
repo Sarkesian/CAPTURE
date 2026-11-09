@@ -54,7 +54,7 @@ try {
   await ov.js(`[...document.querySelectorAll('header button')].find(b => b.innerText.trim() === 'Back')?.click()`);
   await sleep(600);
   await ov.shot('overlay-home');
-  await ov.js(`[...document.querySelectorAll('button')].find(b => /Review Recording/.test(b.innerText))?.click()`);
+  await ov.js(`[...document.querySelectorAll('button')].find(b => /^Replay\b/.test(b.innerText.trim()))?.click()`);
   await sleep(4000);
   await ov.shot('overlay-review');
   await ov.js(`window.__TAURI_INTERNALS__.invoke('hide_overlay')`);

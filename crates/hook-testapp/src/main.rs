@@ -8,8 +8,9 @@
 //! (FLIP_DISCARD) instead of the legacy blt model many older DX11 games use.
 
 use std::time::{Duration, Instant};
+use std::io::BufRead;
 
-use windows::core::{w, HSTRING};
+use windows::core::{w, HSTRING, Interface};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D11::*;
@@ -30,6 +31,17 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let fullscreen = args.iter().any(|a| a == "--fullscreen");
     let flip = args.iter().any(|a| a == "--flip");
+    // Stdio-driven changes exercise real DXGI back-buffer and window mode changes,
+    // without input automation or timing-dependent resize timers.
+    let resolution_test = args.iter().any(|a| a == "--resolution-test");
+    let (commands, changes) = std::sync::mpsc::channel::<String>();
+    if resolution_test {
+        std::thread::spawn(move || {
+            for line in std::io::stdin().lock().lines().map_while(Result::ok) {
+                if commands.send(line).is_err() { break }
+            }
+        });
+    }
     let secs: f64 = args.iter().position(|a| a == "--secs").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(60.0);
     let title = args.iter().position(|a| a == "--title").and_then(|i| args.get(i + 1)).cloned().unwrap_or_else(|| "CAPTURE hook test".into());
     unsafe {
@@ -37,7 +49,7 @@ fn main() {
         let wc = WNDCLASSW { lpfnWndProc: Some(wndproc), hInstance: hinst.into(), lpszClassName: w!("CaptureHookTest"), hCursor: LoadCursorW(None, IDC_ARROW).unwrap(), ..Default::default() };
         RegisterClassW(&wc);
         let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
-        let (w, h) = if fullscreen { (sw, sh) } else { (1280, 720) };
+        let (w, h) = if fullscreen { (sw, sh) } else if resolution_test { (640, 360) } else { (1280, 720) };
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             w!("CaptureHookTest"),
@@ -79,6 +91,7 @@ fn main() {
         let mut rtv: Option<ID3D11RenderTargetView> = None;
         let mut msg = MSG::default();
         let mut frames = 0u64;
+        let context1: ID3D11DeviceContext1 = ctx.cast().unwrap();
         while start.elapsed() < Duration::from_secs_f64(secs) {
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                 if msg.message == WM_QUIT {
@@ -86,6 +99,37 @@ fn main() {
                 }
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
+            }
+            while let Ok(command) = changes.try_recv() {
+                let parts: Vec<_> = command.split_whitespace().collect();
+                if parts.first() == Some(&"minimize") {
+                    let _ = ShowWindow(hwnd, SW_MINIMIZE);
+                    println!("phase minimize");
+                    continue;
+                }
+                if parts.first() == Some(&"restore") {
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                    println!("phase restore");
+                    continue;
+                }
+                if parts.len() != 3 { continue }
+                let (Ok(w), Ok(h)) = (parts[1].parse::<u32>(), parts[2].parse::<u32>()) else { continue };
+                let _ = sc.SetFullscreenState(false, None);
+                ctx.ClearState();
+                rtv = None;
+                let style = if parts[0] == "window" { WS_OVERLAPPEDWINDOW } else { WS_POPUP };
+                SetWindowLongPtrW(hwnd, GWL_STYLE, style.0 as isize);
+                let mut outer = RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 };
+                AdjustWindowRect(&mut outer, style, false).unwrap();
+                SetWindowPos(hwnd, None, 40, 40, outer.right - outer.left, outer.bottom - outer.top, SWP_FRAMECHANGED | SWP_NOZORDER).unwrap();
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+                if parts[0] == "exclusive" {
+                    let _ = SetForegroundWindow(hwnd);
+                    sc.SetFullscreenState(true, None).unwrap();
+                    sc.ResizeTarget(&DXGI_MODE_DESC { Width: w, Height: h, Format: DXGI_FORMAT_R8G8B8A8_UNORM, ..Default::default() }).unwrap();
+                }
+                sc.ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH).unwrap();
+                println!("phase {} {w} {h}", parts[0]);
             }
             if rtv.is_none() {
                 let bb: ID3D11Texture2D = sc.GetBuffer(0).unwrap();
@@ -96,10 +140,28 @@ fn main() {
             let t = start.elapsed().as_secs_f32();
             let c = [0.2 + 0.2 * (t * 0.7).sin(), 0.25 + 0.2 * (t * 0.5 + 2.0).sin(), 0.4 + 0.2 * (t * 0.3 + 4.0).sin(), 1.0];
             ctx.ClearRenderTargetView(rtv.as_ref().unwrap(), &c);
+            if resolution_test {
+                let bb: ID3D11Texture2D = sc.GetBuffer(0).unwrap();
+                let mut d = D3D11_TEXTURE2D_DESC::default();
+                bb.GetDesc(&mut d);
+                let (w, h) = (d.Width as i32, d.Height as i32);
+                ctx.ClearRenderTargetView(rtv.as_ref().unwrap(), &[0.0, 0.0, 1.0, 1.0]);
+                let (cw, ch) = (w / 6, h / 6);
+                context1.ClearView(rtv.as_ref().unwrap(), &[1.0, 0.0, 0.0, 1.0], Some(&[
+                    RECT { left: 0, top: 0, right: cw, bottom: ch },
+                    RECT { left: w-cw, top: 0, right: w, bottom: ch },
+                    RECT { left: 0, top: h-ch, right: cw, bottom: h },
+                    RECT { left: w-cw, top: h-ch, right: w, bottom: h },
+                ]));
+                // A changing patch makes freezes observable without changing the corner probes.
+                context1.ClearView(rtv.as_ref().unwrap(), &[0.0, (t * 3.0).sin().abs(), 1.0, 1.0], Some(&[
+                    RECT { left: w/3, top: h/3, right: w*2/3, bottom: h*2/3 },
+                ]));
+            }
             let _ = sc.Present(1, DXGI_PRESENT(0));
             frames += 1;
         }
-        if fullscreen {
+        if fullscreen || resolution_test {
             let _ = sc.SetFullscreenState(false, None);
         }
         println!("done frames={frames}");

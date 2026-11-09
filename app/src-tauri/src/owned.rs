@@ -115,10 +115,10 @@ pub fn scan(capture_root: &Path, buffer_root: Option<&Path>) -> Scan {
         s.roots.push(capture_root.to_path_buf());
         scan_recordings(capture_root, &mut s);
     }
-    let mut buffers = vec![capture_root.join("Buffer")];
+    let mut buffers: Vec<PathBuf> = BACKGROUND_DIRS.iter().map(|n| capture_root.join(n)).collect();
     if let Some(b) = buffer_root.filter(|b| !b.as_os_str().is_empty()) {
         if b.is_dir() {
-            buffers.push(b.join("Buffer"));
+            buffers.extend(BACKGROUND_DIRS.iter().map(|n| b.join(n)));
         } else {
             s.unavailable.push(b.to_path_buf());
         }
@@ -130,10 +130,13 @@ pub fn scan(capture_root: &Path, buffer_root: Option<&Path>) -> Scan {
     s
 }
 
+/// The background-recording folder's name, and its name before 0.6.1 (as the engine's `storage`).
+pub const BACKGROUND_DIRS: [&str; 2] = ["Background Recording", "Buffer"];
+
 fn scan_recordings(root: &Path, s: &mut Scan) {
     for game in std::fs::read_dir(root).into_iter().flatten().flatten() {
         let g = game.path();
-        if !g.is_dir() || game.file_name().eq_ignore_ascii_case("Buffer") {
+        if !g.is_dir() || BACKGROUND_DIRS.iter().any(|n| game.file_name().eq_ignore_ascii_case(n)) {
             continue;
         }
         let mut any_kind = false;
@@ -199,7 +202,7 @@ fn scan_buffer(buffer: &Path, s: &mut Scan) {
         for f in std::fs::read_dir(&d).into_iter().flatten().flatten() {
             let fp = f.path();
             let n = f.file_name().to_string_lossy().to_ascii_lowercase();
-            let ours = (n.starts_with("seg_") && n.ends_with(".ts")) || ["session.json", "markers.json", "markers.json.tmp"].contains(&n.as_str());
+            let ours = (n.starts_with("seg_") && n.ends_with(".ts")) || ["session.json", "markers.json", "markers.json.tmp", "ended.json"].contains(&n.as_str()) || (n.starts_with("review_") && n.ends_with(".mp4"));
             if ours && fp.is_file() {
                 s.temporary_bytes += size(&fp);
                 s.temporary.push(fp);

@@ -1,5 +1,28 @@
 # Handoff: in-game overlay (CAPTURE 0.6.x), 2026-11-09
 
+> **Update, 2026-11-09 (later the same day).** The open bug below was attacked as follows; none of it has been
+> seen on Skyrim yet (build `dist\CAPTURE-0.6.1-setup.exe`, not installed).
+> - Where the overlay opens is now decided **by the worker at the key press**, from the window in front at that
+>   moment (`Command::OverlayOpen` -> `Event::OverlayOpened { mode }`, `Engine::overlay_mode`), not by the UI from the
+>   last published state. A window is opened only when nothing fullscreen is in front; fullscreen = covers >= 98 % of
+>   its monitor (`targets::placement`), or Windows reports a Direct3D fullscreen application, or the hook reports
+>   exclusive. In-game needs the captured game in front with the hook drawing; otherwise the notice.
+> - Every request logs one line `overlay: asked for; ...` with all the facts (rectangles, hook state, exclusive).
+> - `capture-inject32.exe` is started without a console window (one appearing takes focus from a fullscreen game).
+> - The hook takes the game's input only once the overlay is really drawn; the worker closes an in-game overlay
+>   when the game stops drawing or Windows gives no picture of the overlay window for 2 s.
+> - The overlay window is no longer raised with `set_always_on_top(false)` (that put it above the game).
+> - **Open request from the user (not started):** Replay must be on the overlay's FIRST screen, in one clean,
+>   simply organized menu with the other actions; no button press to reach the footage. Also unknown: whether the
+>   Replay video renders inside the in-game (mirrored) overlay; `capture.log` now has `replay: footage ...` lines.
+> - Since this note: Replay tab/overlay Replay show a closed game's footage, a timeline that follows the recording,
+>   saved clips and screenshots on it; `Buffer` folder renamed `Background Recording`; overlay colours converted
+>   for sRGB/HDR back buffers (unverified on screen); overlay input goes through DevTools `Input.dispatch...`.
+> - Build with `scripts\package-portable.ps1` (it now builds the 64-bit hook on its own: together with
+>   `--bin capture-worker` it was never rebuilt). The one-line `cargo build ... -p capture-app` below overflows
+>   bindgen's stack.
+
+
 For the next engineer/agent. Written at the point of escalation: **opening the overlay over
 fullscreen Skyrim still minimizes Skyrim.** Everything below is what is true now, with evidence.
 

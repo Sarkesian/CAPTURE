@@ -290,8 +290,11 @@ fn allow_media(app: &AppHandle, s: &AppSettings) {
         let _ = app.asset_protocol_scope().allow_directory(&s.capture_root, true);
     }
     if let Some(b) = s.buffer_root.as_deref().filter(|b| !b.trim().is_empty()) {
-        // `<temporary-footage folder>\Buffer`, as the engine's `storage::buffer_dir_for`.
-        let _ = app.asset_protocol_scope().allow_directory(Path::new(b.trim()).join("Buffer"), true);
+        // `<chosen folder>\Background Recording`, as the engine's `storage::buffer_dir_for`
+        // (`Buffer` before 0.6.1).
+        for name in owned::BACKGROUND_DIRS {
+            let _ = app.asset_protocol_scope().allow_directory(Path::new(b.trim()).join(name), true);
+        }
     }
 }
 
@@ -410,7 +413,6 @@ fn close_overlay_window(app: &AppHandle, w: &tauri::WebviewWindow) {
                 let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, windows::Win32::UI::WindowsAndMessaging::SW_HIDE);
             }
         }
-        let _ = w.set_always_on_top(true);
     }
     let _ = w.hide();
     set_page_visible(w, false);
@@ -462,6 +464,139 @@ const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreen
 /// The overlay is open inside the game (mirrored by the in-game hook), not as a window.
 static OVERLAY_IN_GAME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The player's mouse and keyboard while the overlay is shown inside a game.
+///
+/// The in-game hook posts ordinary mouse and key messages to the overlay window. Handing those
+/// to WebView2's own window does not work for hovering: on every move the browser asks Windows
+/// to watch the pointer, Windows answers that the pointer is not over that window (it is over
+/// the game), and the browser drops the hover at once. So the messages are taken here and given
+/// to the page through the browser's input channel (DevTools `Input.dispatch...`), which behaves
+/// exactly like a real mouse and keyboard: hover, clicks, dragging, the wheel and keys.
+mod game_input {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    use serde_json::json;
+    use tauri::{AppHandle, Manager};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::*;
+
+    static APP: OnceLock<AppHandle> = OnceLock::new();
+    static PREVIOUS: AtomicIsize = AtomicIsize::new(0);
+    /// Last pointer position (window pixels) and the latest left click (when, where, count).
+    static POINTER: Mutex<(i32, i32)> = Mutex::new((0, 0));
+    static CLICK: Mutex<Option<(Instant, i32, i32, u32)>> = Mutex::new(None);
+
+    pub fn install(app: &AppHandle, overlay: &tauri::WebviewWindow) {
+        let _ = APP.set(app.clone());
+        if let Ok(hwnd) = overlay.hwnd() {
+            unsafe {
+                let previous = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, wndproc as *const () as isize);
+                PREVIOUS.store(previous, Ordering::SeqCst);
+            }
+        }
+    }
+
+    unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        if super::OVERLAY_IN_GAME.load(Ordering::SeqCst) && forward(msg, wp, lp) {
+            return LRESULT(0);
+        }
+        let previous: WNDPROC = std::mem::transmute(PREVIOUS.load(Ordering::SeqCst));
+        CallWindowProcW(previous, hwnd, msg, wp, lp)
+    }
+
+    /// Give one message from the game to the page; `false` if it is not input.
+    fn forward(msg: u32, wp: WPARAM, lp: LPARAM) -> bool {
+        let Some(w) = APP.get().and_then(|a| a.get_webview_window("overlay")) else { return false };
+        let scale = w.scale_factor().unwrap_or(1.0).max(0.1);
+        // Mouse-button state as the page wants it: left 1, right 2, middle 4.
+        let held = |wp: usize| (wp & 1) | (wp & 2) | ((wp & 0x10) >> 2);
+        let at = |x: i32, y: i32| (x as f64 / scale, y as f64 / scale);
+        let (method, params) = match msg {
+            WM_MOUSEMOVE => {
+                let (x, y) = ((lp.0 & 0xffff) as i16 as i32, ((lp.0 >> 16) & 0xffff) as i16 as i32);
+                *POINTER.lock().unwrap() = (x, y);
+                let (cx, cy) = at(x, y);
+                let b = held(wp.0);
+                ("Input.dispatchMouseEvent", json!({ "type": "mouseMoved", "x": cx, "y": cy, "button": if b & 1 != 0 { "left" } else { "none" }, "buttons": b }))
+            }
+            WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_RBUTTONDBLCLK | WM_MBUTTONDOWN | WM_MBUTTONUP => {
+                let (x, y) = ((lp.0 & 0xffff) as i16 as i32, ((lp.0 >> 16) & 0xffff) as i16 as i32);
+                *POINTER.lock().unwrap() = (x, y);
+                let (cx, cy) = at(x, y);
+                let (button, bit) = match msg {
+                    WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK => ("left", 1),
+                    WM_RBUTTONDOWN | WM_RBUTTONUP | WM_RBUTTONDBLCLK => ("right", 2),
+                    _ => ("middle", 4),
+                };
+                let down = !matches!(msg, WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP);
+                // Two presses of the left button close together are a double click.
+                let mut click = CLICK.lock().unwrap();
+                let mut count = 1;
+                if button == "left" {
+                    if down {
+                        if let Some((t, px, py, n)) = *click {
+                            if t.elapsed().as_millis() < 500 && (px - x).abs() < 8 && (py - y).abs() < 8 {
+                                count = n + 1;
+                            }
+                        }
+                        *click = Some((Instant::now(), x, y, count));
+                    } else {
+                        count = click.map_or(1, |c| c.3);
+                    }
+                }
+                let buttons = if down { held(wp.0) | bit } else { held(wp.0) & !bit };
+                ("Input.dispatchMouseEvent", json!({ "type": if down { "mousePressed" } else { "mouseReleased" }, "x": cx, "y": cy, "button": button, "buttons": buttons, "clickCount": count }))
+            }
+            WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+                // (The position that comes with a wheel message is a screen position, which means
+                // nothing here: the wheel turns where the pointer was last seen.)
+                let (x, y) = *POINTER.lock().unwrap();
+                let (cx, cy) = at(x, y);
+                let turn = ((wp.0 >> 16) & 0xffff) as i16 as f64 * 100.0 / 120.0;
+                let (dx, dy) = if msg == WM_MOUSEWHEEL { (0.0, -turn) } else { (turn, 0.0) };
+                ("Input.dispatchMouseEvent", json!({ "type": "mouseWheel", "x": cx, "y": cy, "deltaX": dx, "deltaY": dy, "buttons": held(wp.0 & 0xffff) }))
+            }
+            WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
+                let vk = wp.0 as u32;
+                let key = match vk {
+                    0x1B => "Escape".to_string(),
+                    0x0D => "Enter".to_string(),
+                    0x09 => "Tab".to_string(),
+                    0x08 => "Backspace".to_string(),
+                    0x2E => "Delete".to_string(),
+                    0x20 => " ".to_string(),
+                    0x21 => "PageUp".to_string(),
+                    0x22 => "PageDown".to_string(),
+                    0x23 => "End".to_string(),
+                    0x24 => "Home".to_string(),
+                    0x25 => "ArrowLeft".to_string(),
+                    0x26 => "ArrowUp".to_string(),
+                    0x27 => "ArrowRight".to_string(),
+                    0x28 => "ArrowDown".to_string(),
+                    0x30..=0x39 | 0x41..=0x5A => (vk as u8 as char).to_ascii_lowercase().to_string(),
+                    _ => String::new(),
+                };
+                let kind = if matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN) { "rawKeyDown" } else { "keyUp" };
+                ("Input.dispatchKeyEvent", json!({ "type": kind, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk, "key": key }))
+            }
+            WM_CHAR => {
+                let Some(c) = char::from_u32(wp.0 as u32).filter(|c| !c.is_control()) else { return true };
+                ("Input.dispatchKeyEvent", json!({ "type": "char", "text": c.to_string() }))
+            }
+            WM_SYSCHAR | WM_DEADCHAR => return true,
+            _ => return false,
+        };
+        let _ = w.with_webview(move |wv| unsafe {
+            if let Ok(core) = wv.controller().CoreWebView2() {
+                let _ = core.CallDevToolsProtocolMethod(&windows::core::HSTRING::from(method), &windows::core::HSTRING::from(params.to_string()), None);
+            }
+        });
+        true
+    }
+}
+
 fn toggle_overlay_window(app: &AppHandle) {
     let Some(w) = app.get_webview_window("overlay") else { return };
     // (Shown inside the game the window was shown directly through Windows, so Tauri does not
@@ -470,48 +605,71 @@ fn toggle_overlay_window(app: &AppHandle) {
         close_overlay_window(app, &w);
         return;
     }
-    // Over a game that fills its screen and has CAPTURE's in-game hook, show the overlay inside
-    // the game: no window can be seen over exclusive fullscreen, and taking focus would minimize
-    // the game. The window is shown behind everything, without focus, and mirrored into the game,
-    // which forwards the player's input to it.
-    let (in_game, fullscreen) = app.state::<AppState>().last_state.lock().unwrap().as_ref().map_or((false, false), |s| (s.in_game, s.game_fullscreen));
-    if !in_game && fullscreen {
-        // A window over a fullscreen game would take focus and minimize it: say why instead.
-        eprintln!("overlay: not opened (fullscreen game without the in-game overlay)");
-        let _ = app.state::<AppState>().worker.send(Command::OverlayUnavailable);
-        return;
+    // Where it opens is decided by the worker at this moment, from the window in front right
+    // now: inside a fullscreen game (through CAPTURE's in-game hook), as a window, or not at all
+    // (a notice says why). A window over a fullscreen game would take focus and minimize it, so
+    // nothing is shown here until the worker has answered (`open_overlay`).
+    if app.state::<AppState>().worker.send(Command::OverlayOpen).is_err() {
+        // No worker, so no game is being recorded and no hotkey reached us: opened by hand.
+        open_overlay(app, capture_protocol::OverlayMode::Window);
     }
-    eprintln!("overlay: opening {}", if in_game { "inside the game" } else { "as a window" });
-    if in_game {
-        if let Ok(hwnd) = w.hwnd() {
-            use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, ShowWindow, HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE};
+}
+
+/// The worker's answer to `Command::OverlayOpen` (or its word that the overlay inside the game
+/// has to close).
+fn open_overlay(app: &AppHandle, mode: capture_protocol::OverlayMode) {
+    use capture_protocol::OverlayMode;
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, ShowWindow, HWND_BOTTOM, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_SHOWNOACTIVATE};
+    let Some(w) = app.get_webview_window("overlay") else { return };
+    let open = OVERLAY_IN_GAME.load(std::sync::atomic::Ordering::SeqCst) || w.is_visible().unwrap_or(false);
+    match mode {
+        OverlayMode::Closed => {
+            if OVERLAY_IN_GAME.load(std::sync::atomic::Ordering::SeqCst) {
+                close_overlay_window(app, &w);
+            }
+        }
+        OverlayMode::Unavailable => {}
+        _ if open => {} // a second answer to a key pressed twice
+        OverlayMode::InGame => {
+            // The window is shown at the very back, without focus, and never on top: the game
+            // keeps the foreground. The worker mirrors it into the game's picture and the game
+            // forwards the player's mouse and keyboard to it.
+            let Ok(hwnd) = w.hwnd() else { return };
             unsafe {
+                // (Moving a topmost window to the bottom also ends its topmost status.)
+                let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                 let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                 let _ = SetWindowPos(hwnd, Some(HWND_BOTTOM), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             }
-            let _ = w.set_always_on_top(false);
             set_page_visible(&w, true);
             OVERLAY_IN_GAME.store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = app.state::<AppState>().worker.send(Command::OverlayMirror { hwnd: Some(hwnd.0 as u64) });
             let _ = app.emit_to("overlay", "overlay_shown", ());
-            return;
         }
-    }
-    // Centre on the monitor under the mouse (the one being played on).
-    if let Ok(cursor) = app.cursor_position() {
-        if let Ok(Some(mon)) = app.monitor_from_point(cursor.x, cursor.y) {
-            if let Ok(size) = w.outer_size() {
-                let (mp, ms) = (mon.position(), mon.size());
-                let x = mp.x + (ms.width as i32 - size.width as i32) / 2;
-                let y = mp.y + (ms.height as i32 - size.height as i32) / 2;
-                let _ = w.set_position(PhysicalPosition::new(x, y));
+        OverlayMode::Window => {
+            // Centre on the monitor under the mouse (the one being played on).
+            if let Ok(cursor) = app.cursor_position() {
+                if let Ok(Some(mon)) = app.monitor_from_point(cursor.x, cursor.y) {
+                    if let Ok(size) = w.outer_size() {
+                        let (mp, ms) = (mon.position(), mon.size());
+                        let x = mp.x + (ms.width as i32 - size.width as i32) / 2;
+                        let y = mp.y + (ms.height as i32 - size.height as i32) / 2;
+                        let _ = w.set_position(PhysicalPosition::new(x, y));
+                    }
+                }
             }
+            // On top again (shown inside a game it was moved to the back).
+            if let Ok(hwnd) = w.hwnd() {
+                unsafe {
+                    let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
+            }
+            let _ = w.show();
+            set_page_visible(&w, true);
+            let _ = w.set_focus();
+            let _ = app.emit_to("overlay", "overlay_shown", ());
         }
     }
-    let _ = w.show();
-    set_page_visible(&w, true);
-    let _ = w.set_focus();
-    let _ = app.emit_to("overlay", "overlay_shown", ());
 }
 
 #[tauri::command]
@@ -729,6 +887,11 @@ fn on_message(app: &AppHandle, m: Message) {
         Event::HotkeyPressed { action: capture_protocol::HotkeyAction::ToggleOverlay } => {
             let a = app.clone();
             let _ = app.run_on_main_thread(move || toggle_overlay_window(&a));
+        }
+        Event::OverlayOpened { mode } => {
+            let (a, mode) = (app.clone(), *mode);
+            let _ = app.run_on_main_thread(move || open_overlay(&a, mode));
+            return;
         }
         Event::Levels { .. } => {
             // High-rate meter data: forward straight to the webviews, nothing else to do.
@@ -1043,6 +1206,7 @@ fn main() {
                 .additional_browser_args(BROWSER_ARGS)
                 .build()?;
             set_page_visible(&overlay, false);
+            game_input::install(app.handle(), &overlay);
             overlay.on_window_event(|e| {
                 if let WindowEvent::CloseRequested { api, .. } = e {
                     api.prevent_close();

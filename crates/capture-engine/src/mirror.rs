@@ -12,14 +12,16 @@ use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession};
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
-use windows::Win32::Foundation::{HMODULE, HWND, LPARAM};
+use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, POINT, RECT};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess};
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
-use windows::Win32::UI::WindowsAndMessaging::{EnumChildWindows, GetClassNameW};
+use windows::Win32::UI::WindowsAndMessaging::{EnumChildWindows, GetClassNameW, GetClientRect, GetWindowRect};
 
 use crate::inject::GameHook;
 
@@ -31,6 +33,8 @@ pub struct Mirror {
     session: GraphicsCaptureSession,
     pool: Direct3D11CaptureFramePool,
     hook: Arc<Mutex<Option<GameHook>>>,
+    frames: Arc<std::sync::atomic::AtomicU32>,
+    started: std::time::Instant,
 }
 
 unsafe impl Send for Mirror {}
@@ -53,6 +57,24 @@ pub fn input_window(hwnd: u64) -> u64 {
     if found == 0 { hwnd } else { found }
 }
 
+/// Where the input window's client area is inside a `w` x `h` picture of window `top`:
+/// (left, top, width, height). The picture covers the window's visible frame; the game's hook
+/// sends mouse positions in the input window's own coordinates, so the game must be handed
+/// exactly that area, or everything the player points at is off by the frame's thickness.
+unsafe fn input_area(top: HWND, input: HWND, w: u32, h: u32) -> (u32, u32, u32, u32) {
+    let mut frame = RECT::default();
+    if DwmGetWindowAttribute(top, DWMWA_EXTENDED_FRAME_BOUNDS, &mut frame as *mut _ as *mut _, std::mem::size_of::<RECT>() as u32).is_err() && GetWindowRect(top, &mut frame).is_err() {
+        return (0, 0, w, h);
+    }
+    let (mut origin, mut client) = (POINT::default(), RECT::default());
+    if !ClientToScreen(input, &mut origin).as_bool() || GetClientRect(input, &mut client).is_err() {
+        return (0, 0, w, h);
+    }
+    let (x, y) = ((origin.x - frame.left).clamp(0, w as i32 - 1) as u32, (origin.y - frame.top).clamp(0, h as i32 - 1) as u32);
+    let (cw, ch) = ((client.right.max(0) as u32).min(w - x), (client.bottom.max(0) as u32).min(h - y));
+    if cw == 0 || ch == 0 { (0, 0, w, h) } else { (x, y, cw, ch) }
+}
+
 impl Mirror {
     /// Start showing window `hwnd` inside the game through `hook`.
     pub fn start(hwnd: u64, hook: Arc<Mutex<Option<GameHook>>>) -> Result<Self, String> {
@@ -71,6 +93,13 @@ impl Mirror {
             let gpu = SendCtx(dev, ctx);
             let staging: Mutex<Option<(ID3D11Texture2D, u32, u32)>> = Mutex::new(None);
             let sink = hook.clone();
+            let (top, input) = (hwnd, input_window(hwnd));
+            {
+                let (x, y, cw, ch) = input_area(HWND(top as *mut _), HWND(input as *mut _), size.Width.max(1) as u32, size.Height.max(1) as u32);
+                eprintln!("in-game overlay: overlay window picture {}x{}, input area {cw}x{ch} at {x},{y}", size.Width, size.Height);
+            }
+            let frames = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let counted = frames.clone();
             pool.FrameArrived(&TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(move |pool, _| {
                 let gpu = &gpu;
                 let Ok(pool) = pool.ok() else { return Ok(()) };
@@ -102,7 +131,10 @@ impl Mirror {
                 let mut m = D3D11_MAPPED_SUBRESOURCE::default();
                 gpu.1.Map(stage, 0, D3D11_MAP_READ, 0, Some(&mut m))?;
                 if let Some(hk) = sink.lock().unwrap().as_ref() {
-                    hk.overlay_frame(w, h, m.pData as *const u8, m.RowPitch as usize);
+                    let (x, y, w, h) = input_area(HWND(top as *mut _), HWND(input as *mut _), w, h);
+                    let src = (m.pData as *const u8).add(y as usize * m.RowPitch as usize + x as usize * 4);
+                    hk.overlay_frame(w, h, src, m.RowPitch as usize);
+                    counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 gpu.1.Unmap(stage, 0);
                 Ok(())
@@ -110,10 +142,18 @@ impl Mirror {
             .map_err(|e| e.to_string())?;
             session.StartCapture().map_err(|e| e.to_string())?;
             if let Some(h) = hook.lock().unwrap().as_ref() {
-                h.set_overlay(true, hwnd, input_window(hwnd));
+                // Input goes to the overlay window itself, which hands it to its page (posting it
+                // to the browser's own input window loses hovering).
+                h.set_overlay(true, hwnd, hwnd);
             }
-            Ok(Self { session, pool, hook })
+            Ok(Self { session, pool, hook, frames, started: std::time::Instant::now() })
         }
+    }
+
+    /// Windows has given no picture of the overlay window for two seconds: there is nothing
+    /// to show in the game (seen when the window is not being drawn at all).
+    pub fn blind(&self) -> bool {
+        self.frames.load(std::sync::atomic::Ordering::Relaxed) == 0 && self.started.elapsed().as_secs_f32() > 2.0
     }
 }
 

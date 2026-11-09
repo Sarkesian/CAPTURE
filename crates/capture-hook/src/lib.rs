@@ -428,8 +428,14 @@ unsafe fn subclass_game_window(hwnd: HWND) {
 
 type WndProcFn = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT;
 
+/// The overlay was drawn on the game's latest frame.
+static OVERLAY_DRAWN: AtomicBool = AtomicBool::new(false);
+
+/// The overlay is open and the player can see it. Only then is the game's mouse and keyboard
+/// taken: with no picture of the overlay yet (or ever), the game must keep its input, or the
+/// player is left with a game that does not react and nothing on screen to explain it.
 fn overlay_is_open() -> Option<&'static Header> {
-    shared().filter(|h| h.overlay_open.load(Ordering::Acquire) != 0)
+    shared().filter(|h| h.overlay_open.load(Ordering::Acquire) != 0 && OVERLAY_DRAWN.load(Ordering::Relaxed))
 }
 
 /// Game-window client position -> overlay-window position, if over the overlay.
@@ -491,24 +497,34 @@ unsafe extern "system" fn game_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPA
     CallWindowProcW(Some(std::mem::transmute::<usize, WndProcFn>(orig)), hwnd, msg, wp, lp)
 }
 
-/// A mouse pointer (white arrow with a dark outline), BGRA, 20 x 30.
+/// Each cell of the pointer drawing becomes this many pixels, so its edges stay sharp when it
+/// is drawn at the size of a real pointer on a high-resolution frame.
+const POINTER_DETAIL: usize = 4;
+
+/// A mouse pointer (white arrow with a dark outline), BGRA.
 fn pointer_pixels() -> (Vec<u8>, u32, u32) {
     const ROWS: [&str; 22] = [
         "X", "XX", "X.X", "X..X", "X...X", "X....X", "X.....X", "X......X", "X.......X", "X........X", "X.........X", "X..........X", "X......XXXXX", "X...X..X", "X..XX..X", "X.X  X..X", "XX   X..X", "X     X..X", "      X..X", "       X..X", "       X..X", "        XX",
     ];
-    let (w, h) = (13u32, ROWS.len() as u32);
-    let mut px = vec![0u8; (w * h * 4) as usize];
+    let k = POINTER_DETAIL;
+    let (w, h) = (13 * k, ROWS.len() * k);
+    let mut px = vec![0u8; w * h * 4];
     for (y, row) in ROWS.iter().enumerate() {
         for (x, c) in row.chars().enumerate() {
-            let i = (y * w as usize + x) * 4;
-            match c {
-                'X' => px[i..i + 4].copy_from_slice(&[20, 20, 20, 255]),
-                '.' => px[i..i + 4].copy_from_slice(&[255, 255, 255, 255]),
-                _ => {}
+            let colour = match c {
+                'X' => [20, 20, 20, 255],
+                '.' => [255, 255, 255, 255],
+                _ => continue,
+            };
+            for sy in 0..k {
+                for sx in 0..k {
+                    let i = ((y * k + sy) * w + x * k + sx) * 4;
+                    px[i..i + 4].copy_from_slice(&colour);
+                }
             }
         }
     }
-    (px, w, h)
+    (px, w as u32, h as u32)
 }
 
 // ---- DirectInput (games that read the mouse/keyboard directly, e.g. Skyrim) ---------------
@@ -608,7 +624,7 @@ unsafe fn di_state(this: *mut c_void, cb: u32, data: *mut c_void, orig: &AtomicU
                 let s = data as *const i32;
                 let b = (data as *const u8).add(12);
                 let buttons = (*b & 0x80 != 0) as usize | ((*b.add(1) & 0x80 != 0) as usize) << 1 | ((*b.add(2) & 0x80 != 0) as usize) << 2;
-                feed_mouse(*s, *s.add(1), *s.add(2), Some(buttons));
+                feed_mouse(1, *s, *s.add(1), *s.add(2), Some(buttons));
             }
             if kind == 0x12 || kind == 0x13 {
                 std::ptr::write_bytes(data as *mut u8, 0, cb as usize);
@@ -644,7 +660,7 @@ unsafe fn di_data(this: *mut c_void, cb: u32, data: *mut u8, count: *mut u32, fl
                         _ => {}
                     }
                 }
-                feed_mouse(dx, dy, dz, Some(buttons));
+                feed_mouse(2, dx, dy, dz, Some(buttons));
             }
             if kind == 0x12 || kind == 0x13 {
                 *count = 0;
@@ -655,15 +671,65 @@ unsafe fn di_data(this: *mut c_void, cb: u32, data: *mut u8, count: *mut u32, fl
     r
 }
 
+/// The player's Windows pointer settings: (speed factor, "enhance pointer precision" on).
+fn pointer_settings() -> (f32, bool) {
+    static SETTINGS: std::sync::OnceLock<(f32, bool)> = std::sync::OnceLock::new();
+    *SETTINGS.get_or_init(|| unsafe {
+        // Pointer speed 1..20 as Windows turns it into a factor (10, the default, is 1).
+        const FACTOR: [f32; 20] = [0.03125, 0.0625, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5];
+        let mut speed = 10i32;
+        let _ = SystemParametersInfoW(SPI_GETMOUSESPEED, 0, Some(&mut speed as *mut i32 as *mut c_void), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
+        let mut accel = [0i32; 3];
+        let _ = SystemParametersInfoW(SPI_GETMOUSE, 0, Some(accel.as_mut_ptr() as *mut c_void), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
+        (FACTOR[(speed.clamp(1, 20) - 1) as usize], accel[2] != 0)
+    })
+}
+
+/// Parts of a pixel the pointer has not moved yet (slow movements add up instead of being lost),
+/// and when the mouse was last read.
+static POINTER_REST: Mutex<(f32, f32, Option<Instant>)> = Mutex::new((0.0, 0.0, None));
+
 /// Move our pointer by a relative mouse movement and send moves, clicks and wheel turns to the
-/// overlay window.
-unsafe fn feed_mouse(dx: i32, dy: i32, dz: i32, buttons: Option<usize>) {
+/// overlay window. The game reads the bare mouse, so the movement is turned into pointer travel
+/// the way Windows does on the desktop: the player's pointer speed, and faster travel for
+/// faster movements when "enhance pointer precision" is on.
+///
+/// `source` is how the game read the mouse (1 its current state, 2 its queued events). A game
+/// that reads it both ways would move the pointer twice, so movement is taken from whichever
+/// way delivered some first.
+unsafe fn feed_mouse(source: usize, dx: i32, dy: i32, dz: i32, buttons: Option<usize>) {
+    static MOVES_FROM: AtomicUsize = AtomicUsize::new(0);
+    let (dx, dy) = if dx == 0 && dy == 0 {
+        (0, 0)
+    } else {
+        match MOVES_FROM.compare_exchange(0, source, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => (dx, dy),
+            Err(from) if from == source => (dx, dy),
+            Err(_) => (0, 0),
+        }
+    };
     let Some(h) = overlay_is_open() else { return };
     let Some((rect, (bw, bh), _)) = *OVERLAY_RECT.lock().unwrap() else { return };
     let target = HWND(h.overlay_input_hwnd.load(Ordering::Relaxed) as *mut c_void);
     let mut c = CURSOR.lock().unwrap();
     let (x, y) = c.unwrap_or(((rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0));
-    let (x, y) = ((x + dx as f32).clamp(0.0, bw - 1.0), (y + dy as f32).clamp(0.0, bh - 1.0));
+    let (speed, precision) = pointer_settings();
+    let (mx, my) = {
+        let mut rest = POINTER_REST.lock().unwrap();
+        // How fast the mouse is moving, in counts per second: the game reads the mouse once per
+        // frame, so the size of one reading says nothing without the time it covers.
+        let now = Instant::now();
+        let dt = rest.2.map_or(1.0 / 60.0, |t| now.duration_since(t).as_secs_f32()).clamp(1.0 / 500.0, 1.0 / 20.0);
+        rest.2 = Some(now);
+        let velocity = ((dx * dx + dy * dy) as f32).sqrt() / dt;
+        // A gentle version of "enhance pointer precision", which on the desktop moves the
+        // pointer less than the mouse for slow, careful movements and more for fast sweeps.
+        let gain = speed * if precision { 0.8 + ((velocity - 1500.0) / 12000.0).clamp(0.0, 0.4) } else { 0.9 };
+        let (fx, fy) = (dx as f32 * gain + rest.0, dy as f32 * gain + rest.1);
+        (rest.0, rest.1) = (fx - fx.trunc(), fy - fy.trunc());
+        (fx.trunc(), fy.trunc())
+    };
+    let (x, y) = ((x + mx).clamp(0.0, bw - 1.0), (y + my).clamp(0.0, bh - 1.0));
     *c = Some((x, y));
     drop(c);
     let held = DI_BUTTONS.load(Ordering::Relaxed);
@@ -713,14 +779,16 @@ enum Layer {
     Pointer,
 }
 
-/// Count the frame and report it to the worker.
-fn count_frame(h: &Header, api: u32) {
-    h.presents.fetch_add(1, Ordering::Relaxed);
+/// Count the frame and report it to the worker; `true` on the frames (the first, then every
+/// 32nd) on which the slower facts about the game are refreshed.
+fn count_frame(h: &Header, api: u32) -> bool {
+    let n = h.presents.fetch_add(1, Ordering::Relaxed);
     h.last_present_qpc.store(qpc(), Ordering::Relaxed);
     h.api.store(api, Ordering::Relaxed);
     if h.hook_state.load(Ordering::Relaxed) != proto::state::PRESENTING {
         h.hook_state.store(proto::state::PRESENTING, Ordering::Release);
     }
+    n % 32 == 0
 }
 
 /// Pick up a newly published notice and work out how visible the current one is.
@@ -796,8 +864,10 @@ fn layout(bw: f32, bh: f32, notice: Option<(f32, u32, u32, f32)>, overlay: Optio
         out.push((Layer::Overlay, [x, y, x + ow, y + oh], 1.0));
     }
     if let (Some(_), Some((x, y))) = (overlay, pointer) {
-        let k = (bh / 1080.0).clamp(1.0, 3.0) * 1.3;
-        out.push((Layer::Pointer, [x, y, x + 13.0 * k, y + 22.0 * k], 1.0));
+        // The size Windows draws its arrow at on a screen of this height (about 19 pixels tall
+        // per 1080 lines at the usual scaling).
+        let k = (bh / 1440.0).clamp(0.75, 2.5);
+        out.push((Layer::Pointer, [x.round(), y.round(), x.round() + 13.0 * k, y.round() + 22.0 * k], 1.0));
     }
     if let Some((alpha, w, h, scale_pct)) = notice {
         // Size relative to a 1080-line frame, so it looks the same at any resolution.
@@ -844,12 +914,13 @@ unsafe fn on_present(this: *mut c_void) -> windows::core::Result<()> {
         count_frame(h, proto::api::OTHER_DXGI);
         return Ok(());
     };
-    count_frame(h, proto::api::D3D11);
-    // Exclusive fullscreen as DXGI reports it (cheap; tells the worker the overlay must be
-    // shown inside the game).
-    let mut full = windows::core::BOOL(0);
-    let _ = sc.GetFullscreenState(Some(&mut full), None);
-    h.exclusive.store(full.as_bool() as u32, Ordering::Relaxed);
+    if count_frame(h, proto::api::D3D11) {
+        // Exclusive fullscreen as DXGI reports it (tells the worker the overlay must be shown
+        // inside the game).
+        let mut full = windows::core::BOOL(0);
+        let _ = sc.GetFullscreenState(Some(&mut full), None);
+        h.exclusive.store(full.as_bool() as u32, Ordering::Relaxed);
+    }
     let mut n = NOTICE.lock().unwrap();
     let mut o = OVERLAY.lock().unwrap();
     let alpha = notice_alpha(h, &mut n);
@@ -861,6 +932,9 @@ unsafe fn on_present(this: *mut c_void) -> windows::core::Result<()> {
     }
     if !open {
         *CURSOR.lock().unwrap() = None;
+    }
+    if !open {
+        OVERLAY_DRAWN.store(false, Ordering::Relaxed);
     }
     if alpha.is_none() && !open {
         *OVERLAY_RECT.lock().unwrap() = None;
@@ -889,7 +963,11 @@ unsafe fn on_present(this: *mut c_void) -> windows::core::Result<()> {
     let pointer = if open { *CURSOR.lock().unwrap() } else { None };
     let layers = layout(d.Width as f32, d.Height as f32, alpha.map(|a| (a, n.w, n.h, scale_pct)), open.then_some((o.w, o.h)), pointer);
     remember_overlay(&layers, d.Width, d.Height, o.w, o.h);
+    if r.rtv.is_none() || r.backbuffer != bb.as_raw() as usize {
+        r.encoding = frame_encoding(sc, d.Format);
+    }
     r.draw(&bb, &d, &layers)?;
+    OVERLAY_DRAWN.store(open, Ordering::Relaxed);
     drawn(h, n.seq, d.Width, d.Height, d.Format.0 as u32);
     Ok(())
 }
@@ -902,11 +980,12 @@ unsafe fn on_present9(this: *mut c_void) -> windows::core::Result<()> {
     drop_if_dormant();
     let Some(h) = shared() else { return Ok(()) };
     let Some(dev) = IDirect3DDevice9::from_raw_borrowed(&this) else { return Ok(()) };
-    count_frame(h, proto::api::D3D9);
-    if let Ok(sc) = dev.GetSwapChain(0) {
-        let mut pp = D3DPRESENT_PARAMETERS::default();
-        if sc.GetPresentParameters(&mut pp).is_ok() {
-            h.exclusive.store((!pp.Windowed.as_bool()) as u32, Ordering::Relaxed);
+    if count_frame(h, proto::api::D3D9) {
+        if let Ok(sc) = dev.GetSwapChain(0) {
+            let mut pp = D3DPRESENT_PARAMETERS::default();
+            if sc.GetPresentParameters(&mut pp).is_ok() {
+                h.exclusive.store((!pp.Windowed.as_bool()) as u32, Ordering::Relaxed);
+            }
         }
     }
     let mut n = NOTICE.lock().unwrap();
@@ -921,6 +1000,9 @@ unsafe fn on_present9(this: *mut c_void) -> windows::core::Result<()> {
     }
     if !open {
         *CURSOR.lock().unwrap() = None;
+    }
+    if !open {
+        OVERLAY_DRAWN.store(false, Ordering::Relaxed);
     }
     if alpha.is_none() && !open {
         *OVERLAY_RECT.lock().unwrap() = None;
@@ -950,6 +1032,7 @@ unsafe fn on_present9(this: *mut c_void) -> windows::core::Result<()> {
     let layers = layout(d.Width as f32, d.Height as f32, alpha.map(|a| (a, n.w, n.h, scale_pct)), open.then_some((o.w, o.h)), pointer);
     remember_overlay(&layers, d.Width, d.Height, o.w, o.h);
     r.draw(dev, &bb, &d, &layers)?;
+    OVERLAY_DRAWN.store(open, Ordering::Relaxed);
     drawn(h, n.seq, d.Width, d.Height, d.Format.0 as u32);
     Ok(())
 }
@@ -1102,10 +1185,30 @@ V vs(uint id : SV_VertexID) {
     o.uv = uv;
     return o;
 }
+float3 srgb_to_linear(float3 c) {
+    return c <= 0.04045 ? c / 12.92 : pow(abs((c + 0.055) / 1.055), 2.4);
+}
 float4 ps(V i) : SV_Target {
     float4 c = tex.Sample(smp, i.uv);
+    // Our pictures are ordinary screen colours (sRGB). What the game's frame expects differs
+    // from game to game (alpha.z); written unchanged into a frame that expects something else
+    // they come out washed out, too dark or too bright.
+    float3 rgb = c.rgb;
+    if (alpha.z > 0.5) {
+        // 1: the frame takes linear light and encodes it itself (sRGB back buffer).
+        rgb = srgb_to_linear(rgb);
+        if (alpha.z > 1.5 && alpha.z < 2.5) {
+            // 2: HDR, linear light where 1.0 is 80 nits: put white at the brightness in alpha.w.
+            rgb *= alpha.w / 80.0;
+        } else if (alpha.z > 2.5) {
+            // 3: HDR10: wide-gamut primaries, then the PQ curve.
+            rgb = float3(dot(rgb, float3(0.6274, 0.3293, 0.0433)), dot(rgb, float3(0.0691, 0.9195, 0.0114)), dot(rgb, float3(0.0164, 0.0880, 0.8956)));
+            float3 y = pow(abs(rgb * alpha.w / 10000.0), 0.1593017578125);
+            rgb = pow(abs((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y)), 78.84375);
+        }
+    }
     // alpha.y = 1: an opaque picture whose alpha channel means nothing (a captured window).
-    return float4(c.rgb, lerp(c.a, 1.0, alpha.y) * alpha.x);
+    return float4(rgb, lerp(c.a, 1.0, alpha.y) * alpha.x);
 }
 "#;
 
@@ -1140,6 +1243,40 @@ struct Renderer {
     rtv: Option<ID3D11RenderTargetView>,
     /// Back buffer the view was made for.
     backbuffer: usize,
+    /// How colours must be written into the game's frame (see `Encoding`).
+    encoding: f32,
+}
+
+/// What a game's frame expects of the colours written into it (the pixel shader's `alpha.z`).
+mod encoding {
+    /// Ordinary screen colours, as our pictures are: written unchanged.
+    pub const SRGB: f32 = 0.0;
+    /// Linear light that the frame encodes itself (sRGB back buffers, common with Unity).
+    pub const LINEAR: f32 = 1.0;
+    /// HDR, linear light with 1.0 = 80 nits (16-bit float back buffers).
+    pub const HDR_LINEAR: f32 = 2.0;
+    /// HDR10 (10-bit back buffer in the PQ colour space).
+    pub const HDR10: f32 = 3.0;
+    /// How bright our white is drawn in an HDR frame, in nits (about a desktop window's).
+    pub const HDR_WHITE_NITS: f32 = 200.0;
+}
+
+/// The encoding for a back buffer of `format` on swap chain `sc`.
+unsafe fn frame_encoding(sc: &IDXGISwapChain, format: DXGI_FORMAT) -> f32 {
+    // HDR10 is a colour space of the swap chain rather than a format, and DXGI has no way to ask
+    // a swap chain for it: a 10-bit back buffer on a screen that is in HDR mode is taken as HDR10.
+    if matches!(format, DXGI_FORMAT_R10G10B10A2_UNORM | DXGI_FORMAT_R10G10B10A2_TYPELESS) {
+        if let Ok(out6) = sc.GetContainingOutput().and_then(|o| o.cast::<IDXGIOutput6>()) {
+            if out6.GetDesc1().is_ok_and(|d| d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
+                return encoding::HDR10;
+            }
+        }
+    }
+    match format {
+        DXGI_FORMAT_R8G8B8A8_UNORM_SRGB | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB | DXGI_FORMAT_B8G8R8X8_UNORM_SRGB => encoding::LINEAR,
+        DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_TYPELESS => encoding::HDR_LINEAR,
+        _ => encoding::SRGB,
+    }
 }
 
 unsafe impl Send for Renderer {}
@@ -1201,6 +1338,7 @@ impl Renderer {
             pointer: None,
             rtv: None,
             backbuffer: 0,
+            encoding: encoding::SRGB,
         };
         r.dim = Some(r.immutable(&[0, 0, 0, 255], 1, 1)?);
         let (px, w, h) = pointer_pixels();
@@ -1306,7 +1444,7 @@ impl Renderer {
             let (x0, y0) = ndc(l, t);
             let (x1, y1) = ndc(r, b);
             let opaque = if layer == Layer::Overlay { 1.0 } else { 0.0 };
-            let consts: [f32; 8] = [x0, y0, x1, y1, alpha, opaque, 0.0, 0.0];
+            let consts: [f32; 8] = [x0, y0, x1, y1, alpha, opaque, self.encoding, encoding::HDR_WHITE_NITS];
             let mut m = D3D11_MAPPED_SUBRESOURCE::default();
             if ctx.Map(&self.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut m)).is_ok() {
                 std::ptr::copy_nonoverlapping(consts.as_ptr(), m.pData as *mut f32, 8);
@@ -1330,5 +1468,16 @@ fn typed(f: DXGI_FORMAT) -> DXGI_FORMAT {
         DXGI_FORMAT_R10G10B10A2_TYPELESS => DXGI_FORMAT_R10G10B10A2_UNORM,
         DXGI_FORMAT_R16G16B16A16_TYPELESS => DXGI_FORMAT_R16G16B16A16_FLOAT,
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn shaders_compile() {
+        unsafe {
+            super::compile(b"vs\0", b"vs_4_0\0").expect("vertex shader");
+            super::compile(b"ps\0", b"ps_4_0\0").expect("pixel shader");
+        }
     }
 }

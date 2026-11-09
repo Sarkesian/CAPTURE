@@ -31,7 +31,7 @@ const st2 = await waitFor(m => m.re === s2 && m.event === 'save_started');
 const fin2 = await waitFor(m => m.event === 'save_finished' && m.data.save_id === st2.data.save_id);
 check(fin2.data.duration_secs >= 5.9 && fin2.data.duration_secs <= 7.1, `6 s replay saved as ${fin2.data.duration_secs.toFixed(2)} s (was up to +2 s before)`);
 console.log('review file:', rv.data.path);
-send('release_review');
+send('release_review', {});
 await sleep(500);
 send('shutdown');
 await new Promise(r => proc.on('exit', r));

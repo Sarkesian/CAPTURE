@@ -50,7 +50,7 @@ altKey(0x7a); // Alt+F11
 check(await waitFor(async () => overlayVisible(), 5000), 'Alt+F11 opens the overlay');
 const ov = await connect(await page(u => u.includes('#overlay')));
 await waitFor(async () => (await ov.js(`document.querySelector('.st')?.textContent`)) === 'Replay on', 10000);
-check((await ov.js(`[...document.querySelectorAll('.act .big')].map(e => e.textContent).join('|')`)) === 'Save Replay|Add Marker|Review Recording|Start Recording', 'four primary actions visible');
+check((await ov.js(`[...document.querySelectorAll('.act .big')].map(e => e.textContent).join('|')`)) === 'Save Replay|Add Marker|Replay|Start Recording', 'four primary actions visible');
 await ov.shot('1-overlay-home');
 
 // 2) Add Marker + Save Replay from the overlay.
@@ -64,7 +64,7 @@ check(await waitFor(async () => (await ov.js(`document.querySelectorAll('.clip .
 await ov.shot('2-overlay-saved');
 
 // 3) Review Recording: real playback of buffered footage, marker on the timeline, range save.
-await click(ov, 'Review Recording');
+await click(ov, 'Replay');
 check(await waitFor(async () => (await ov.js(`(() => { const v = document.querySelector('.rv video'); return v && v.readyState >= 2 && v.duration > 3; })()`)), 20000), 'review video loaded while recording continues');
 check(await ov.js(`document.querySelectorAll('.mk').length`) >= 1, 'marker visible on the timeline');
 await ov.js(`(() => { const v = document.querySelector('.rv video'); v.currentTime = Math.max(0, v.duration - 4); return v.play().then(() => true, () => false); })()`);

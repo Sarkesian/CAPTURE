@@ -53,9 +53,9 @@
     <section class="banner warn" data-test="path-issue">
       <Icon name="alert" size={18} />
       <div class="grow">
-        <b>{issue.which === 'capture_root' ? 'Your recordings folder isn’t available' : 'Your temporary footage folder isn’t available'}</b>:
+        <b>{issue.which === 'capture_root' ? 'Your recordings folder isn’t available' : 'Your background recording folder isn’t available'}</b>:
         <span class="mono">{issue.path}</span>. Its drive isn’t connected to this PC. CAPTURE keeps this setting, so it works again when the drive is back,
-        {issue.which === 'capture_root' ? 'but it can’t save until then.' : 'but replay can’t buffer until then.'}
+        {issue.which === 'capture_root' ? 'but it can’t save until then.' : 'but background recording is paused until then.'}
       </div>
       {#if issue.which === 'capture_root'}
         <button class="btn sm" onclick={changeFolder}>Choose folder…</button>
@@ -154,7 +154,7 @@
     <button class="link plain" onclick={openCaptureFolder} title="Open the capture folder"><span class="faint">Saving to</span> <span class="mono">{s.capture_root}</span></button>
     {#if e?.free_bytes != null}<span class="sep"></span><span><span class="faint">Free</span> {fmtBytes(e.free_bytes)}</span>{/if}
     <span class="sep"></span>
-    <span><span class="faint">Temporary</span> {fmtBytes(e?.buffer_bytes ?? 0)} of {s.buffer_cap_gb} GB</span>
+    <span><span class="faint">Background recording</span> {fmtBytes(e?.buffer_bytes ?? 0)} of {s.buffer_cap_gb} GB</span>
     <span class="grow"></span>
     <button class="btn ghost sm" onclick={() => onnavigate('settings')}><Icon name="settings" size={16} />Recording settings</button>
   </footer>

@@ -180,7 +180,9 @@ impl GameHook {
             h.magic.store(proto::MAGIC, Ordering::Release);
             if bits32 {
                 let helper = shipped(&["capture-inject32.exe"]).ok_or("capture-inject32.exe is missing next to the worker")?;
-                let out = std::process::Command::new(helper).arg(pid.to_string()).arg(&dll).output().map_err(|e| format!("32-bit loader: {e}"))?;
+                // No console window: one appearing takes focus and minimizes a fullscreen game.
+                use std::os::windows::process::CommandExt;
+                let out = std::process::Command::new(helper).arg(pid.to_string()).arg(&dll).creation_flags(0x0800_0000 /* CREATE_NO_WINDOW */).output().map_err(|e| format!("32-bit loader: {e}"))?;
                 if !out.status.success() {
                     return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
                 }
@@ -242,6 +244,26 @@ impl GameHook {
     /// The game presents in exclusive fullscreen (as DirectX tells the hook).
     pub fn exclusive(&self) -> bool {
         self.usable() && self.header().exclusive.load(Ordering::Relaxed) != 0
+    }
+
+    /// The hook's condition in a few words, for the log.
+    pub fn facts(&self) -> String {
+        let h = self.header();
+        let mut now = 0i64;
+        unsafe {
+            let _ = windows::Win32::System::Performance::QueryPerformanceCounter(&mut now);
+        }
+        let last = h.last_present_qpc.load(Ordering::Relaxed);
+        let age = if last == 0 { "never".to_string() } else { format!("{:.2}s ago", (now as u64).saturating_sub(last) as f64 / self.qpf as f64) };
+        format!(
+            "hook state {} api {} exclusive {} last frame {age} frames {} backbuffer {}x{}",
+            h.hook_state.load(Ordering::Relaxed),
+            h.api.load(Ordering::Relaxed),
+            h.exclusive.load(Ordering::Relaxed),
+            h.presents.load(Ordering::Relaxed),
+            h.backbuffer_w.load(Ordering::Relaxed),
+            h.backbuffer_h.load(Ordering::Relaxed),
+        )
     }
 
     /// Show (or stop showing) CAPTURE's overlay window inside the game. `input` is the window

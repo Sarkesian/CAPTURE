@@ -67,6 +67,7 @@ pub struct Engine {
     mirror: Option<mirror::Mirror>,
     emit: Emit,
     next_save_id: u64,
+    screenshots: Arc<std::sync::atomic::AtomicUsize>,
     fps_sample: (Instant, u64),
     capture_fps: f64,
     last_state: Option<EngineState>,
@@ -77,6 +78,16 @@ pub struct Engine {
     mic_monitor: Option<mic::Monitor>,
     /// UI views currently showing meters.
     meter_clients: std::collections::HashSet<String>,
+    /// Games (by process id) already told that borderless gives a better overlay.
+    borderless_tip: std::collections::HashSet<u32>,
+    /// The game in exclusive fullscreen CAPTURE has been drawing in, and since when; and the
+    /// games already told "Overlay ready".
+    ready_since: Option<(u32, Instant)>,
+    ready_told: std::collections::HashSet<u32>,
+    /// The Replay snapshot of the previous background recording, while one is being watched.
+    past_review: Option<PathBuf>,
+    /// The previous background recording's folder and game (looked up once per folder).
+    past_seen: Option<(PathBuf, String)>,
 }
 
 /// How long a different game must stay in front before Auto mode switches to it: a little
@@ -85,6 +96,8 @@ pub struct Engine {
 fn switch_after(previous_closed: bool) -> std::time::Duration {
     std::time::Duration::from_secs(if previous_closed { 20 } else { 4 })
 }
+
+const OVERLAY_READY: &str = "Overlay ready";
 
 /// A hotkey as shown in notices: `"Alt+F10"`.
 fn quoted(combo: &str) -> String {
@@ -113,6 +126,7 @@ impl Engine {
             mirror: None,
             emit,
             next_save_id: 1,
+            screenshots: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             fps_sample: (Instant::now(), 0),
             capture_fps: 0.0,
             last_state: None,
@@ -120,6 +134,11 @@ impl Engine {
             switch_candidate: None,
             mic_monitor: None,
             meter_clients: Default::default(),
+            borderless_tip: Default::default(),
+            ready_since: None,
+            ready_told: Default::default(),
+            past_review: None,
+            past_seen: None,
         }
     }
 
@@ -141,6 +160,8 @@ impl Engine {
             c.overlay
                 && match kind {
                     Kind::Recording => c.notices.recording_started,
+                    // Takes the place of the "Recording ..." notice when a game starts.
+                    Kind::Saved if title == OVERLAY_READY => c.notices.recording_started,
                     Kind::Saved if title.starts_with("Marker") => c.notices.marker,
                     Kind::Working | Kind::Saved => c.notices.saved,
                     Kind::Failed => c.notices.problems,
@@ -188,10 +209,26 @@ impl Engine {
 
     /// Short confirmation sound the moment a hotkey action is accepted (uses the same
     /// "confirmation sound" setting, device and volume as markers). Never recorded.
-    fn ack_sound(&self) {
+    fn ack_sound(&self, cue: sound::Cue) {
         if let Some(m) = self.cfg.as_ref().map(|c| &c.markers).filter(|m| m.sound) {
-            sound::play_chime(m.sound_volume, m.sound_device.clone());
+            sound::play(cue, m.sound_volume, m.sound_device.clone());
         }
+    }
+
+    fn capture_feedback(&self, re: Option<u64>, action: CaptureAction) {
+        let (title, cue, kind) = match action {
+            CaptureAction::Screenshot => ("Screenshot saved", sound::Cue::Screenshot, Kind::Saved),
+            CaptureAction::Replay => ("Clip Saved", sound::Cue::Replay, Kind::Saved),
+            CaptureAction::RecordingStart => ("Recording started", sound::Cue::Start, Kind::Recording),
+            CaptureAction::RecordingStop => ("Recording saved", sound::Cue::Stop, Kind::Saved),
+        };
+        let overlay_notice = self.cfg.as_ref().is_some_and(|c| c.overlay && if action == CaptureAction::RecordingStart { c.notices.recording_started } else { c.notices.saved })
+            && (self.overlay.is_some() || self.pipeline.as_ref().is_some_and(|p| p.hook.lock().unwrap().as_ref().is_some_and(|h| h.usable())));
+        // Publish input acceptance before touching the GPU, encoder or filesystem.
+        self.send(re, Event::CaptureTriggered { action, overlay_notice });
+        crate::trace::ev("feedback", crate::clock::now_100ns(), action as i64, 0, 0);
+        self.ack_sound(cue);
+        self.notice(kind, title.into(), String::new());
     }
 
     pub fn handle(&mut self, re: Option<u64>, cmd: Command) -> bool {
@@ -216,13 +253,40 @@ impl Engine {
                 Some(p) => {
                     let emit = self.emit.clone();
                     p.prepare_review(move |r| {
+                        match &r {
+                            Ok(rv) => eprintln!("replay: footage {:.1}..{:.1} s ready to watch", rv.start, rv.end),
+                            Err(e) => eprintln!("replay: footage not ready: {e}"),
+                        }
                         emit(Message::new(re, match r {
                             Ok(rv) => Event::ReviewReady(rv),
                             Err(message) => Event::ReviewFailed { message },
                         }))
                     });
                 }
-                None => self.send(re, Event::ReviewFailed { message: "Nothing is being recorded right now.".into() }),
+                // Nothing is being recorded: the previous background recording, if it is still there.
+                None => match self.past_recording() {
+                    Some((dir, _)) => {
+                        if let Some(old) = self.past_review.take() {
+                            let _ = std::fs::remove_file(old);
+                        }
+                        let path = dir.join(format!("review_{:03}.mp4", self.next_save_id));
+                        self.next_save_id += 1;
+                        self.past_review = Some(path.clone());
+                        let emit = self.emit.clone();
+                        std::thread::spawn(move || {
+                            let r = past_review(&dir, &path);
+                            match &r {
+                                Ok(rv) => eprintln!("replay: previous recording, {:.1} s ready to watch", rv.end),
+                                Err(e) => eprintln!("replay: previous recording not ready: {e}"),
+                            }
+                            emit(Message::new(re, match r {
+                                Ok(rv) => Event::ReviewReady(rv),
+                                Err(message) => Event::ReviewFailed { message },
+                            }))
+                        });
+                    }
+                    None => self.send(re, Event::ReviewFailed { message: "Nothing is being recorded right now.".into() }),
+                },
             },
             Command::Meters { client, enabled } => {
                 if enabled {
@@ -265,19 +329,47 @@ impl Engine {
                 });
             }
             Command::Screenshot => self.screenshot(re),
-            Command::OverlayUnavailable => {
-                self.notice(Kind::Failed, "Overlay unavailable in fullscreen".into(), "Switch the game to borderless or windowed to use it".into());
+            Command::OverlayOpen => {
+                self.mirror = None;
+                let (mode, ready_soon, facts) = self.overlay_mode();
+                let what = match mode {
+                    OverlayMode::InGame => "opening inside the game",
+                    OverlayMode::Window => "opening as a window",
+                    _ if ready_soon => "not opened, a game in exclusive fullscreen is in front and CAPTURE is not drawing in it yet",
+                    _ => "not opened, a game in exclusive fullscreen is in front and CAPTURE cannot draw in it",
+                };
+                eprintln!("overlay: asked for; {what}; {facts}");
+                match mode {
+                    OverlayMode::Unavailable => self.overlay_unavailable(ready_soon),
+                    OverlayMode::InGame => {
+                        // Once per game: the overlay is sharper and handles better as a real
+                        // window, which only a borderless game allows.
+                        let pid = self.pipeline.as_ref().map_or(0, |p| p.shared.target_pid);
+                        if self.borderless_tip.insert(pid) {
+                            self.notice(Kind::Working, "Tip: play in borderless window".into(), "The overlay is sharper and smoother there".into());
+                        }
+                    }
+                    _ => {}
+                }
+                self.send(re, Event::OverlayOpened { mode });
             }
             Command::OverlayMirror { hwnd } => {
                 self.mirror = None;
-                if let (Some(hwnd), Some(p)) = (hwnd, &self.pipeline) {
-                    if p.hook.lock().unwrap().as_ref().is_some_and(|h| h.usable()) {
-                        match mirror::Mirror::start(hwnd, p.hook.clone()) {
-                            Ok(m) => {
-                                eprintln!("in-game overlay: showing the overlay in the game");
-                                self.mirror = Some(m);
-                            }
-                            Err(e) => eprintln!("in-game overlay: cannot show the overlay in the game: {e}"),
+                if let Some(hwnd) = hwnd {
+                    let started = match &self.pipeline {
+                        Some(p) if p.hook.lock().unwrap().as_ref().is_some_and(|h| h.usable()) => mirror::Mirror::start(hwnd, p.hook.clone()),
+                        _ => Err("the game is not drawing through CAPTURE any more".into()),
+                    };
+                    match started {
+                        Ok(m) => {
+                            eprintln!("in-game overlay: showing the overlay in the game");
+                            self.mirror = Some(m);
+                        }
+                        Err(e) => {
+                            // Never fall back to a window here: the game is fullscreen.
+                            eprintln!("in-game overlay: cannot show the overlay in the game: {e}");
+                            self.overlay_unavailable(false);
+                            self.send(re, Event::OverlayOpened { mode: OverlayMode::Closed });
                         }
                     }
                 }
@@ -307,9 +399,14 @@ impl Engine {
                     emit(Message::new(re, ev));
                 });
             }
-            Command::ReleaseReview => {
+            Command::ReleaseReview { path } => {
+                if self.past_review.as_ref().is_some_and(|f| path.is_none() || path.as_deref() == Some(&*f.to_string_lossy())) {
+                    let _ = std::fs::remove_file(self.past_review.take().unwrap());
+                }
                 if let Some(p) = &self.pipeline {
-                    p.shared.release_review();
+                    if path.is_none() || path == p.shared.review_path() {
+                        p.shared.release_review();
+                    }
                 }
             }
             Command::AddMarker { label } => self.add_marker(re, label),
@@ -397,6 +494,7 @@ impl Engine {
             (CaptureTarget::Auto { ignore, .. }, Some(p)) => ignore.iter().any(|i| i.eq_ignore_ascii_case(&p.shared.target_exe)),
             _ => false,
         };
+        if cfg.markers.sound { sound::warm_output(cfg.markers.sound_device.clone()); }
         self.cfg = Some(cfg);
         if let Some(p) = &self.pipeline {
             let game_cfg = self.cfg.as_ref().map(|c| c.for_game(&p.shared.target_exe));
@@ -449,6 +547,7 @@ impl Engine {
                 self.start_error = None;
                 self.fps_sample = (Instant::now(), 0);
                 self.pipeline = Some(p);
+                self.forget_past_recordings();
                 let save = if cfg.save_hotkey.is_empty() { "Save clip in CAPTURE".to_string() } else { quoted(&cfg.save_hotkey) };
                 let title = if display { "Recording your display".to_string() } else { format!("Recording {name}") };
                 let mic = match (cfg.audio.mic_enabled, cfg.audio.mic_muted) {
@@ -456,12 +555,16 @@ impl Engine {
                     (true, true) => " · mic muted",
                     _ => "",
                 };
-                let mut detail = format!("{save} saves the last {}{mic}", fmt_secs(live_of(cfg).replay_secs as f64));
-                if !cfg.hotkeys.overlay.is_empty() {
-                    detail.push_str(&format!("
-{} opens the overlay", quoted(&cfg.hotkeys.overlay)));
+                let detail = format!("{save} saves the last {}{mic}", fmt_secs(live_of(cfg).replay_secs as f64));
+                if cfg.hotkeys.overlay.is_empty() {
+                    self.notice(Kind::Recording, title, detail);
+                } else if !targets::d3d_fullscreen_running() {
+                    // With an overlay key, the notice at the start of a game is the reminder of
+                    // that key (everything else is in the overlay). Over a game in exclusive
+                    // fullscreen the overlay is not ready yet, and saying so now would be untrue
+                    // and unseen: `announce_overlay_ready` says it once CAPTURE draws in the game.
+                    self.notice(Kind::Saved, OVERLAY_READY.into(), format!("Press {} to open it", quoted(&cfg.hotkeys.overlay)));
                 }
-                self.notice(Kind::Recording, title, detail);
             }
             Err(e) => self.start_error = Some(failed(e)),
         }
@@ -470,18 +573,12 @@ impl Engine {
     fn start_session(&mut self, re: Option<u64>) {
         let Some(p) = self.pipeline.as_ref().filter(|p| !p.target_gone()) else {
             let msg = if self.replay_on { "Nothing is being captured right now." } else { "Turn on recording first." };
+            self.notice(Kind::Failed, "Recording not started".into(), msg.into());
             self.send(re, Event::Error { message: format!("Can't start a recording: {msg}") });
             return;
         };
         if p.start_session() {
-            let game = p.shared.game_name.clone();
-            self.ack_sound();
-            let key = self.cfg.as_ref().map(|c| c.hotkeys.session.clone()).filter(|k| !k.is_empty());
-            let detail = match key {
-                Some(k) => format!("Press {} again to stop and save it", quoted(&k)),
-                None => "Press the same key again to stop and save it".into(),
-            };
-            self.notice(Kind::Recording, format!("Recording session · {game}"), detail);
+            self.capture_feedback(re, CaptureAction::RecordingStart);
         }
     }
 
@@ -496,20 +593,18 @@ impl Engine {
         let id = self.next_save_id;
         self.next_save_id += 1;
         let emit = self.emit.clone();
-        let overlay = self.overlay.clone().filter(|_| self.cfg.as_ref().is_some_and(|c| c.overlay));
+        let overlay = self.overlay.clone().filter(|_| self.cfg.as_ref().is_some_and(|c| c.overlay && c.notices.problems));
         let hook = p.hook.clone();
-        let game = p.shared.game_name.clone();
-        let game_now = game.clone();
         let stems = self.editor_audio_files();
+        self.capture_feedback(re, CaptureAction::RecordingStop);
         let requested = p.stop_session(
             move |r| {
-                // Success was already confirmed when the key was pressed; only a failure is shown.
+                // Input was acknowledged already; completion only updates the library.
                 let ev = match r {
                     Ok((clip, _)) => {
                         if stems {
                             export_stems_after_save(&emit, &clip);
                         }
-                        let _ = &game;
                         Event::SaveFinished(clip)
                     }
                     Err(message) => {
@@ -522,30 +617,43 @@ impl Engine {
             id,
         );
         if let Some(secs) = requested {
-            self.ack_sound();
-            // The one notice for this save: confirms the key press at once.
-            self.notice(Kind::Saved, format!("Session saved · {}", fmt_secs(secs)), game_now);
             self.send(re, Event::SaveStarted { save_id: id, requested_secs: secs });
         }
     }
 
     fn screenshot(&mut self, re: Option<u64>) {
         let Some(p) = self.pipeline.as_ref().filter(|p| !p.target_gone()) else {
+            self.notice(Kind::Failed, "Screenshot not taken".into(), "Nothing is being captured right now.".into());
             self.send(re, Event::Error { message: "Nothing is being captured right now, so there is nothing to screenshot.".into() });
             return;
         };
-        match shot::save(&p.gpu, &p.capture, &p.shared.root, &p.shared.game_name) {
-            Ok(path) => {
-                self.ack_sound();
-                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                self.notice(Kind::Saved, "Screenshot saved".into(), name);
-                self.send(re, Event::ScreenshotSaved { path: path.to_string_lossy().into_owned() });
-            }
-            Err(e) => {
-                self.notice(Kind::Failed, "Screenshot not saved".into(), e.clone());
-                self.send(re, Event::Error { message: format!("Screenshot not saved: {e}") });
-            }
+        if self.screenshots.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < 2).then_some(n + 1)).is_err() {
+            self.notice(Kind::Failed, "Screenshot not taken".into(), "Two screenshots are still processing. Try again in a moment.".into());
+            self.send(re, Event::Error { message: "Two screenshots are still processing. Try again in a moment.".into() });
+            return;
         }
+        let (gpu, capture, shared) = (p.gpu.clone(), p.capture.clone(), p.shared.clone());
+        let at = shared.now();
+        let emit = self.emit.clone();
+        let pending = self.screenshots.clone();
+        let hook = p.hook.clone();
+        let overlay = self.overlay.clone().filter(|_| self.cfg.as_ref().is_some_and(|c| c.overlay && c.notices.problems));
+        self.capture_feedback(re, CaptureAction::Screenshot);
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shot::save(&gpu, &capture, &shared.root, &shared.game_name)))
+                .unwrap_or_else(|_| Err("Screenshot processing failed.".into()));
+            match result {
+                Ok(path) => {
+                    shared.note_saved(SavedKind::Screenshot, at, None, &path);
+                    emit(Message::new(re, Event::ScreenshotSaved { path: path.to_string_lossy().into_owned() }));
+                }
+                Err(message) => {
+                    if overlay.is_some() { route_notice(overlay.as_ref(), &hook, Notice { kind: Kind::Failed, title: "Screenshot not saved".into(), detail: message.clone() }); }
+                    emit(Message::new(re, Event::Error { message: format!("Screenshot not saved: {message}") }));
+                }
+            }
+            pending.fetch_sub(1, Ordering::SeqCst);
+        });
     }
 
     fn toggle_session(&mut self, re: Option<u64>) {
@@ -581,6 +689,30 @@ impl Engine {
     }
 
     fn save(&mut self, re: Option<u64>, range: Option<(f64, f64)>) {
+        // A range of the previous background recording (Replay while nothing is being recorded).
+        let past = self.past_recording(); // (none while a game is being recorded)
+        if let (Some((start, end)), Some((dir, _)), Some(root)) = (range, past, self.cfg.as_ref().map(|c| PathBuf::from(&c.capture_root))) {
+            let id = self.next_save_id;
+            self.next_save_id += 1;
+            self.capture_feedback(re, CaptureAction::Replay);
+            self.send(re, Event::SaveStarted { save_id: id, requested_secs: end - start });
+            let emit = self.emit.clone();
+            std::thread::spawn(move || {
+                emit(Message::new(re, match past_clip(&root, &dir, start, end) {
+                    Ok(c) => Event::SaveFinished(SavedClip {
+                        save_id: id,
+                        path: c.path.to_string_lossy().into_owned(),
+                        requested_secs: end - start,
+                        duration_secs: c.duration_secs,
+                        bytes: c.bytes,
+                        video_streams: c.video_streams,
+                        audio_tracks: c.audio_tracks,
+                    }),
+                    Err(message) => Event::SaveFailed { save_id: id, message },
+                }));
+            });
+            return;
+        }
         let Some(p) = &self.pipeline else {
             let msg = if self.replay_on {
                 "Nothing is being recorded right now, so there is nothing to save."
@@ -594,27 +726,25 @@ impl Engine {
         let id = self.next_save_id;
         self.next_save_id += 1;
         let emit = self.emit.clone();
-        let flags = self.cfg.as_ref().map(|c| (c.overlay && c.notices.saved, c.overlay && c.notices.problems)).unwrap_or((false, false));
+        let problems = self.cfg.as_ref().is_some_and(|c| c.overlay && c.notices.problems);
         let overlay = self.overlay.clone();
         let hook = p.hook.clone();
-        let game = p.shared.game_name.clone();
-        let game_now = game.clone();
         let stems = self.editor_audio_files();
+        self.capture_feedback(re, CaptureAction::Replay);
         let requested = p.request_save(
             range,
             SaveKind::Clip,
             move |r| {
-                // Success was already confirmed when the key was pressed; only a failure is shown.
+                // Input was acknowledged already; completion only updates the library.
                 let ev = match r {
                     Ok((clip, _)) => {
                         if stems {
                             export_stems_after_save(&emit, &clip);
                         }
-                        let _ = &game;
                         Event::SaveFinished(clip)
                     }
                     Err(message) => {
-                        if flags.1 {
+                        if problems {
                             route_notice(overlay.as_ref(), &hook, Notice { kind: Kind::Failed, title: "Clip not saved".into(), detail: message.clone() });
                         }
                         Event::SaveFailed { save_id: id, message }
@@ -624,10 +754,6 @@ impl Engine {
             },
             id,
         );
-        // The one notice for this save, the moment the key is pressed: the input was taken.
-        // (A failure later shows "Clip not saved".)
-        self.ack_sound();
-        self.notice(Kind::Saved, format!("Clip saved · last {}", fmt_secs(requested)), game_now);
         self.send(re, Event::SaveStarted { save_id: id, requested_secs: requested });
     }
 
@@ -716,6 +842,21 @@ impl Engine {
     /// Called periodically and after every command. Emits only when something changed,
     /// unless `force`.
     pub fn publish_state(&mut self, re: Option<u64>, force: bool) {
+        // An overlay shown inside a game that closed or stopped drawing (minimized, alt-tabbed
+        // away) is closed, so the next press of the hotkey opens it again instead of "closing"
+        // something nobody can see.
+        if self.mirror.is_some() && !self.pipeline.as_ref().is_some_and(|p| p.hook.lock().unwrap().as_ref().is_some_and(|h| h.usable())) {
+            eprintln!("in-game overlay: closed, the game is no longer drawing");
+            self.mirror = None;
+            self.send(None, Event::OverlayOpened { mode: OverlayMode::Closed });
+        }
+        self.announce_overlay_ready();
+        if self.mirror.as_ref().is_some_and(|m| m.blind()) {
+            eprintln!("in-game overlay: closed, Windows gives no picture of the overlay window while this game is in front");
+            self.mirror = None;
+            self.overlay_unavailable(false);
+            self.send(None, Event::OverlayOpened { mode: OverlayMode::Closed });
+        }
         let st = self.state();
         if force || self.last_state.as_ref() != Some(&st) {
             self.last_state = Some(st.clone());
@@ -723,21 +864,108 @@ impl Engine {
         }
     }
 
-    /// (overlay inside the game possible, game is fullscreen). Inside the game: CAPTURE's hook
-    /// draws there and the game is in exclusive fullscreen or fills its screen. Logged when it
-    /// changes, with the reasons.
-    fn in_game(&mut self) -> (bool, bool) {
-        let (hook, exclusive, fills) = match &self.pipeline {
+    /// In exclusive fullscreen the overlay only opens once CAPTURE draws inside the game, a little
+    /// while after the game starts. Say when that is, once per game, with the key that opens it.
+    fn announce_overlay_ready(&mut self) {
+        let drawing = self.pipeline.as_ref().and_then(|p| p.hook.lock().unwrap().as_ref().is_some_and(|h| h.exclusive()).then_some(p.shared.target_pid));
+        let Some(pid) = drawing else { return };
+        match self.ready_since {
+            Some((p, since)) if p == pid => {
+                if since.elapsed().as_millis() >= 1000 && self.mirror.is_none() && self.ready_told.insert(pid) {
+                    let key = self.cfg.as_ref().map(|c| c.hotkeys.overlay.clone()).unwrap_or_default();
+                    if !key.is_empty() {
+                        self.notice(Kind::Saved, OVERLAY_READY.into(), format!("Press {} to open it", quoted(&key)));
+                    }
+                }
+            }
+            _ => self.ready_since = Some((pid, Instant::now())),
+        }
+    }
+
+    /// The overlay cannot open over the game in front: say so with a notice and a sound (over
+    /// exclusive fullscreen, before CAPTURE draws in the game, the sound is all that gets through).
+    fn overlay_unavailable(&self, ready_soon: bool) {
+        if let Some(m) = self.cfg.as_ref().map(|c| &c.markers).filter(|m| m.sound) {
+            sound::play_refusal(m.sound_volume, m.sound_device.clone());
+        }
+        if ready_soon {
+            self.notice(Kind::Failed, "Overlay not ready yet".into(), "Try again in a few seconds".into());
+        } else {
+            self.notice(Kind::Failed, "No overlay in exclusive fullscreen here".into(), "Set the game to borderless window to use it".into());
+        }
+    }
+
+    /// Where the overlay can open right now, judged from the window in front at this moment
+    /// (not from the last published state, which can be seconds old or about another window,
+    /// e.g. a launcher that has just started the game); whether an unavailable overlay will be
+    /// available shortly; and the facts behind it for the log.
+    ///
+    /// - Nothing fullscreen in front, or a borderless game: a real window. That is the best
+    ///   overlay (native sharpness, the real mouse pointer), and such games stay up when another
+    ///   window takes focus.
+    /// - A game in exclusive fullscreen: it minimizes as soon as another window takes focus, so
+    ///   the overlay is drawn inside the game by CAPTURE's hook, or not shown at all.
+    fn overlay_mode(&self) -> (OverlayMode, bool, String) {
+        use capture_protocol::hook::{api, state};
+        let (target_pid, target_hwnd, usable, hook_exclusive, cannot_draw, hook_facts) = match &self.pipeline {
             Some(p) => {
                 let g = p.hook.lock().unwrap();
-                (g.as_ref().is_some_and(|h| h.usable()), g.as_ref().is_some_and(|h| h.exclusive()), targets::fills_monitor(p.shared.target_hwnd))
+                match g.as_ref() {
+                    Some(h) => {
+                        let hd = h.header();
+                        let (st, ap) = (hd.hook_state.load(Ordering::Relaxed), hd.api.load(Ordering::Relaxed));
+                        // Loaded, but it failed, or the game draws with something it cannot draw with.
+                        let cannot = st == state::FAILED || (st == state::PRESENTING && ap == api::OTHER_DXGI);
+                        (p.shared.target_pid, p.shared.target_hwnd, h.usable(), h.exclusive(), cannot, h.facts())
+                    }
+                    None => (p.shared.target_pid, p.shared.target_hwnd, false, false, false, "no hook in the captured game".to_string()),
+                }
             }
-            None => (false, false, false),
+            None => (0, 0, false, false, false, "nothing is being captured".to_string()),
         };
-        let fullscreen = exclusive || fills;
+        let mut front = targets::foreground();
+        if front == 0 {
+            front = target_hwnd; // between two windows: judge by the captured game
+        }
+        let d3d = targets::d3d_fullscreen_running();
+        let Some(pl) = targets::placement(front) else {
+            // Nothing can be told about what is in front: only open a window when Windows does
+            // not report an exclusive-fullscreen application either.
+            let mode = if d3d { OverlayMode::Unavailable } else { OverlayMode::Window };
+            return (mode, true, format!("no window in front; exclusive fullscreen running: {d3d}; {hook_facts}"));
+        };
+        let own = pl.pid == std::process::id() || targets::process_path(pl.pid).is_some_and(|p| p.to_ascii_lowercase().ends_with("\\capture.exe"));
+        let game_in_front = target_pid != 0 && pl.pid == target_pid;
+        let exclusive = !own && (d3d || (game_in_front && hook_exclusive));
+        let mode = match (exclusive, game_in_front && usable) {
+            (false, _) => OverlayMode::Window,
+            (true, true) => OverlayMode::InGame,
+            (true, false) => OverlayMode::Unavailable,
+        };
+        // Not yet: CAPTURE is still on another window (a launcher that started this game) or its
+        // hook has not seen a frame yet. Not at all: the hook is in this game and cannot draw.
+        let ready_soon = !(game_in_front && cannot_draw);
+        (mode, ready_soon, format!("in front: {}; fills its screen: {}; captured game pid {target_pid} in front: {game_in_front}; exclusive fullscreen running: {d3d}; {hook_facts}", pl.facts, pl.fullscreen))
+    }
+
+    /// (CAPTURE's hook draws in the captured game and it is fullscreen, the game is fullscreen),
+    /// for the published state. Logged when it changes, with the reasons.
+    fn in_game(&mut self) -> (bool, bool) {
+        let (hook, exclusive, placement) = match &self.pipeline {
+            Some(p) => {
+                let g = p.hook.lock().unwrap();
+                (g.as_ref().is_some_and(|h| h.usable()), g.as_ref().is_some_and(|h| h.exclusive()), targets::placement(p.shared.target_hwnd))
+            }
+            None => (false, false, None),
+        };
+        let fullscreen = exclusive || placement.as_ref().is_some_and(|p| p.fullscreen);
         let now = hook && fullscreen;
         if self.last_state.as_ref().is_some_and(|s| s.in_game != now) {
-            eprintln!("in-game overlay: {} (hook drawing: {hook}, exclusive fullscreen: {exclusive}, fills its screen: {fills})", if now { "available" } else { "not available" });
+            eprintln!(
+                "in-game overlay: {} (hook drawing: {hook}, exclusive fullscreen: {exclusive}, {})",
+                if now { "game is fullscreen with CAPTURE drawing in it" } else { "not drawing in a fullscreen game" },
+                placement.map_or("no game window".to_string(), |p| p.facts)
+            );
         }
         (now, fullscreen)
     }
@@ -772,6 +1000,8 @@ impl Engine {
             free_bytes,
             in_game,
             game_fullscreen,
+            saved: vec![],
+            past_game: if self.pipeline.is_none() { self.past_recording().map(|(_, game)| game) } else { None },
         };
         if self.mic_monitor.as_ref().is_some_and(|m| m.started.elapsed().as_secs() > 300) {
             self.mic_monitor = None;
@@ -798,10 +1028,14 @@ impl Engine {
             let live = *sh.live.lock().unwrap();
             (ring.available_secs(sh.save_end()).min(live.replay_secs as f64), ring.total_bytes(), !ring.segments().is_empty())
         };
-        let attention = sh.attention.lock().unwrap().clone();
+        let attention = sh.attention.lock().unwrap().clone()
+            .or_else(|| p.capture.latest.lock().unwrap().error.clone());
         st.markers = sh.markers_now();
         st.session_secs = sh.session_start.lock().unwrap().map(|s| ((sh.now() - s) * 10.0).round() / 10.0);
-        st.now_secs = (sh.now() * 10.0).round() / 10.0;
+        // Where the recording has got to: it stops when the game closes, while the footage stays
+        // (the Replay timeline ends there instead of running on into nothing).
+        st.now_secs = (sh.save_end() * 10.0).round() / 10.0;
+        st.saved = sh.saved.lock().unwrap().clone();
         st.target_name = Some(sh.game_name.clone());
         st.target_exe = Some(sh.target_exe.clone());
         st.detected_by = sh.detected_by.clone();
@@ -855,11 +1089,45 @@ impl Engine {
             .collect()
     }
 
+    /// The newest background recording still on disk while nothing is being recorded: its
+    /// folder and game.
+    fn past_recording(&mut self) -> Option<(PathBuf, String)> {
+        if self.pipeline.is_some() {
+            return None;
+        }
+        let root = PathBuf::from(&self.cfg.as_ref()?.capture_root);
+        let mut dirs = self.leftover_dirs(&root);
+        dirs.sort();
+        let dir = dirs.pop()?;
+        if self.past_seen.as_ref().is_none_or(|(d, _)| *d != dir) {
+            let game = std::fs::read(dir.join("session.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .and_then(|m| m["game"].as_str().map(String::from))
+                .unwrap_or_else(|| "your last game".into());
+            self.past_seen = Some((dir, game));
+        }
+        self.past_seen.clone()
+    }
+
+    /// A new game is being recorded: the recordings kept from earlier games (those that ended
+    /// normally) go. What a crash left behind stays until the player saves or deletes it.
+    fn forget_past_recordings(&mut self) {
+        self.past_review = None;
+        self.past_seen = None;
+        let Some(root) = self.cfg.as_ref().map(|c| PathBuf::from(&c.capture_root)) else { return };
+        for d in self.leftover_dirs(&root) {
+            if d.join(storage::ENDED_FILE).exists() {
+                storage::remove_session_dir(&d);
+            }
+        }
+    }
+
     fn leftover_bytes(&self, root: &Path) -> u64 {
         self.leftover_dirs(root).iter().map(|d| storage::dir_size(d)).sum()
     }
 
-    /// Deletes only `Buffer\<old session>` folders — never clips, never the live session.
+    /// Deletes only `Background Recording\<old session>` folders — never clips, never the live session.
     fn clear_leftovers(&mut self) -> u64 {
         let Some(root) = self.cfg.as_ref().map(|c| PathBuf::from(&c.capture_root)) else { return 0 };
         let mut freed = 0;
@@ -871,6 +1139,10 @@ impl Engine {
 
     pub fn shutdown(&mut self) {
         self.stop_session(None);
+        let shots_until = Instant::now() + std::time::Duration::from_secs(30);
+        while self.screenshots.load(Ordering::SeqCst) > 0 && Instant::now() < shots_until {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         if let Some(p) = &self.pipeline {
             // Let in-flight saves finish before tearing down the session. A full-session save
             // of a long recording can take minutes; the bound only guards against a hang.
@@ -922,6 +1194,54 @@ pub fn bindings(cfg: &EngineConfig) -> hotkey::Bindings {
         (HotkeyAction::Screenshot, cfg.hotkeys.screenshot.clone()),
         (HotkeyAction::ToggleMicMute, cfg.hotkeys.mic_mute.clone()),
     ]
+}
+
+/// The footage files of a kept session folder, in order, with the session time of the first
+/// picture and the audio track names.
+fn past_footage(dir: &Path) -> Result<(Vec<(PathBuf, f64)>, f64, Vec<String>, String), String> {
+    let manifest: serde_json::Value = std::fs::read(dir.join("session.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(serde_json::json!({}));
+    let game = manifest["game"].as_str().unwrap_or("your last game").to_string();
+    let tracks: Vec<String> = manifest["audio_tracks"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+    let mut segs: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "ts") && std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false))
+        .collect();
+    segs.sort();
+    if segs.is_empty() {
+        return Err("That recording has no footage left.".into());
+    }
+    let origin = save::first_keyframe_secs(&segs[0]).unwrap_or(0.0);
+    Ok((segs.into_iter().map(|p| (p, 0.0)).collect(), origin, tracks, game))
+}
+
+/// A playable copy of the previous background recording for Replay. Its timeline starts at 0;
+/// the recording's markers are placed on it.
+fn past_review(dir: &Path, path: &Path) -> Result<Review, String> {
+    let (list, origin, tracks, game) = past_footage(dir)?;
+    let (clip, _) = save::remux(&list, None, 0.0, 0.0, 1e9, &tracks, path).map_err(|e| format!("Could not open the last recording: {e}"))?;
+    let mut markers: Vec<Marker> = std::fs::read(dir.join("markers.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    markers.retain(|m| m.t >= origin && m.t <= origin + clip.duration_secs);
+    for m in &mut markers {
+        m.t -= origin;
+    }
+    Ok(Review { path: path.to_string_lossy().into_owned(), start: 0.0, end: clip.duration_secs, game, past: true, markers })
+}
+
+/// Save `start..end` (seconds on the `past_review` timeline) of the previous recording as a clip.
+fn past_clip(root: &Path, dir: &Path, start: f64, end: f64) -> Result<save::ClipResult, String> {
+    let (list, origin, tracks, game) = past_footage(dir)?;
+    // Each file with the moment it starts at, so the clip begins in the right one (within a
+    // second of `start`) instead of at the beginning of an earlier file.
+    let list: Vec<(PathBuf, f64)> = list.into_iter().map(|(p, _)| { let t = save::first_keyframe_secs(&p).map_or(0.0, |t| (t - origin).max(0.0)); (p, t) }).collect();
+    let out_dir = storage::clips_dir(root, &game);
+    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+    let name = storage::clip_file_name(&storage::local_stamp(), &game, "Clip");
+    let path = storage::reserve_unique_path(&out_dir, &name).map_err(|e| e.to_string())?;
+    // (The clip is cut from the file that holds its first moment onwards.)
+    let first = list.iter().rposition(|(_, t)| *t <= start.max(0.0)).unwrap_or(0);
+    save::remux(&list[first..], None, list[first].1, start.max(0.0), end, &tracks, &path).map(|(clip, _)| clip)
 }
 
 /// Save a leftover session folder (crash / power loss) as `<Game>\Clips\..._Recovered.mp4`.

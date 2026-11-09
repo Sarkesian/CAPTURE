@@ -190,6 +190,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let _ = GetClientRect(hwnd, &mut rc);
             if let Some(n) = CURRENT.lock().unwrap().clone() {
                 paint(dc, rc, &n, SCALE_PCT.load(Ordering::Relaxed) as i32);
+                crate::trace::ev("notice_paint", crate::clock::now_100ns(), n.kind as i64, 0, 0);
             }
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)

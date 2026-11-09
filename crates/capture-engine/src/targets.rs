@@ -169,25 +169,81 @@ pub fn monitors() -> Vec<Monitor> {
         .collect()
 }
 
-/// The window covers its whole monitor (exclusive fullscreen, borderless or maximized without
-/// borders): nothing behind it can be seen, so CAPTURE's overlay is shown inside the game.
-pub fn fills_monitor(hwnd: isize) -> bool {
+/// How a window sits on its monitor, for deciding whether it is a fullscreen game.
+pub struct Placement {
+    pub pid: u32,
+    /// Covers (nearly) its whole monitor and is not a maximized ordinary window or the desktop.
+    pub fullscreen: bool,
+    /// The facts behind `fullscreen`, for the log.
+    pub facts: String,
+}
+
+/// The window in front right now (0 if none).
+pub fn foreground() -> isize {
+    unsafe { GetForegroundWindow().0 as isize }
+}
+
+/// Windows reports a Direct3D application running in exclusive fullscreen (the mode in which
+/// a game minimizes as soon as any other window takes focus).
+pub fn d3d_fullscreen_running() -> bool {
+    // (Declared here: turning on the whole `Win32_UI_Shell` feature for one function is not worth it.)
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHQueryUserNotificationState(state: *mut i32) -> i32;
+    }
+    const QUNS_RUNNING_D3D_FULL_SCREEN: i32 = 3;
+    let mut state = 0i32;
+    unsafe { SHQueryUserNotificationState(&mut state) >= 0 && state == QUNS_RUNNING_D3D_FULL_SCREEN }
+}
+
+/// Where window `hwnd` is and whether it is fullscreen (exclusive fullscreen, or borderless
+/// over the whole screen). Tolerant on purpose: games are a few pixels off, keep window borders
+/// in their style while in exclusive fullscreen, or report odd rectangles on scaled displays.
+/// Deciding "not fullscreen" for a fullscreen game makes CAPTURE open a window over it, which
+/// minimizes the game.
+pub fn placement(hwnd: isize) -> Option<Placement> {
     use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
     if hwnd == 0 {
-        return false;
+        return None;
     }
     unsafe {
         let h = HWND(hwnd as *mut _);
         let mut r = RECT::default();
-        if GetWindowRect(h, &mut r).is_err() {
-            return false;
-        }
+        GetWindowRect(h, &mut r).ok()?;
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, Some(&mut pid));
         let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
         if !GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
-            return false;
+            return None;
         }
         let m = mi.rcMonitor;
-        r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
+        let mut buf = [0u16; 64];
+        let n = GetClassNameW(h, &mut buf);
+        let class = String::from_utf16_lossy(&buf[..n as usize]);
+        let shell = matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" | "XamlExplorerHostIslandWindow" | "Windows.UI.Core.CoreWindow");
+        let minimized = IsIconic(h).as_bool();
+        let style = GetWindowLongW(h, GWL_STYLE) as u32;
+        // A maximized ordinary window (title bar) is not a fullscreen game, even where it covers
+        // the whole monitor (auto-hidden taskbar).
+        let maximized = IsZoomed(h).as_bool() && style & WS_CAPTION.0 == WS_CAPTION.0;
+        let (iw, ih) = ((r.right.min(m.right) - r.left.max(m.left)).max(0) as i64, (r.bottom.min(m.bottom) - r.top.max(m.top)).max(0) as i64);
+        let area = ((m.right - m.left) as i64 * (m.bottom - m.top) as i64).max(1);
+        let covered = iw * ih * 100 / area;
+        let fullscreen = covered >= 98 && !shell && !minimized && !maximized && IsWindowVisible(h).as_bool();
+        let facts = format!(
+            "window {hwnd:#x} class {class} pid {pid} rect {},{} {}x{} on monitor {},{} {}x{} covers {covered}%{}{}",
+            r.left,
+            r.top,
+            r.right - r.left,
+            r.bottom - r.top,
+            m.left,
+            m.top,
+            m.right - m.left,
+            m.bottom - m.top,
+            if minimized { " minimized" } else { "" },
+            if maximized { " maximized" } else { "" },
+        );
+        Some(Placement { pid, fullscreen, facts })
     }
 }
 

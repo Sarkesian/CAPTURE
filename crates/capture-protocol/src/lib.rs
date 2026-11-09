@@ -45,7 +45,9 @@ pub enum Command {
     /// Make the buffered footage playable for the review timeline (stream copy into a
     /// temporary MP4). Footage used by the review is protected until released.
     PrepareReview,
-    ReleaseReview,
+    /// Done with a review snapshot. `path` names it (`Review::path`): a window that lets go of
+    /// an older snapshot must not delete the one another window is watching. `None` = whichever.
+    ReleaseReview { #[serde(default)] path: Option<String> },
     /// Save a clip of an exact timeline range (seconds), e.g. from the review timeline.
     SaveRange { start: f64, end: f64 },
     /// Full-session recording, independent of the replay length (uses the same capture).
@@ -62,12 +64,13 @@ pub enum Command {
     MicTest { #[serde(default)] device: Option<String> },
     /// Save the current captured frame as PNG in <Game>\Screenshots\.
     Screenshot,
+    /// The player asked for the overlay: decide, from what is in front at this moment, where it
+    /// can open (answered with `OverlayOpened`). Over a fullscreen game where it cannot be shown
+    /// inside the game, the worker shows a notice and no window may be opened.
+    OverlayOpen,
     /// Show the window `hwnd` (CAPTURE's overlay) inside the captured game, live, through the
-    /// in-game hook (`EngineState::in_game`); `None` stops showing it.
+    /// in-game hook (after `OverlayOpened { mode: InGame }`); `None` stops showing it.
     OverlayMirror { #[serde(default)] hwnd: Option<u64> },
-    /// The overlay was asked for over a fullscreen game where it cannot be shown inside the
-    /// game: tell the player with a notice instead of minimizing the game.
-    OverlayUnavailable,
     /// "Editor audio files": synchronized WAV per isolated track next to the clip.
     ExportStems { path: String },
     /// Duration of a saved clip (answered with `ClipInfo`).
@@ -87,6 +90,8 @@ pub enum Event {
     Hello { worker_version: String },
     State(EngineState),
     Targets { windows: Vec<WindowTarget>, displays: Vec<DisplayTarget> },
+    /// Accepted input, emitted before any capture processing. Completion updates data only.
+    CaptureTriggered { action: CaptureAction, overlay_notice: bool },
     SaveStarted { save_id: u64, requested_secs: f64 },
     SaveFinished(SavedClip),
     SaveFailed { save_id: u64, message: String },
@@ -107,6 +112,27 @@ pub enum Event {
     Recovered { clips: Vec<String>, failed: Vec<String> },
     /// Mic test progress: phase "recording" | "playing" | "done" | "failed".
     MicTest { phase: String, peak: f32, message: Option<String> },
+    /// Answer to `OverlayOpen`; also sent with `Closed` when an overlay shown inside the game
+    /// can no longer be shown there (the game closed or stopped drawing).
+    OverlayOpened { mode: OverlayMode },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureAction { Screenshot, Replay, RecordingStart, RecordingStop }
+
+/// Where CAPTURE's overlay opens.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayMode {
+    /// Inside the game's own picture (the game keeps focus and stays fullscreen).
+    InGame,
+    /// As an ordinary window (nothing fullscreen is in front).
+    Window,
+    /// Not at all: a fullscreen game is in front and a window would minimize it. A notice says so.
+    Unavailable,
+    /// The overlay shown inside the game must be closed.
+    Closed,
 }
 
 /// A playable snapshot of the buffer. `start`/`end` are session-timeline seconds of its first
@@ -117,6 +143,12 @@ pub struct Review {
     pub start: f64,
     pub end: f64,
     pub game: String,
+    /// The footage is the previous background recording (nothing is being recorded now): its
+    /// timeline does not grow and its markers are `markers` (times as `start`/`end`).
+    #[serde(default)]
+    pub past: bool,
+    #[serde(default)]
+    pub markers: Vec<Marker>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -255,7 +287,7 @@ pub struct EngineConfig {
     /// Root folder that holds `Buffer` and one folder per game (`<Game>\Clips|Sessions|Screenshots`).
     pub capture_root: String,
     /// Optional separate folder for the temporary buffer (e.g. a faster drive). Its `Buffer`
-    /// subfolder is used; `None` = `<capture_root>\Buffer`.
+    /// subfolder is used; `None` = `<capture_root>\Background Recording`.
     #[serde(default)]
     pub buffer_root: Option<String>,
     pub replay_secs: u32,
@@ -492,14 +524,41 @@ pub struct EngineState {
     pub mic_monitor: Option<MicLevel>,
     pub leftover_buffer_bytes: u64,
     pub free_bytes: Option<u64>,
-    /// CAPTURE's in-game hook is drawing in the captured game right now: the overlay can be
-    /// shown inside the game (`Command::OverlayMirror`) instead of as a window over it.
+    /// CAPTURE's in-game hook is drawing in the captured game and that game is fullscreen
+    /// (information only: where the overlay opens is decided by `Command::OverlayOpen`).
     #[serde(default)]
     pub in_game: bool,
     /// The captured game is fullscreen (exclusive, or its window fills the screen): a window
     /// opened over it would take focus and minimize it.
     #[serde(default)]
     pub game_fullscreen: bool,
+    /// Clips and screenshots saved from this background recording, for the Replay timeline.
+    #[serde(default)]
+    pub saved: Vec<SavedMark>,
+    /// The game whose background recording is still on disk while nothing is being recorded
+    /// (kept when the game or CAPTURE closed; replaced when the next game is recorded).
+    #[serde(default)]
+    pub past_game: Option<String>,
+}
+
+/// Something saved from the background recording, placed on its timeline.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SavedMark {
+    pub kind: SavedKind,
+    /// Seconds on the session timeline: the moment of a screenshot, the start of a clip.
+    pub t: f64,
+    /// Where a clip ends.
+    #[serde(default)]
+    pub end: Option<f64>,
+    /// File name.
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SavedKind {
+    Clip,
+    Screenshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

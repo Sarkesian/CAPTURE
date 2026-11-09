@@ -31,8 +31,11 @@ if (-not (Test-Path "$root\third_party\ffmpeg\bin\avcodec-62.dll")) {
 Push-Location $root
 try {
     if (-not $SkipBuild) {
-        cargo build --release -p capture-engine --bin capture-worker -p capture-hook
+        cargo build --release -p capture-engine --bin capture-worker
         if ($LASTEXITCODE) { throw 'worker build failed' }
+        # On its own: together with `--bin capture-worker` the hook library is not built at all.
+        cargo build --release -p capture-hook
+        if ($LASTEXITCODE) { throw 'hook build failed' }
         # 32-bit games get a 32-bit hook, loaded by a 32-bit helper.
         cargo build --release -p capture-hook -p capture-inject32 --target i686-pc-windows-msvc
         if ($LASTEXITCODE) { throw '32-bit hook build failed (rustup target add i686-pc-windows-msvc)' }

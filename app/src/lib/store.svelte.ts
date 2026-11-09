@@ -79,35 +79,36 @@ function onEngine(m: EngineMessage) {
       app.windows = m.data.windows.sort((a, b) => a.app_name.localeCompare(b.app_name));
       app.displays = m.data.displays;
       break;
+    case 'capture_triggered':
+      if (!m.data.overlay_notice) toast({ screenshot: 'Screenshot saved', replay: 'Clip Saved', recording_start: 'Recording started', recording_stop: 'Recording saved' }[m.data.action], 'ok', 1800);
+      break;
     case 'save_started':
-      toast('Saving…', 'info', 2500);
       break;
     case 'save_finished':
       app.lastClip = m.data;
       app.libraryVersion++;
-      toast(
-        m.data.duration_secs + 1 < m.data.requested_secs
-          ? `Saved ${fmtDuration(m.data.duration_secs)} — only that much was buffered (you asked for ${fmtDuration(m.data.requested_secs)})`
-          : `Saved ${fmtDuration(m.data.duration_secs)}`,
-        'ok',
-      );
       refreshClips();
       break;
     case 'save_failed':
       toast(`Not saved: ${m.data.message}`, 'error', 9000);
       break;
     case 'error':
-      toast(m.data.message, 'info', 7000);
+      toast(m.data.message, 'error', 7000);
       break;
     case 'marker_added':
       toast(`Marker added at ${m.data.at}`, 'ok', 2500);
       break;
     case 'review_ready':
+      // Engine events reach every window (the main one and the overlay): only the window that
+      // asked for a snapshot takes it, or the other one would later "release" a snapshot it
+      // never showed and pull the footage out from under this one.
+      if (!app.reviewLoading) break;
       app.review = m.data;
       app.reviewLoading = false;
       app.reviewError = null;
       break;
     case 'review_failed':
+      if (!app.reviewLoading) break;
       app.reviewLoading = false;
       app.reviewError = m.data.message;
       break;
@@ -119,7 +120,6 @@ function onEngine(m: EngineMessage) {
     case 'stems_done':
       app.stemsBusy[m.data.path] = false;
       if (m.data.error) toast(`Editor audio files not made: ${m.data.error}`, 'error', 8000);
-      else toast(`Editor audio files saved (${m.data.files.length} WAV) next to the clip`, 'ok');
       app.libraryVersion++;
       break;
     case 'recovered':
@@ -128,7 +128,6 @@ function onEngine(m: EngineMessage) {
       app.libraryVersion++;
       break;
     case 'screenshot_saved':
-      toast('Screenshot saved', 'ok', 2500);
       app.libraryVersion++;
       break;
     case 'mic_test':
@@ -165,7 +164,12 @@ export function prepareReview() {
   app.reviewError = null;
   return engine('prepare_review');
 }
-export const releaseReview = () => { app.review = null; return engine('release_review'); };
+export const releaseReview = () => {
+  const path = app.review?.path ?? null;
+  app.review = null;
+  app.reviewLoading = false;
+  return engine('release_review', { path });
+};
 export const saveRange = (start: number, end: number) => engine('save_range', { start, end });
 export function requestClipInfo(path: string) {
   if (!(path in app.clipInfo)) {

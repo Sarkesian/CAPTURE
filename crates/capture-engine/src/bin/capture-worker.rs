@@ -58,6 +58,7 @@ fn main() {
     engine.attach_hotkey(HotkeyService::start(
         vec![],
         move |action| {
+            capture_engine::trace::ev("hotkey", capture_engine::clock::now_100ns(), action as i64, 0, 0);
             let cmd = match action {
                 HotkeyAction::SaveReplay => Some(Command::SaveReplay),
                 HotkeyAction::AddMarker => Some(Command::AddMarker { label: None }),

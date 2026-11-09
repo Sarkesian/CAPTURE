@@ -71,7 +71,7 @@
     if (typeof dir === 'string') updateSettings({ capture_root: dir });
   }
   async function changeBuffer() {
-    const dir = await open({ directory: true, title: 'Folder for temporary footage', defaultPath: s.buffer_root ?? s.capture_root });
+    const dir = await open({ directory: true, title: 'Folder for the background recording', defaultPath: s.buffer_root ?? s.capture_root });
     if (typeof dir === 'string') updateSettings({ buffer_root: dir });
   }
   // Updates: choose a downloaded release zip; CAPTURE checks every file before offering to install.
@@ -167,7 +167,7 @@
     <section id="markers">
       <h2>Markers</h2>
       <div class="field">
-        <div class="lbl"><div>Keep footage around markers</div><div class="hint">Stops it being overwritten until you save or the session ends. Uses at most half the temporary limit.</div></div>
+        <div class="lbl"><div>Keep footage around markers</div><div class="hint">Stops it being overwritten until you save or the session ends. Uses at most half the background recording limit.</div></div>
         <Toggle checked={s.markers.protect} label="Protect footage around markers" onchange={v => updateSettings({ markers: { ...s.markers, protect: v } })} />
       </div>
       {#if s.markers.protect}
@@ -213,7 +213,7 @@
       </div>
       {#if s.notify_on_save}
         <div class="field sub checks">
-          {#each [['recording_started', 'Recording started'], ['saved', 'Saved'], ['marker', 'Marker added'], ['problems', 'Problems']] as [k, label] (k)}
+          {#each [['recording_started', 'Recording started'], ['saved', 'Capture triggered'], ['marker', 'Marker added'], ['problems', 'Problems']] as [k, label] (k)}
             <label class="row small"><input type="checkbox" checked={s.notices[k as keyof typeof s.notices]} onchange={ev => updateSettings({ notices: { ...s.notices, [k]: (ev.target as HTMLInputElement).checked } })} />{label}</label>
           {/each}
         </div>
@@ -270,14 +270,14 @@
       </div>
       <p class="foot">Changing the folder does not move existing clips.</p>
       <div class="field">
-        <div class="lbl"><div>Temporary footage</div><div class="hint mono ellipsis">{s.buffer_root ? join(s.buffer_root, 'Buffer') : `${join(s.capture_root, 'Buffer')} (with your clips)`}</div></div>
+        <div class="lbl"><div>Background recording</div><div class="hint mono ellipsis">{s.buffer_root ? join(s.buffer_root, 'Background Recording') : `${join(s.capture_root, 'Background Recording')} (with your clips)`}</div></div>
         <div class="row">
           <button class="btn" onclick={changeBuffer}>Change…</button>
           {#if s.buffer_root}<button class="btn ghost" onclick={() => updateSettings({ buffer_root: null })}>Use clip folder</button>{/if}
         </div>
       </div>
       <div class="field">
-        <label class="lbl" for="cap"><div>Temporary footage limit</div><div class="hint">Now using {fmtBytes(e?.buffer_bytes ?? 0)}.</div></label>
+        <label class="lbl" for="cap"><div>Background recording limit</div><div class="hint">Now using {fmtBytes(e?.buffer_bytes ?? 0)}.</div></label>
         <div class="row"><input class="input num" id="cap" type="number" min="1" max="2000" step="1" value={s.buffer_cap_gb} onchange={ev => updateSettings({ buffer_cap_gb: num(ev) })} /><span class="faint small">GB</span></div>
       </div>
       <div class="field">
@@ -285,7 +285,7 @@
         <div class="row"><input class="input num" id="free" type="number" min="1" max="2000" step="1" value={s.min_free_gb} onchange={ev => updateSettings({ min_free_gb: num(ev) })} /><span class="faint small">GB</span></div>
       </div>
       <div class="field">
-        <div class="lbl"><div>Leftover temporary footage</div><div class="hint">From sessions that did not close normally. Saved clips are never touched.</div></div>
+        <div class="lbl"><div>Leftover background recording</div><div class="hint">From sessions that did not close normally. Saved clips are never touched.</div></div>
         <div class="row">
           <span class="small muted">{fmtBytes(e?.leftover_buffer_bytes ?? 0)}</span>
           <button class="btn sm" disabled={!e || e.leftover_buffer_bytes === 0} onclick={() => engine('recover_leftovers')}>Save as clip</button>

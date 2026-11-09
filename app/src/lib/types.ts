@@ -59,6 +59,7 @@ export interface MicLevel { device: string; peak: number; error: string | null }
 
 export interface MarkerConfig { sound: boolean; sound_volume: number; sound_device: string | null; protect: boolean; protect_before_secs: number; protect_after_secs: number }
 export type HotkeyAction = 'save_replay' | 'add_marker' | 'toggle_overlay' | 'toggle_session' | 'screenshot' | 'toggle_mic_mute';
+export interface SavedMark { kind: 'clip' | 'screenshot'; t: number; end: number | null; name: string }
 export interface Marker { id: number; t: number; at: string; label: string; footage: 'buffered' | 'protected' | 'expired'; note: string | null; saved_in: string[] }
 
 export interface EncoderInfo { name: string; hardware: boolean; width: number; height: number; fps: number; rejected: string[] }
@@ -86,6 +87,10 @@ export interface EngineState {
   mic_monitor: MicLevel | null;
   leftover_buffer_bytes: number;
   free_bytes: number | null;
+  /** Clips and screenshots saved from this background recording (optional: older engines). */
+  saved?: SavedMark[];
+  /** The game whose background recording is still kept while nothing is being recorded. */
+  past_game?: string | null;
 }
 
 export interface WindowTarget { hwnd: number; pid: number; exe: string; title: string; app_name: string; width: number; height: number }
@@ -101,7 +106,7 @@ export interface SavedClip {
   audio_tracks: string[];
 }
 
-export interface Review { path: string; start: number; end: number; game: string }
+export interface Review { path: string; start: number; end: number; game: string; past?: boolean; markers?: Marker[] }
 
 export interface ClipEntry { path: string; name: string; game: string; bytes: number; modified_ms: number; kind: 'clip' | 'session' | 'screenshot'; has_stems: boolean; has_markers: boolean }
 
@@ -109,6 +114,7 @@ export type EngineMessage = { v: number; re?: number } & (
   | { event: 'hello'; data: { worker_version: string } }
   | { event: 'state'; data: EngineState }
   | { event: 'targets'; data: { windows: WindowTarget[]; displays: DisplayTarget[] } }
+  | { event: 'capture_triggered'; data: { action: 'screenshot' | 'replay' | 'recording_start' | 'recording_stop'; overlay_notice: boolean } }
   | { event: 'save_started'; data: { save_id: number; requested_secs: number } }
   | { event: 'save_finished'; data: SavedClip }
   | { event: 'save_failed'; data: { save_id: number; message: string } }
