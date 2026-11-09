@@ -477,7 +477,7 @@ fn build_review(shared: &Shared) -> Result<Review, String> {
     };
     let n = shared.review_seq.fetch_add(1, Ordering::SeqCst);
     let path = shared.session_dir.join(format!("review_{n:03}.mp4"));
-    match save::remux(&segs, start, start, end, &shared.track_names, &path) {
+    match save::remux(&segs, None, start, start, end, &shared.track_names, &path) {
         Ok((clip, actual_start)) => {
             shared.release_review(); // the previous snapshot
             *shared.review.lock().unwrap() = Some((seqs, path.clone()));
@@ -599,6 +599,10 @@ fn run_mux(shared: Arc<Shared>, rx: Receiver<Packet>, streams: Vec<StreamDesc>) 
         )
     };
     let mut last_free_check = Instant::now() - Duration::from_secs(10);
+    // Audio that arrives while no segment is open (before the first video keyframe of the
+    // session, or during a pause). Encoders deliver video later than audio (~0.5 s for the
+    // software encoder), so without this the first moments of a session had no sound.
+    let mut pending: std::collections::VecDeque<Packet> = std::collections::VecDeque::new();
     loop {
         let p = match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(p) => p,
@@ -648,14 +652,29 @@ fn run_mux(shared: Arc<Shared>, rx: Receiver<Packet>, streams: Vec<StreamDesc>) 
             // A drive that came back may have lost the session folder (e.g. remounted).
             let _ = std::fs::create_dir_all(&shared.session_dir);
             match SegmentWriter::create(&path, &streams) {
-                Ok(w) => {
-                    writer = Some(w);
+                Ok(mut w) => {
                     seg_start = p.secs();
+                    // The keyframe first (a segment must start with it), then the waiting
+                    // audio that belongs at or after it.
+                    let r = w.write(p);
+                    for q in std::mem::take(&mut pending).into_iter().filter(|q| q.secs() >= seg_start) {
+                        let _ = w.write(q);
+                    }
+                    writer = Some(w);
                     shared.ring.lock().unwrap().push(Segment { seq, path, start: seg_start, end: None, bytes: 0, protect: 0 });
-                    if write_failed {
+                    if write_failed && r.is_ok() {
                         write_failed = false;
                         shared.set_attention(None);
                     }
+                    if let Err(e) = r {
+                        write_failed = true;
+                        shared.set_attention(Some(cant_write(&e)));
+                        if let Some(w) = writer.take() {
+                            let bytes = w.finish();
+                            shared.ring.lock().unwrap().close_last(last_video, bytes);
+                        }
+                    }
+                    continue;
                 }
                 Err(e) => {
                     write_failed = true;
@@ -664,7 +683,16 @@ fn run_mux(shared: Arc<Shared>, rx: Receiver<Packet>, streams: Vec<StreamDesc>) 
                 }
             }
         }
-        if let Some(w) = writer.as_mut() {
+        let Some(w) = writer.as_mut() else {
+            if !is_video {
+                pending.push_back(p);
+                if pending.len() > 1000 {
+                    pending.pop_front(); // only the last few seconds can belong to a new segment
+                }
+            }
+            continue;
+        };
+        {
             if let Err(e) = w.write(p) {
                 // Stop writing into a dead file: close it and retry a new segment at the next
                 // keyframe (about once a second) instead of failing for a whole segment.
@@ -707,8 +735,21 @@ fn do_save(shared: &Shared, t_end: f64, secs: f64, save_id: u64, kind: SaveKind)
         let mut ring = shared.ring.lock().unwrap();
         let sel = ring.select(t_end, secs).ok_or("Nothing has been buffered yet. Wait a moment and try again.")?;
         ring.protect(&sel.seqs);
-        sel
+        // The segment before the first one holds the audio of the clip's first moments
+        // (see `save::remux`): keep it until the save is done.
+        let lead = ring
+            .segments()
+            .iter()
+            .take_while(|s| s.seq < sel.seqs[0])
+            .last()
+            .filter(|s| s.end.is_some())
+            .map(|s| (s.seq, s.path.clone()));
+        if let Some((seq, _)) = &lead {
+            ring.protect(&[*seq]);
+        }
+        (sel, lead)
     };
+    let (sel, lead) = sel;
     // Wait until the segment holding `t_end` (and late audio after it) is closed on disk.
     let deadline = Instant::now() + Duration::from_secs_f64(SEGMENT_SECS * 3.0 + 2.0);
     while Instant::now() < deadline && !shared.mux_done.load(Ordering::SeqCst) && !shared.ring.lock().unwrap().is_complete_through(t_end) {
@@ -725,8 +766,9 @@ fn do_save(shared: &Shared, t_end: f64, secs: f64, save_id: u64, kind: SaveKind)
             .filter(|s| !sel.seqs.contains(s) && closed.contains(s))
             .collect();
         ring.protect(&tail);
-        let all: Vec<u64> = sel.seqs.iter().chain(tail.iter()).copied().collect();
+        let mut all: Vec<u64> = sel.seqs.iter().chain(tail.iter()).copied().collect();
         let mut segs = ring.paths_for(&all);
+        all.extend(lead.as_ref().map(|l| l.0));
         segs.sort_by_key(|s| s.0);
         (all, segs.into_iter().map(|(_, p, st)| (p, st)).collect::<Vec<_>>())
     };
@@ -738,7 +780,7 @@ fn do_save(shared: &Shared, t_end: f64, secs: f64, save_id: u64, kind: SaveKind)
         std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create the folder {}: {e}", dir.display()))?;
         let name = storage::clip_file_name(&storage::local_stamp(), &shared.game_name, label);
         let path = storage::reserve_unique_path(&dir, &name).map_err(|e| format!("Cannot create the clip file: {e}"))?;
-        let (clip, actual_start) = save::remux(&segs, sel.start, sel.end - secs, sel.end, &shared.track_names, &path)?;
+        let (clip, actual_start) = save::remux(&segs, lead.as_ref().map(|l| l.1.as_path()), sel.start, sel.end - secs, sel.end, &shared.track_names, &path)?;
         record_markers_in_clip(shared, &clip.path, actual_start, sel.end);
         Ok(SavedClip {
             save_id,

@@ -42,6 +42,7 @@ unsafe fn open_input(p: &Path) -> Result<Input, String> {
 /// Returns the clip and the timeline time its first frame corresponds to.
 pub fn remux(
     segments: &[(PathBuf, f64)],
+    lead_in: Option<&Path>,
     seg0_start: f64,
     want_start: f64,
     clip_end: f64,
@@ -49,7 +50,7 @@ pub fn remux(
     final_path: &Path,
 ) -> Result<(ClipResult, f64), String> {
     let partial = storage::partial_path(final_path);
-    let r = unsafe { remux_inner(segments, seg0_start, want_start, clip_end, track_names, &partial) };
+    let r = unsafe { remux_inner(segments, lead_in, seg0_start, want_start, clip_end, track_names, &partial) };
     let actual_start = match r {
         Ok(t) => t,
         Err(e) => {
@@ -105,13 +106,38 @@ pub fn first_keyframe_secs(path: &Path) -> Option<f64> {
     }
 }
 
+/// Timeline time (seconds) of the last video frame in a buffer segment.
+pub fn last_video_secs(path: &Path) -> Option<f64> {
+    unsafe {
+        let ic = open_input(path).ok()?;
+        let n = (*ic.0).nb_streams as usize;
+        let v = (0..n).find(|&i| (*(*(*(*ic.0).streams.add(i))).codecpar).codec_type == ff::AVMediaType::AVMEDIA_TYPE_VIDEO)?;
+        let tb = (*(*(*ic.0).streams.add(v))).time_base;
+        let pkt = ff::av_packet_alloc();
+        let mut last = None;
+        while ff::av_read_frame(ic.0, pkt) >= 0 {
+            if (*pkt).stream_index as usize == v && (*pkt).pts != ff::AV_NOPTS_VALUE {
+                last = Some(last.map_or((*pkt).pts, |l: i64| l.max((*pkt).pts)));
+            }
+            ff::av_packet_unref(pkt);
+        }
+        let mut p = pkt;
+        ff::av_packet_free(&mut p);
+        last.map(|l| l as f64 * tb.num as f64 / tb.den as f64)
+    }
+}
+
 /// Pure choice of the cut point (unit-tested): the last keyframe at or before `want`, else the
 /// first keyframe.
 pub fn pick_origin(keys: &[i64], want: i64) -> Option<i64> {
     keys.iter().copied().filter(|&k| k <= want).max().or_else(|| keys.first().copied())
 }
 
-unsafe fn remux_inner(segments: &[(PathBuf, f64)], seg0_start: f64, want_start: f64, clip_end: f64, names: &[String], out: &Path) -> Result<f64, String> {
+/// `lead_in`: the buffer segment just before `segments`. Encoders deliver video later than
+/// audio, so the audio for the clip's first moments (up to the encoder's latency: ~0.1 s with
+/// NVENC, ~0.5 s with the software encoder) was written into that earlier segment. Only its
+/// audio at or after the clip's first frame is used; its video is never.
+unsafe fn remux_inner(segments: &[(PathBuf, f64)], lead_in: Option<&Path>, seg0_start: f64, want_start: f64, clip_end: f64, names: &[String], out: &Path) -> Result<f64, String> {
     let first = segments.first().ok_or("No footage in the buffer yet")?;
     let ic0 = open_input(&first.0)?;
     let n = (*ic0.0).nb_streams as usize;
@@ -193,18 +219,22 @@ unsafe fn remux_inner(segments: &[(PathBuf, f64)], seg0_start: f64, want_start: 
     }
     let _pg = PktGuard(pkt);
     let span = (end_pts - origin_pts) as f64 * vtb.num as f64 / vtb.den as f64;
-    for (path, _) in segments {
-        let ic = match open_input(path) {
+    let inputs = lead_in.map(|p| (p.to_path_buf(), true)).into_iter().chain(segments.iter().map(|(p, _)| (p.clone(), false)));
+    for (path, audio_only) in inputs {
+        let ic = match open_input(&path) {
             Ok(ic) => ic,
             Err(_) => continue, // a damaged tail segment must not sink the whole clip
         };
         if (*ic.0).nb_streams as usize != n {
+            if audio_only {
+                continue;
+            }
             return Err("Buffer segments changed layout mid-clip".into());
         }
         while ff::av_read_frame(ic.0, pkt) >= 0 {
             let si = (*pkt).stream_index as usize;
             let ist = *(*ic.0).streams.add(si);
-            if (*pkt).pts == ff::AV_NOPTS_VALUE {
+            if (*pkt).pts == ff::AV_NOPTS_VALUE || (audio_only && si == video_idx) {
                 ff::av_packet_unref(pkt);
                 continue;
             }

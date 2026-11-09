@@ -866,12 +866,18 @@ fn recover_session(root: &Path, dir: &Path) -> Result<PathBuf, String> {
         return Err("no footage".into());
     }
     let origin = save::first_keyframe_secs(&segs[0]);
+    // The frame being written when the recorder died is usually cut short and would decode as
+    // a damaged frame: end the recovered clip just before the last video frame on disk.
+    let clip_end = match (origin, segs.last().and_then(|l| save::last_video_secs(l))) {
+        (Some(o), Some(last)) if last > o => last - o - 0.001,
+        _ => 1e9,
+    };
     let list: Vec<(PathBuf, f64)> = segs.into_iter().map(|p| (p, 0.0)).collect();
     let out_dir = storage::clips_dir(root, &game);
     std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
     let name = storage::clip_file_name(&storage::local_stamp(), &game, "Recovered");
     let path = storage::reserve_unique_path(&out_dir, &name).map_err(|e| e.to_string())?;
-    let (clip, _) = save::remux(&list, 0.0, 0.0, 1e9, &tracks, &path)?;
+    let (clip, _) = save::remux(&list, None, 0.0, 0.0, clip_end, &tracks, &path)?;
     // Markers survive a crash: the session's crash-safe markers.json becomes the recovered
     // clip's sidecar (before the caller deletes the buffer folder).
     let markers: Vec<Marker> = std::fs::read(dir.join("markers.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();

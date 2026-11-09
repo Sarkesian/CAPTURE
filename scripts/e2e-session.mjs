@@ -25,7 +25,7 @@ await sleep(9000); // longer than the 5 s replay length: session must keep it al
 const s = send('stop_session', {});
 const st = await waitFor(m => m.re === s && m.event === 'save_started');
 const fin = await waitFor(m => m.event === 'save_finished' && m.data.save_id === st.data.save_id);
-check(fin.data.path.replaceAll('\\', '/').includes('/Sessions/Desktop/') && fin.data.path.endsWith('_Desktop_Session.mp4'), `saved to ${fin.data.path}`);
+check(fin.data.path.replaceAll('\\', '/').includes('/Desktop/Sessions/') && fin.data.path.endsWith('_Desktop_Session.mp4'), `saved to ${fin.data.path}`);
 check(fin.data.duration_secs > 9.5 && fin.data.duration_secs < 12, `session length ${fin.data.duration_secs.toFixed(2)} s (expected ~10.2, longer than the 5 s replay)`);
 await sleep(600);
 check(state().session_secs == null, 'session state cleared');
