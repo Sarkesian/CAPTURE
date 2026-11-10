@@ -66,6 +66,7 @@ export async function init() {
   await listen<string>('goto', e => { app.tab = e.payload as typeof app.tab; refreshClips(); });
   refreshTargets();
   refreshClips();
+  engine('history');
 }
 
 function onEngine(m: EngineMessage) {
@@ -94,12 +95,14 @@ function onEngine(m: EngineMessage) {
       break;
     case 'save_failed':
       toast(`Not saved: ${m.data.message}`, 'error', 9000);
+      engine('history');
       break;
     case 'error':
       toast(m.data.message, 'error', 7000);
       break;
     case 'marker_added':
       toast(`Marker added at ${m.data.at}`, 'ok', 2500);
+      engine('history');
       break;
     case 'review_ready':
       reviewReply(m);
@@ -127,6 +130,7 @@ function onEngine(m: EngineMessage) {
       break;
     case 'screenshot_saved':
       app.libraryVersion++;
+      engine('history');
       break;
     case 'mic_test':
       app.micTest = m.data;
@@ -166,6 +170,7 @@ export const releaseReview = () => {
   const path = app.review?.path ?? null;
   app.review = null;
   app.reviewLoading = false;
+  app.reviewError = null;
   if (app.nextReview) engine('release_review', { path: app.nextReview.path });
   app.nextReview = null;
   for (const [id] of reviewRequests) reviewRequests.set(id, 'cancelled');

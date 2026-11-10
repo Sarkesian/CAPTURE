@@ -1,0 +1,40 @@
+# CAPTURE Replay overhaul — 0.6.5-rc.1
+
+Implemented on `feature/replay-experience` in `D:\Projects\CAPTURE-replay`, based on the repaired 0.6.4 commit `107fc45`. This is a review candidate, not an installed update. The installed executable's SHA-256 matched the corresponding source checkout's 0.6.4 release executable before editing. The rollback point remains `107fc45`; the original working trees and installed program are unchanged.
+
+## Result
+
+Replay now centers on a large player, game/date/session selectors, a full-session overview and an independently zoomable detailed timeline. The viewport remains stable while scrubbing, loading windows and refreshing indexed history. The overview preserves media gaps instead of compressing them away. Separate sessions remain separately selectable, so game/resolution epochs are explicit boundaries rather than misleadingly stitchable footage.
+
+Mouse wheel zoom anchors the cursor. Shift+wheel, horizontal scrolling, Alt+drag and dragging the overview window pan. Full history resets the viewport; Find playhead returns to an offscreen position. Timestamps adapt from tenths of a second through hours. Pointer capture, cancellation and release end every drag reliably.
+
+Select clip or Clip around creates a selection within the moment's recorded interval. Drag either handle or the range; use snapping to moments, playhead and recorded boundaries, or Shift to bypass it. Focused handles adjust in 0.1-second increments (Shift for one second). In/Out fields accept readable timestamps. Duration stays visible. A selection crossing a gap or expired footage is flagged and cannot be submitted. Saving keeps the range available for adjustment or retry, acknowledges immediately, and refreshes the Library silently on completion.
+
+Markers and screenshots keep their original media timestamps, including events outside retained footage. Dense groups open a selectable list; the searchable Moments panel pages through 40 items at a time. Screenshot previews use the original images, with no generated thumbnail files. Previous/next marker navigation follows deterministic timestamp/ID order, including very close markers. Marker renaming remains available. Expired video is identified without removing its event or screenshot.
+
+Playback still uses the existing bounded MP4 preview windows, cache ownership, prefetch and stream-copy saves. The UI holds a requested position independently of the loaded window, cancels late responses after closing/gap seeks, and handles cached paths that do not fire another metadata event. No capture, encoding, FPS, resolution, audio, retention, codecs, packet-saving or engine source was changed. The packaged worker, hooks and FFmpeg DLLs are **byte-identical to the installed 0.6.4 manifest**.
+
+Home now links retained background history to Replay instead of describing every earlier session as a crash and offering bulk save/delete actions. Replay links directly to the permanent Library. The same timeline and selection component serves the compact overlay; history loads at startup, including when recording is off.
+
+Keyboard: Space play/pause; arrows seek 5 seconds (Alt: 0.1 second, Shift: pan); Home/End jump; I/O set boundaries; [/] navigate markers; +/- zoom; 0 restores full history; F enters/exits fullscreen. Controls have accessible names, focus states and native pointer/keyboard behavior.
+
+## Verification
+
+- Frontend production build and native Tauri **release** build passed. Candidate version is `0.6.5-rc.1`; no installer was run.
+- Workspace Rust suite: **82 passed, 0 failed** (21 app, 57 engine, 1 hook, 3 protocol). Existing hardware-specific coverage is not implied by this count.
+- `scripts/test-timeline.mjs` passed at 2-minute, 30-minute, 2-hour, 4-hour and 6-hour scales: cursor invariance, bounded panning, adaptive ticks, original timestamp formatting/parsing, gap validation and 1,000-event clustering.
+- Expanded `scripts/ui-history-fixture.mjs` / `ui-replay-acceptance.mjs`: **39 checks passed** in isolated Edge with decoded H.264/AAC video and synthetic indexed metadata. Real CDP pointer/wheel/keyboard input exercised cursor zoom, overview panning/jumps, clustered events, close-marker navigation, handle dragging/release/precision, screenshot search/hover/seeking, timestamp entry, gap rejection, saving feedback, Library refresh, playback-window handoff, 760×600 sizing, shared compact panel and late-response cancellation. This fixture does not substitute for a native engine test.
+- Fresh `scripts/e2e-history.mjs` passed with the source-built debug worker: real prerecorded indexed media past four hours; preview cache reuse/ownership; original-packet saving; failure/retry; journal persistence/restart; and permanent media preservation. Preview creation **156 ms**, acknowledgements **24–62 ms**, four-second saves **122–149 ms**, preview **2.18 MB**. All **121 encoded video slices** matched the original source. These are local synthetic-fixture measurements, not six hours of live gameplay.
+- Live desktop-capture regression passed: review opened in **544 ms**, selected 5-second range saved as **5.02 s**, six-second Instant Replay saved as **6.37 s** with the existing keyframe-aligned behavior.
+- Physical screenshot and Instant Replay hotkeys sent through Computer Use passed against the exact 0.6.4 packaged worker in a disposable DX11 target. Acknowledgements were **0.03 ms / 2.72 ms**, notice paint **7.11 ms / 4.16 ms**. The initial windowed test was rejected by the baseline's even-dimension rule under display scaling; a display-sized test passed. No capture policy was altered to work around it.
+- Native Windows interaction verified real indexed footage near six hours, selecting a grouped marker at 2:00:06, preview loading, selecting and saving a 14-second normal MP4, and seeing that clip/preview in Library. The isolated app was restarted; the original five fixture sessions, 109 six-hour events, screenshots and saved clip remained available. Native minimum sizing, window expansion, fullscreen playback and Escape return were exercised.
+- Native compact Replay loaded live recorded footage in the supported window overlay while recording continued. The hook loaded into the disposable DX11 target. The runtime selected the **window overlay fallback**, so successful mirrored in-game input and true exclusive-fullscreen Replay are **not claimed**.
+- Computer Use was stopped with the physical Escape key near the end of the UI session. UI automation stopped there; subsequent work was limited to non-UI packaging and verification.
+
+## Review and remaining limits
+
+Extract the candidate and run `Review.ps1`. It initializes this copy's own Data and ReviewCaptures folders with recording off, no hotkeys, and no installed settings imported. Samples cover the requested duration scales using genuine short encoded windows at widely separated timestamps. Gaps are intentional; they are not continuous two-to-six-hour recordings. Open Replay, select a session, find a moment, select a clip and Save Clip. Sample saves go to this copy's Library. The review launcher has an initialization-only switch for non-UI package checks.
+
+Not verified: a continuous six-hour live recording/soak, demanding-game CPU/VRAM impact, sample-accurate audio/video continuity over many preview handoffs, true exclusive-fullscreen Replay, hook-mirrored pointer interaction, AMD/Intel hardware, or broader codec/recipient compatibility. The display refused the test target's exclusive-fullscreen request. Existing SDR conversion on HDR displays, odd-dimension rejection and 4:4:4 preview compatibility remain baseline limitations. Starts remain keyframe-aligned, not frame-accurate; previews are bounded windows, not a gapless decoding engine. Cross-session/resolution-epoch clip stitching remains unsupported.
+
+No installed application, user settings, permanent recordings or user history was overwritten. All new media/indexes and live capture tests used disposable paths in this worktree. No new package dependency was added.

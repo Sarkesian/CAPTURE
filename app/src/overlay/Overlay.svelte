@@ -99,7 +99,7 @@
   {:else if !s}
     <p class="muted">Loading…</p>
   {:else if view === 'review'}
-    <ReviewPanel onclose={back} />
+    <ReviewPanel compact onclose={back} />
   {:else if view === 'player' && playing}
     <section class="player">
       <!-- svelte-ignore a11y_media_has_caption -->

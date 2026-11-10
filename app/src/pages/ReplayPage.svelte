@@ -1,6 +1,6 @@
 <script lang="ts">
   // Replay: watch the recent buffer while recording continues, jump between markers, save a range.
-  import { app, releaseReview, setReplay, fmtDuration, engine } from '../lib/store.svelte';
+  import { app, releaseReview, setReplay, engine } from '../lib/store.svelte';
   import { onMount } from 'svelte';
   import ReviewPanel from '../overlay/ReviewPanel.svelte';
   import Icon from '../components/Icon.svelte';
@@ -22,13 +22,13 @@
     <div class="grow">
       <h1>Replay</h1>
       <p class="muted small">
-        Browse your original-quality gameplay history. Recording continues while you watch.
+        Find a moment. Make it a clip.
       </p>
     </div>
   </header>
 
-  {#if live || footage || e?.past_game || app.history?.sessions.length}
-    <ReviewPanel onclose={() => onnavigate?.('home')} />
+  {#if live || footage || e?.past_game || app.history?.sessions.length || !app.history}
+    <ReviewPanel onclose={() => onnavigate?.('home')} onlibrary={() => onnavigate?.('library')} />
   {:else}
     <div class="empty">
       <Icon name="replay" size={32} />
@@ -47,6 +47,7 @@
 <style>
   .page { display: flex; flex-direction: column; gap: var(--s4); height: calc(100vh - var(--s6) - var(--s10)); min-height: 420px; }
   h1 { font-size: var(--fs-xl); font-weight: 650; margin: 0 0 var(--s1); }
+  header .grow { display: flex; align-items: baseline; gap: 14px; }
   .empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: var(--s3); text-align: center;
            border: 1px dashed var(--line-strong); border-radius: var(--r-lg); color: var(--text-3); padding: var(--s8); }
   .empty h2 { color: var(--text); font-size: var(--fs-lg); margin: 0; }

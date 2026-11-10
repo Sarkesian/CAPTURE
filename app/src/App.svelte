@@ -75,7 +75,7 @@
   </nav>
 
   <main bind:this={main}>
-    <div class="content">
+    <div class="content" class:replaying={page === 'replay'}>
       {#if failed}
         <div class="banner warn">CAPTURE could not load its settings: {failed}</div>
       {:else if !app.settings}
@@ -128,6 +128,7 @@
 
   main { flex: 1; min-width: 0; overflow-y: auto; background: var(--bg); border-top-left-radius: var(--r-lg); }
   .content { max-width: var(--content-max); margin: 0 auto; padding: var(--s6) var(--s8) var(--s10); }
+  .content.replaying { max-width: 1800px; }
 
   @media (max-width: 900px) {
     nav { width: var(--nav-w-compact); align-items: center; }

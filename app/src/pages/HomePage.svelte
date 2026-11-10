@@ -2,7 +2,7 @@
   // Home: is it recording, what, how much replay is ready, is audio OK, and the main actions.
   import { open } from '@tauri-apps/plugin-dialog';
   import {
-    app, setReplay, saveReplay, addMarker, toggleSession, updateSettings, engine, clearTempCache,
+    app, setReplay, saveReplay, addMarker, toggleSession, updateSettings,
     openCaptureFolder, openPath, revealPath, fmtDuration, fmtBytes,
   } from '../lib/store.svelte';
   import Icon from '../components/Icon.svelte';
@@ -65,12 +65,11 @@
     </section>
   {/each}
 
-  {#if (e?.leftover_buffer_bytes ?? 0) > 0}
-    <section class="banner warn">
-      <Icon name="alert" size={18} />
-      <div class="grow"><b>Footage from a session that didn’t close normally</b> ({fmtBytes(e!.leftover_buffer_bytes)}). Keep it as a clip, or delete it.</div>
-      <button class="btn sm primary" onclick={() => engine('recover_leftovers')}>Save as clip</button>
-      <button class="btn sm ghost" onclick={clearTempCache}>Delete</button>
+  {#if app.history?.sessions.length || (e?.leftover_buffer_bytes ?? 0) > 0}
+    <section class="banner">
+      <Icon name="replay" size={18} />
+      <div class="grow"><b>Background history</b> · {app.history?.sessions.length ? `${app.history.sessions.length} recorded session${app.history.sessions.length===1?'':'s'}` : 'Earlier gameplay is available'}. Find a moment in Replay and save it to your Library.</div>
+      <button class="btn sm" onclick={() => onnavigate('replay')}>Review history</button>
     </section>
   {/if}
 

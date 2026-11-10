@@ -5,7 +5,7 @@ import {mkdirSync,readFileSync,writeFileSync} from 'node:fs';
 import readline from 'node:readline';
 import path from 'node:path';
 const [worker,root]=process.argv.slice(2);mkdirSync(root,{recursive:true});
-const game=spawn(path.resolve(import.meta.dirname,'../target/release/hook-testapp.exe'),['--secs','120','--title','Capture feedback latency test'],{stdio:['ignore','pipe','inherit']});
+const game=spawn(path.resolve(import.meta.dirname,'../target/release/hook-testapp.exe'),['--secs','120','--title','Capture feedback latency test',...process.argv.slice(4)],{stdio:['ignore','pipe','inherit'],windowsHide:true});
 let ready=false;readline.createInterface({input:game.stdout}).on('line',l=>{if(l.startsWith('ready'))ready=true});
 const proc=spawn(worker,[],{stdio:['pipe','pipe','pipe'],env:{...process.env,CAPTURE_TRACE:path.join(root,'timing.csv'),CAPTURE_IN_GAME_OVERLAY:'0'}});
 const events=[];let id=0,diagnostics='';proc.stderr.on('data',b=>diagnostics+=b);
