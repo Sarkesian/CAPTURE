@@ -1,6 +1,6 @@
 // Mirrors crates/capture-protocol (v1) and app/src-tauri/src/settings.rs.
 
-export type Quality = 'balanced' | 'high' | 'maximum';
+export type Quality = 'balanced' | 'high' | 'maximum' | 'archival';
 export type Status = 'ready' | 'starting' | 'waiting' | 'buffering' | 'needs_attention';
 
 export type TargetPref =
@@ -14,6 +14,7 @@ export interface Settings {
   capture_root: string;
   replay_enabled: boolean;
   replay_secs: number;
+  history_secs: number;
   target: TargetPref;
   quality: Quality;
   fps: number;
@@ -67,6 +68,12 @@ export interface TrackState { name: string; mode: string; source: string; peak: 
 export interface HotkeyState { action: HotkeyAction | null; combo: string; registered: boolean; message: string | null }
 
 export interface EngineState {
+  history_buffered_secs: number;
+  frames_encoded: number;
+  frames_without_source: number;
+  frames_dropped: number;
+  frames_repeated: number;
+  source_frames_unselected: number;
   status: Status;
   attention: string | null;
   target_name: string | null;
@@ -106,7 +113,10 @@ export interface SavedClip {
   audio_tracks: string[];
 }
 
-export interface Review { path: string; start: number; end: number; game: string; past?: boolean; markers?: Marker[] }
+export interface Review { session: string; path: string; start: number; end: number; game: string; past?: boolean; markers?: Marker[] }
+export interface TimelineEvent { id: string; kind: string; t: number; end: number | null; label: string; path: string | null; marker: Marker | null }
+export interface HistorySession { id: string; game: string; created_ms: number; ended: boolean; intervals: [number, number][]; events: TimelineEvent[] }
+export interface HistoryState { failed_saves: {id:string;session:string;start:number;end:number;error:string}[];sessions: HistorySession[]; bytes: number; preview_bytes: number; retained_secs: number; target_secs: number; reason: string | null }
 
 export interface ClipEntry { path: string; name: string; game: string; bytes: number; modified_ms: number; kind: 'clip' | 'session' | 'screenshot'; has_stems: boolean; has_markers: boolean }
 
@@ -123,6 +133,7 @@ export type EngineMessage = { v: number; re?: number } & (
   | { event: 'marker_added'; data: Marker }
   | { event: 'review_ready'; data: Review }
   | { event: 'review_failed'; data: { message: string } }
+  | { event: 'history_ready'; data: HistoryState }
   | { event: 'clip_info'; data: { path: string; duration_secs: number | null; error: string | null } }
   | { event: 'audio_devices'; data: { inputs: AudioDevice[]; outputs: AudioDevice[]; apps: AudioApp[] } }
   | { event: 'stems_done'; data: { path: string; folder: string | null; files: string[]; error: string | null } }

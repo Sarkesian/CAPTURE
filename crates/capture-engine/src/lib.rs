@@ -8,6 +8,7 @@ pub mod detect;
 pub mod devices;
 pub mod gpu;
 pub mod hotkey;
+pub mod history;
 pub mod inject;
 pub mod mic;
 pub mod mirror;
@@ -54,6 +55,8 @@ fn failed(m: impl Into<String>) -> Unresolved {
 }
 
 pub struct Engine {
+    history: Option<Arc<history::Catalog>>,
+    history_maintenance: Instant,
     cfg: Option<EngineConfig>,
     replay_on: bool,
     pipeline: Option<Pipeline>,
@@ -114,8 +117,47 @@ pub fn fmt_secs(s: f64) -> String {
 }
 
 impl Engine {
+    fn publish_history(&self,re:Option<u64>) {
+        if let Some(h)=&self.history {
+            match h.state(self.cfg.as_ref().map_or(14400,|c|c.history_secs)) {
+                Ok(mut state)=>{
+                    if let Some(cfg)=&self.cfg {if state.bytes+state.preview_bytes>=cfg.buffer_cap_bytes.saturating_sub(10_000_000) {state.reason=Some("Storage budget limits available history; protected or imported recordings may exceed it".into());}}
+                    if !h.import_complete(){state.reason=Some("Recovering earlier recordings…".into());}
+                    self.send(re,Event::HistoryReady(state));
+                },
+                Err(e)=>self.send(re,Event::Error{message:format!("Recording history: {e}")})
+            }
+        }
+    }
+    fn history_review(&self,re:Option<u64>,session:String,at:f64) {
+        let Some(h)=self.history.clone() else {return;};let emit=self.emit.clone();
+        std::thread::spawn(move || {let event=match h.preview(&session,at){Ok(v)=>Event::ReviewReady(v),Err(message)=>Event::ReviewFailed{message}};emit(Message::new(re,event));});
+    }
+    fn history_save(&mut self,re:Option<u64>,session:String,start:f64,end:f64) {
+        let Some(h)=self.history.clone() else {return;};
+        let mut lease=match h.lease(&session,start,end,"save") {Ok(l)=>l,Err(message)=>{self.send(re,Event::SaveFailed{save_id:0,message});return;}};
+        let id=self.next_save_id;self.next_save_id+=1;
+        self.capture_feedback(re,CaptureAction::Replay);
+        self.send(re,Event::SaveStarted{save_id:id,requested_secs:end-start});
+        let emit=self.emit.clone();let root=PathBuf::from(&self.cfg.as_ref().unwrap().capture_root);
+        let stems=self.editor_audio_files();
+        std::thread::spawn(move || {
+            let until=Instant::now()+std::time::Duration::from_secs(8);
+            while Instant::now()<until {
+                if h.media(&session,start,end+3.0).ok().and_then(|s|s.last().map(|s|s.end)).is_some_and(|t|t>=end){break;}
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let event=match h.save_clip(&lease,&root,id) {
+                Ok(c)=>{if stems{export_stems_after_save(&emit,&c);}Event::SaveFinished(c)},
+                Err(message)=>{lease.failed(&message);Event::SaveFailed{save_id:id,message}}
+            };
+            emit(Message::new(re,event));
+        });
+    }
     pub fn new(emit: Emit) -> Self {
         Self {
+            history: None,
+            history_maintenance:Instant::now(),
             cfg: None,
             replay_on: false,
             pipeline: None,
@@ -218,7 +260,7 @@ impl Engine {
     fn capture_feedback(&self, re: Option<u64>, action: CaptureAction) {
         let (title, cue, kind) = match action {
             CaptureAction::Screenshot => ("Screenshot saved", sound::Cue::Screenshot, Kind::Saved),
-            CaptureAction::Replay => ("Clip Saved", sound::Cue::Replay, Kind::Saved),
+            CaptureAction::Replay => ("Saving Clip", sound::Cue::Replay, Kind::Saved),
             CaptureAction::RecordingStart => ("Recording started", sound::Cue::Start, Kind::Recording),
             CaptureAction::RecordingStop => ("Recording saved", sound::Cue::Stop, Kind::Saved),
         };
@@ -249,45 +291,28 @@ impl Engine {
             Command::StopSession => self.stop_session(re),
             Command::SaveReplay => self.save(re, None),
             Command::SaveRange { start, end } => self.save(re, Some((start, end))),
-            Command::PrepareReview => match &self.pipeline {
-                Some(p) => {
-                    let emit = self.emit.clone();
-                    p.prepare_review(move |r| {
-                        match &r {
-                            Ok(rv) => eprintln!("replay: footage {:.1}..{:.1} s ready to watch", rv.start, rv.end),
-                            Err(e) => eprintln!("replay: footage not ready: {e}"),
+            Command::History => self.publish_history(re),
+            Command::HistoryReview { session, at } => self.history_review(re,session,at),
+            Command::HistorySave { session,start,end } => self.history_save(re,session,start,end),
+            Command::HistoryMarker {session,id,label,remove} => {
+                if let Some(h)=&self.history {
+                    let result=(||->Result<(),String>{
+                        let mut ev=h.events(&session)?.into_iter().find(|e|e.id==id && e.kind=="marker").ok_or("Marker no longer exists")?;
+                        if let Some(p)=self.pipeline.as_ref().filter(|p|p.shared.session_id==session) {
+                            if let Some(m)=&ev.marker {if remove {p.shared.remove_marker(m.id);} else {p.shared.rename_marker(m.id,label.unwrap_or_default());}return Ok(());}
                         }
-                        emit(Message::new(re, match r {
-                            Ok(rv) => Event::ReviewReady(rv),
-                            Err(message) => Event::ReviewFailed { message },
-                        }))
-                    });
+                        if remove {ev.kind="removed".into();h.unpin(&session,&id);}else {ev.label=label.unwrap_or_default();if let Some(m)=&mut ev.marker {m.label=ev.label.clone();}}
+                        h.event(&session,&ev)
+                    })();
+                    if let Err(message)=result {self.send(re,Event::Error{message});}
+                    self.publish_history(re);
                 }
-                // Nothing is being recorded: the previous background recording, if it is still there.
-                None => match self.past_recording() {
-                    Some((dir, _)) => {
-                        if let Some(old) = self.past_review.take() {
-                            let _ = std::fs::remove_file(old);
-                        }
-                        let path = dir.join(format!("review_{:03}.mp4", self.next_save_id));
-                        self.next_save_id += 1;
-                        self.past_review = Some(path.clone());
-                        let emit = self.emit.clone();
-                        std::thread::spawn(move || {
-                            let r = past_review(&dir, &path);
-                            match &r {
-                                Ok(rv) => eprintln!("replay: previous recording, {:.1} s ready to watch", rv.end),
-                                Err(e) => eprintln!("replay: previous recording not ready: {e}"),
-                            }
-                            emit(Message::new(re, match r {
-                                Ok(rv) => Event::ReviewReady(rv),
-                                Err(message) => Event::ReviewFailed { message },
-                            }))
-                        });
-                    }
-                    None => self.send(re, Event::ReviewFailed { message: "Nothing is being recorded right now.".into() }),
-                },
-            },
+            }
+            Command::PrepareReview => {
+                let latest=self.history.as_ref().and_then(|h|h.state(self.cfg.as_ref().map_or(14400,|c|c.history_secs)).ok()).and_then(|s|s.sessions.into_iter().rev().find(|s|!s.intervals.is_empty()));
+                if let Some(s)=latest {let at=(s.intervals.last().unwrap()[1]-25.0).max(s.intervals.last().unwrap()[0]);self.history_review(re,s.id,at);}
+                else {self.send(re,Event::ReviewFailed{message:"Nothing has been recorded yet. Give it a few seconds.".into()});}
+            }
             Command::Meters { client, enabled } => {
                 if enabled {
                     self.meter_clients.insert(client);
@@ -400,6 +425,7 @@ impl Engine {
                 });
             }
             Command::ReleaseReview { path } => {
+                if let (Some(h),Some(path))=(&self.history,&path) {h.release_preview(path);}
                 if self.past_review.as_ref().is_some_and(|f| path.is_none() || path.as_deref() == Some(&*f.to_string_lossy())) {
                     let _ = std::fs::remove_file(self.past_review.take().unwrap());
                 }
@@ -427,22 +453,27 @@ impl Engine {
             }
             Command::GetState => {}
             Command::RecoverLeftovers => {
-                let Some(root) = self.cfg.as_ref().map(|c| PathBuf::from(&c.capture_root)) else { return true };
-                let dirs = self.leftover_dirs(&root);
-                let emit = self.emit.clone();
-                std::thread::spawn(move || {
-                    let (mut clips, mut failed) = (vec![], vec![]);
-                    for d in dirs {
-                        match recover_session(&root, &d) {
-                            Ok(p) => {
-                                storage::remove_session_dir(&d);
-                                clips.push(p.to_string_lossy().into_owned());
-                            }
-                            Err(e) => failed.push(format!("{}: {e}", d.display())),
-                        }
+                let Some(h)=self.history.clone() else {return true;};
+                let Some(cfg)=&self.cfg else {return true;};let root=PathBuf::from(&cfg.capture_root);
+                let current=self.pipeline.as_ref().map(|p|p.shared.session_id.clone());
+                let selections=(||->Result<Vec<history::Lease>,String>{
+                    let state=h.state(cfg.history_secs)?;let mut leases=vec![];
+                    for session in state.sessions.into_iter().filter(|s|Some(&s.id)!=current.as_ref()) {
+                        for [a,b] in session.intervals {leases.push(h.lease(&session.id,a,b,"save")?);}
                     }
-                    emit(Message::new(re, Event::Recovered { clips, failed }));
-                });
+                    Ok(leases)
+                })();
+                match selections {
+                    Err(message)=>self.send(re,Event::Error{message}),
+                    Ok(leases)=>{
+                        self.capture_feedback(re,CaptureAction::Replay);
+                        let emit=self.emit.clone();std::thread::spawn(move||{
+                            let mut clips=vec![];let mut failed=vec![];
+                            for mut lease in leases {match h.save_clip(&lease,&root,0){Ok(c)=>clips.push(c.path),Err(e)=>{lease.failed(&e);failed.push(e);}}}
+                            emit(Message::new(re,Event::Recovered{clips,failed}));
+                        });
+                    }
+                }
             }
             Command::ClearTempCache => {
                 let freed = self.clear_leftovers();
@@ -496,6 +527,12 @@ impl Engine {
         };
         if cfg.markers.sound { sound::warm_output(cfg.markers.sound_device.clone()); }
         self.cfg = Some(cfg);
+        let cfg=self.cfg.as_ref().unwrap();
+        let root=storage::buffer_dir_for(Path::new(&cfg.capture_root),cfg.buffer_root.as_deref());
+        match history::Catalog::open(&root) {
+            Ok(h)=>{if self.history.as_ref().is_none_or(|old|!Arc::ptr_eq(old,&h)){let importer=h.clone();std::thread::spawn(move || { for _ in 0..100000 {if let Err(e)=importer.import_step(){eprintln!("history recovery: {e}");importer.import_failed(&e);break;} if importer.import_complete(){break;}std::thread::sleep(std::time::Duration::from_millis(10));} });}self.history=Some(h);},
+            Err(e)=>{self.start_error=Some(failed(format!("Could not open recording history: {e}")));return;}
+        }
         if let Some(p) = &self.pipeline {
             let game_cfg = self.cfg.as_ref().map(|c| c.for_game(&p.shared.target_exe));
             if let Some(c) = &game_cfg {
@@ -547,7 +584,7 @@ impl Engine {
                 self.start_error = None;
                 self.fps_sample = (Instant::now(), 0);
                 self.pipeline = Some(p);
-                self.forget_past_recordings();
+                // Global history survives every successful session switch.
                 let save = if cfg.save_hotkey.is_empty() { "Save clip in CAPTURE".to_string() } else { quoted(&cfg.save_hotkey) };
                 let title = if display { "Recording your display".to_string() } else { format!("Recording {name}") };
                 let mic = match (cfg.audio.mic_enabled, cfg.audio.mic_muted) {
@@ -643,7 +680,9 @@ impl Engine {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shot::save(&gpu, &capture, &shared.root, &shared.game_name)))
                 .unwrap_or_else(|_| Err("Screenshot processing failed.".into()));
             match result {
-                Ok(path) => {
+                Ok((path,frame_qpc)) => {
+                    let at=if frame_qpc>0 {frame_qpc.saturating_sub(shared.t0) as f64/1e7} else {at};
+                    if let Err(e)=shared.history.event(&shared.session_id,&TimelineEvent{id:format!("shot:{}",path.display()),kind:"screenshot".into(),t:at,end:None,label:path.file_name().unwrap_or_default().to_string_lossy().into_owned(),path:Some(path.to_string_lossy().into_owned()),marker:None}) {emit(Message::new(re,Event::Error{message:format!("Screenshot saved, but timeline position could not be preserved: {e}")}));}
                     shared.note_saved(SavedKind::Screenshot, at, None, &path);
                     emit(Message::new(re, Event::ScreenshotSaved { path: path.to_string_lossy().into_owned() }));
                 }
@@ -689,29 +728,11 @@ impl Engine {
     }
 
     fn save(&mut self, re: Option<u64>, range: Option<(f64, f64)>) {
-        // A range of the previous background recording (Replay while nothing is being recorded).
-        let past = self.past_recording(); // (none while a game is being recorded)
-        if let (Some((start, end)), Some((dir, _)), Some(root)) = (range, past, self.cfg.as_ref().map(|c| PathBuf::from(&c.capture_root))) {
-            let id = self.next_save_id;
-            self.next_save_id += 1;
-            self.capture_feedback(re, CaptureAction::Replay);
-            self.send(re, Event::SaveStarted { save_id: id, requested_secs: end - start });
-            let emit = self.emit.clone();
-            std::thread::spawn(move || {
-                emit(Message::new(re, match past_clip(&root, &dir, start, end) {
-                    Ok(c) => Event::SaveFinished(SavedClip {
-                        save_id: id,
-                        path: c.path.to_string_lossy().into_owned(),
-                        requested_secs: end - start,
-                        duration_secs: c.duration_secs,
-                        bytes: c.bytes,
-                        video_streams: c.video_streams,
-                        audio_tracks: c.audio_tracks,
-                    }),
-                    Err(message) => Event::SaveFailed { save_id: id, message },
-                }));
-            });
-            return;
+        if self.pipeline.is_none() {
+            if let Some((start,end))=range {
+                let session=self.history.as_ref().and_then(|h|h.state(14400).ok()).and_then(|s|s.sessions.into_iter().rev().find(|s|!s.intervals.is_empty()));
+                if let Some(session)=session {self.history_save(re,session.id,start,end);return;}
+            }
         }
         let Some(p) = &self.pipeline else {
             let msg = if self.replay_on {
@@ -730,10 +751,10 @@ impl Engine {
         let overlay = self.overlay.clone();
         let hook = p.hook.clone();
         let stems = self.editor_audio_files();
-        self.capture_feedback(re, CaptureAction::Replay);
         let requested = p.request_save(
             range,
             SaveKind::Clip,
+            || self.capture_feedback(re,CaptureAction::Replay),
             move |r| {
                 // Input was acknowledged already; completion only updates the library.
                 let ev = match r {
@@ -763,6 +784,17 @@ impl Engine {
     /// A session whose window closed stays saveable until a new one starts.
     pub fn tick(&mut self) {
         self.hand_over_notice();
+        if self.history_maintenance.elapsed().as_secs()>=2 {
+            self.history_maintenance=Instant::now();
+            if let (Some(h),Some(c))=(&self.history,&self.cfg) {
+                if let Err(e)=h.refresh_files().and_then(|_|h.retain(c.history_secs,c.buffer_cap_bytes,c.min_free_bytes).map(|_|())) {eprintln!("history maintenance: {e}");}
+            }
+        }
+        if self.pipeline.as_ref().is_some_and(|p|p.capture.resolution_changed.load(Ordering::Relaxed)) {
+            let recording=self.pipeline.as_ref().is_some_and(|p|p.shared.session_start.lock().unwrap().is_some());
+            self.start_pipeline();
+            if recording {if let Some(p)=&self.pipeline {p.start_session();}}
+        }
         if !self.replay_on {
             return;
         }
@@ -978,6 +1010,8 @@ impl Engine {
         let free_bytes = root.as_deref().and_then(storage::free_bytes);
         let leftover_buffer_bytes = root.as_deref().map(|r| self.leftover_bytes(r)).unwrap_or(0);
         let mut st = EngineState {
+            history_buffered_secs:0.0,
+            frames_encoded:0,frames_without_source:0,frames_dropped:0,frames_repeated:0,source_frames_unselected:0,
             status: Status::Ready,
             attention: None,
             target_name: None,
@@ -1042,8 +1076,14 @@ impl Engine {
         st.encoder = Some(p.encoder.clone());
         st.buffered_secs = (buffered * 10.0).round() / 10.0;
         st.buffer_bytes = bytes;
+        st.history_buffered_secs=sh.ring.lock().unwrap().segments().iter().filter_map(|s|s.end.map(|e|(e-s.start).max(0.0))).sum();
         st.capture_fps = (self.capture_fps * 10.0).round() / 10.0;
         st.frames_captured = frames;
+        st.frames_encoded=sh.frames_encoded.load(Ordering::Relaxed);
+        st.frames_without_source=sh.frames_without_source.load(Ordering::Relaxed);
+        st.frames_dropped=sh.frames_dropped.load(Ordering::Relaxed);
+        st.frames_repeated=sh.frames_repeated.load(Ordering::Relaxed);
+        st.source_frames_unselected=sh.source_frames_unselected.load(Ordering::Relaxed);
         st.tracks = p.audio.as_ref().map(|a| a.states()).unwrap_or_default();
         for t in &mut st.tracks {
             t.peak = (t.peak * 100.0).round() / 100.0;
@@ -1066,6 +1106,7 @@ impl Engine {
             Status::Starting
         };
         st.attention = attention.or_else(|| {
+            if st.frames_dropped>0 {return Some(format!("{} recording frames missed their deadline. Resolution, FPS and quality have not been reduced. Consider lowering game GPU load or explicitly choosing other recording settings.",st.frames_dropped));}
             (st.status == Status::Starting && sh.now() > 5.0 && frames == 0)
                 .then(|| "No frames received yet. The game may be minimized, protected, or in exclusive fullscreen. Try borderless mode or Whole display.".into())
         });
@@ -1112,33 +1153,22 @@ impl Engine {
 
     /// A new game is being recorded: the recordings kept from earlier games (those that ended
     /// normally) go. What a crash left behind stays until the player saves or deletes it.
-    fn forget_past_recordings(&mut self) {
-        self.past_review = None;
-        self.past_seen = None;
-        let Some(root) = self.cfg.as_ref().map(|c| PathBuf::from(&c.capture_root)) else { return };
-        for d in self.leftover_dirs(&root) {
-            if d.join(storage::ENDED_FILE).exists() {
-                storage::remove_session_dir(&d);
-            }
-        }
-    }
-
     fn leftover_bytes(&self, root: &Path) -> u64 {
         self.leftover_dirs(root).iter().map(|d| storage::dir_size(d)).sum()
     }
 
     /// Deletes only `Background Recording\<old session>` folders — never clips, never the live session.
     fn clear_leftovers(&mut self) -> u64 {
-        let Some(root) = self.cfg.as_ref().map(|c| PathBuf::from(&c.capture_root)) else { return 0 };
-        let mut freed = 0;
-        for d in self.leftover_dirs(&root) {
-            freed += storage::remove_session_dir(&d);
-        }
-        freed
+        // Explicit cleanup uses the same leases as automatic cleanup; legacy media is kept.
+        let Some(h)=&self.history else{return 0;};
+        let before=h.state(0).map(|s|s.bytes).unwrap_or(0);
+        let _=h.retain(0,0,0);
+        before.saturating_sub(h.state(0).map(|s|s.bytes).unwrap_or(before))
     }
 
     pub fn shutdown(&mut self) {
         self.stop_session(None);
+        history::wait_for_saves(std::time::Duration::from_secs(14*60));
         let shots_until = Instant::now() + std::time::Duration::from_secs(30);
         while self.screenshots.load(Ordering::SeqCst) > 0 && Instant::now() < shots_until {
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1198,111 +1228,8 @@ pub fn bindings(cfg: &EngineConfig) -> hotkey::Bindings {
 
 /// The footage files of a kept session folder, in order, with the session time of the first
 /// picture and the audio track names.
-fn past_footage(dir: &Path) -> Result<(Vec<(PathBuf, f64)>, f64, Vec<String>, String), String> {
-    let manifest: serde_json::Value = std::fs::read(dir.join("session.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(serde_json::json!({}));
-    let game = manifest["game"].as_str().unwrap_or("your last game").to_string();
-    let tracks: Vec<String> = manifest["audio_tracks"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
-    let mut segs: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| e.to_string())?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "ts") && std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false))
-        .collect();
-    segs.sort();
-    if segs.is_empty() {
-        return Err("That recording has no footage left.".into());
-    }
-    let origin = save::first_keyframe_secs(&segs[0]).unwrap_or(0.0);
-    Ok((segs.into_iter().map(|p| (p, 0.0)).collect(), origin, tracks, game))
-}
-
-/// A playable copy of the previous background recording for Replay. Its timeline starts at 0;
-/// the recording's markers are placed on it.
-fn past_review(dir: &Path, path: &Path) -> Result<Review, String> {
-    let (list, origin, tracks, game) = past_footage(dir)?;
-    let (clip, _) = save::remux(&list, None, 0.0, 0.0, 1e9, &tracks, path).map_err(|e| format!("Could not open the last recording: {e}"))?;
-    let mut markers: Vec<Marker> = std::fs::read(dir.join("markers.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-    markers.retain(|m| m.t >= origin && m.t <= origin + clip.duration_secs);
-    for m in &mut markers {
-        m.t -= origin;
-    }
-    Ok(Review { path: path.to_string_lossy().into_owned(), start: 0.0, end: clip.duration_secs, game, past: true, markers })
-}
-
-/// Save `start..end` (seconds on the `past_review` timeline) of the previous recording as a clip.
-fn past_clip(root: &Path, dir: &Path, start: f64, end: f64) -> Result<save::ClipResult, String> {
-    let (list, origin, tracks, game) = past_footage(dir)?;
-    // Each file with the moment it starts at, so the clip begins in the right one (within a
-    // second of `start`) instead of at the beginning of an earlier file.
-    let list: Vec<(PathBuf, f64)> = list.into_iter().map(|(p, _)| { let t = save::first_keyframe_secs(&p).map_or(0.0, |t| (t - origin).max(0.0)); (p, t) }).collect();
-    let out_dir = storage::clips_dir(root, &game);
-    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
-    let name = storage::clip_file_name(&storage::local_stamp(), &game, "Clip");
-    let path = storage::reserve_unique_path(&out_dir, &name).map_err(|e| e.to_string())?;
-    // (The clip is cut from the file that holds its first moment onwards.)
-    let first = list.iter().rposition(|(_, t)| *t <= start.max(0.0)).unwrap_or(0);
-    save::remux(&list[first..], None, list[first].1, start.max(0.0), end, &tracks, &path).map(|(clip, _)| clip)
-}
-
-/// Save a leftover session folder (crash / power loss) as `<Game>\Clips\..._Recovered.mp4`.
-/// Damaged segments are skipped; the folder is only deleted by the caller after success.
-fn recover_session(root: &Path, dir: &Path) -> Result<PathBuf, String> {
-    let manifest: serde_json::Value = std::fs::read(dir.join("session.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or(serde_json::json!({}));
-    let game = manifest["game"].as_str().unwrap_or("Recovered").to_string();
-    let tracks: Vec<String> = manifest["audio_tracks"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
-    let mut segs: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| e.to_string())?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "ts") && std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false))
-        .collect();
-    segs.sort();
-    if segs.is_empty() {
-        return Err("no footage".into());
-    }
-    let origin = save::first_keyframe_secs(&segs[0]);
-    // The frame being written when the recorder died is usually cut short and would decode as
-    // a damaged frame: end the recovered clip just before the last video frame on disk.
-    let clip_end = match (origin, segs.last().and_then(|l| save::last_video_secs(l))) {
-        (Some(o), Some(last)) if last > o => last - o - 0.001,
-        _ => 1e9,
-    };
-    let list: Vec<(PathBuf, f64)> = segs.into_iter().map(|p| (p, 0.0)).collect();
-    let out_dir = storage::clips_dir(root, &game);
-    std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
-    let name = storage::clip_file_name(&storage::local_stamp(), &game, "Recovered");
-    let path = storage::reserve_unique_path(&out_dir, &name).map_err(|e| e.to_string())?;
-    let (clip, _) = save::remux(&list, None, 0.0, 0.0, clip_end, &tracks, &path)?;
-    // Markers survive a crash: the session's crash-safe markers.json becomes the recovered
-    // clip's sidecar (before the caller deletes the buffer folder).
-    let markers: Vec<Marker> = std::fs::read(dir.join("markers.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-    if let (Some(origin), false) = (origin, markers.is_empty()) {
-        write_marker_sidecar(&clip.path, &markers, origin, clip.duration_secs);
-    }
-    Ok(clip.path)
-}
-
-/// `<clip>.markers.json` with times relative to the clip start (same format as normal saves).
-fn write_marker_sidecar(clip: &Path, markers: &[Marker], origin: f64, duration: f64) {
-    let inside: Vec<_> = markers
-        .iter()
-        .filter(|m| m.t >= origin && m.t <= origin + duration)
-        .map(|m| serde_json::json!({ "t": ((m.t - origin) * 100.0).round() / 100.0, "label": m.label, "at": m.at }))
-        .collect();
-    if inside.is_empty() {
-        return;
-    }
-    let doc = serde_json::json!({ "capture_markers": 1, "clip": clip.file_name().map(|n| n.to_string_lossy().into_owned()), "markers": inside });
-    let mut side = clip.as_os_str().to_owned();
-    side.push(".markers.json");
-    let _ = std::fs::write(PathBuf::from(side), serde_json::to_vec_pretty(&doc).unwrap());
-}
-
 fn live_of(cfg: &EngineConfig) -> Live {
-    Live { replay_secs: cfg.replay_secs.clamp(5, 3600), cap_bytes: cfg.buffer_cap_bytes, min_free_bytes: cfg.min_free_bytes }
+    Live { replay_secs: cfg.replay_secs.clamp(5, 3600), history_secs:cfg.history_secs.clamp(60,21600), cap_bytes: cfg.buffer_cap_bytes, min_free_bytes: cfg.min_free_bytes }
 }
 
 fn base_settings(cfg: &EngineConfig) -> Result<PathBuf, Unresolved> {

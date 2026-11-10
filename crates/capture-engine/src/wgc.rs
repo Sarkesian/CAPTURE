@@ -17,7 +17,7 @@ use windows::Graphics::SizeInt32;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::Graphics::Dxgi::{IDXGIDevice,IDXGIOutput6};
 use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess};
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
@@ -49,6 +49,7 @@ pub enum Source {
 /// The most recent captured frame, already cropped and (after a size change) scaled to the
 /// encoder size.
 pub struct Latest {
+    pub frame_qpc: u64,
     pub texture: ID3D11Texture2D,
     rtv: ID3D11RenderTargetView,
     pub has_frame: bool,
@@ -150,6 +151,8 @@ impl Scaler {
 }
 
 pub struct Capture {
+    pub resolution_changed: Arc<AtomicBool>,
+    pub native_resolution: Arc<AtomicBool>,
     pub width: u32,
     pub height: u32,
     pub latest: Arc<Mutex<Latest>>,
@@ -194,6 +197,13 @@ pub fn client_crop(hwnd: isize) -> Option<(i32, i32, i32, i32)> {
 
 impl Capture {
     pub fn start(gpu: &Gpu, source: Source, cursor: bool) -> Result<Self, String> {
+        Self::start_with_native(gpu,source,cursor,false)
+    }
+    pub fn start_native(gpu:&Gpu,source:Source,cursor:bool)->Result<Self,String> {
+        validate_native_color(gpu,&source)?;
+        Self::start_with_native(gpu,source,cursor,true)
+    }
+    fn start_with_native(gpu:&Gpu,source:Source,cursor:bool,native:bool)->Result<Self,String> {
         let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
             .map_err(|e| format!("Windows Graphics Capture is unavailable: {e}"))?;
         let item: GraphicsCaptureItem = unsafe {
@@ -210,9 +220,10 @@ impl Capture {
             Source::Monitor(_) => None,
         };
         let crop0 = window.and_then(client_crop);
+        let dimension=|v:i32|if native {v.max(2) as u32} else {even(v)};
         let (width, height) = match crop0 {
-            Some((_, _, w, h)) => (even(w.min(size.Width)), even(h.min(size.Height))),
-            None => (even(size.Width), even(size.Height)),
+            Some((_, _, w, h)) => (dimension(w.min(size.Width)), dimension(h.min(size.Height))),
+            None => (dimension(size.Width), dimension(size.Height)),
         };
 
         let winrt_device: IDirect3DDevice = unsafe {
@@ -225,6 +236,8 @@ impl Capture {
         let latest = Arc::new(Mutex::new(initial));
         let frames = Arc::new(AtomicU64::new(0));
         let closed = Arc::new(AtomicBool::new(false));
+        let resolution_changed=Arc::new(AtomicBool::new(false));
+        let native_resolution=Arc::new(AtomicBool::new(native));
 
         let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             &winrt_device,
@@ -239,6 +252,7 @@ impl Capture {
 
         {
             let (latest, frames) = (latest.clone(), frames.clone());
+            let (resolution_changed,native_resolution)=(resolution_changed.clone(),native_resolution.clone());
             // The immediate context is multithread-protected (see gpu.rs), so using it from the
             // WGC callback thread is safe.
             let ctx = SendCtx(gpu.context.clone(), winrt_device.clone());
@@ -289,7 +303,12 @@ impl Capture {
                     let (sw, sh) = ((rect.right - rect.left) as u32, (rect.bottom - rect.top) as u32);
                     // Same size as the recording (the usual case): a plain copy below. Otherwise
                     // scale it into the recording size so nothing is cut off or left half-empty.
-                    let resized = (even(sw as i32), even(sh as i32)) != (width, height);
+                    let resized = if native_resolution.load(Ordering::Relaxed) {(sw,sh)!=(width,height)} else {(even(sw as i32),even(sh as i32))!=(width,height)};
+                    if resized && native_resolution.load(Ordering::Relaxed) {
+                        resolution_changed.store(true,Ordering::Relaxed);
+                        l.has_frame=false;
+                        return Ok(());
+                    }
                     if resized {
                         let (tw, th) = (desc.Width, desc.Height);
                         if l.scaler.as_ref().is_none_or(|sc| sc.in_size != (tw, th)) {
@@ -331,6 +350,7 @@ impl Capture {
                         }
                         l.error = None;
                         l.has_frame = true;
+                        l.frame_qpc=frame.SystemRelativeTime().map(|t|t.Duration.max(0) as u64).unwrap_or(t_arrive);
                         frames.fetch_add(1, Ordering::Relaxed);
                     }
                     Ok(())
@@ -347,8 +367,31 @@ impl Capture {
             .map_err(|e| e.to_string())?;
         }
         session.StartCapture().map_err(|e| format!("Capture could not start: {e}"))?;
-        Ok(Self { width, height, latest, frames, closed, session, pool })
+        Ok(Self { width, height, latest, frames, closed, session, pool, resolution_changed,native_resolution })
     }
+}
+
+fn validate_native_color(gpu:&Gpu,source:&Source)->Result<(),String> {
+    use windows::Win32::Graphics::Gdi::{MonitorFromWindow,MONITOR_DEFAULTTONEAREST};
+    let monitor=match source {Source::Monitor(h)=>HMONITOR(*h as *mut _),Source::Window(h)=>unsafe{MonitorFromWindow(HWND(*h as *mut _),MONITOR_DEFAULTTONEAREST)}};
+    unsafe {
+        let adapter=gpu.device.cast::<IDXGIDevice>().and_then(|d|d.GetAdapter()).map_err(|e|format!("Cannot verify source color format: {e}"))?;
+        let mut index=0;
+        while let Ok(output)=adapter.EnumOutputs(index) {
+            index+=1;
+            if output.GetDesc().map(|d|d.Monitor==monitor).unwrap_or(false) {
+                let output=output.cast::<IDXGIOutput6>().map_err(|e|format!("Cannot verify source color format: {e}"))?;
+                let color=output.GetDesc1().map_err(|e|e.to_string())?.ColorSpace;
+                return validate_sdr_color(color);
+            }
+        }
+    }
+    Err("Cannot verify this display's color format on the capture GPU. Recording was not silently converted; multi-adapter color capture needs validation.".into())
+}
+
+fn validate_sdr_color(color:DXGI_COLOR_SPACE_TYPE)->Result<(),String> {
+    if color==DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 || color==DXGI_COLOR_SPACE_RGB_STUDIO_G22_NONE_P709 {Ok(())}
+    else {Err("This display uses HDR or an unsupported color space. The current recorder preserves 8-bit SDR only; recording has not been silently converted. HDR/10-bit preservation requires a different validated capture and encoding path.".into())}
 }
 
 impl Drop for Capture {
@@ -378,12 +421,26 @@ fn make_latest(gpu: &Gpu, width: u32, height: u32) -> Result<Latest, String> {
     unsafe { gpu.device.CreateRenderTargetView(&texture, None, Some(&mut rtv)) }.map_err(|e| e.to_string())?;
     let rtv = rtv.unwrap();
     unsafe { gpu.context.ClearRenderTargetView(&rtv, &[0.0, 0.0, 0.0, 1.0]) };
-    Ok(Latest { texture, rtv, has_frame: false, last_size: SizeInt32 { Width: width as i32, Height: height as i32 }, scaler: None, error: None })
+    Ok(Latest { frame_qpc:0,texture, rtv, has_frame: false, last_size: SizeInt32 { Width: width as i32, Height: height as i32 }, scaler: None, error: None })
+}
+
+#[cfg(test)]
+pub(crate) fn synthetic_latest(gpu:&Gpu,width:u32,height:u32,pixels:&[u8])->Latest {
+    let mut latest=make_latest(gpu,width,height).unwrap();
+    unsafe {gpu.context.UpdateSubresource(&latest.texture,0,None,pixels.as_ptr().cast(),width*4,0);}
+    latest.has_frame=true;latest
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_hdr_is_never_silently_treated_as_sdr() {
+        assert!(validate_sdr_color(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709).is_ok());
+        assert!(validate_sdr_color(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020).is_err());
+        assert!(validate_sdr_color(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709).is_err());
+    }
 
     #[test]
     fn size_transitions_never_publish_a_partial_surface() {

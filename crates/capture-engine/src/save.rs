@@ -61,6 +61,10 @@ pub fn remux(
     let verified = verify(&partial, track_names.len() as u32);
     let res = match verified {
         Ok(mut v) => {
+            if clip_end < 1e8 && v.duration_secs + 0.15 < clip_end - actual_start {
+                let _ = std::fs::remove_file(&partial);
+                return Err("The clip is incomplete. Original recording retained; try the available range again.".into());
+            }
             if let Err(e) = std::fs::rename(&partial, final_path) {
                 let _ = std::fs::remove_file(&partial);
                 return Err(format!("Could not finalize clip: {e}"));
@@ -103,6 +107,15 @@ pub fn first_keyframe_secs(path: &Path) -> Option<f64> {
         drop(ic);
         let k = *keyframes(path, v).first()?;
         Some(k as f64 * tb.num as f64 / tb.den as f64)
+    }
+}
+
+/// Recovery can infer a track count from media, but must not invent lost source labels.
+pub fn recovered_audio_names(path:&Path)->Option<Vec<String>> {
+    unsafe {
+        let ic=open_input(path).ok()?;let mut count=0;
+        for i in 0..(*ic.0).nb_streams as usize {if (*(*(*(*ic.0).streams.add(i))).codecpar).codec_type==ff::AVMediaType::AVMEDIA_TYPE_AUDIO {count+=1;}}
+        Some((0..count).map(|i|if i==0 {"Preview Mix".into()}else{format!("Recovered Audio {}",i+1)}).collect())
     }
 }
 
@@ -223,7 +236,7 @@ unsafe fn remux_inner(segments: &[(PathBuf, f64)], lead_in: Option<&Path>, seg0_
     for (path, audio_only) in inputs {
         let ic = match open_input(&path) {
             Ok(ic) => ic,
-            Err(_) => continue, // a damaged tail segment must not sink the whole clip
+            Err(e) => return Err(format!("A required recording segment could not be read: {e}. Original footage has been retained.")),
         };
         if (*ic.0).nb_streams as usize != n {
             if audio_only {

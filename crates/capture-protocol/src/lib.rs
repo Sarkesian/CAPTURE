@@ -45,6 +45,10 @@ pub enum Command {
     /// Make the buffered footage playable for the review timeline (stream copy into a
     /// temporary MP4). Footage used by the review is protected until released.
     PrepareReview,
+    History,
+    HistoryReview { session: String, at: f64 },
+    HistorySave { session: String, start: f64, end: f64 },
+    HistoryMarker { session: String, id: String, label: Option<String>, remove: bool },
     /// Done with a review snapshot. `path` names it (`Review::path`): a window that lets go of
     /// an older snapshot must not delete the one another window is watching. `None` = whichever.
     ReleaseReview { #[serde(default)] path: Option<String> },
@@ -102,6 +106,7 @@ pub enum Event {
     MarkerAdded(Marker),
     ReviewReady(Review),
     ReviewFailed { message: String },
+    HistoryReady(HistoryState),
     ClipInfo { path: String, duration_secs: Option<f64>, error: Option<String> },
     AudioDevices { inputs: Vec<AudioDevice>, outputs: Vec<AudioDevice>, apps: Vec<AudioApp> },
     /// Real audio levels since the previous `Levels` message (peak and RMS, linear 0..1).
@@ -139,6 +144,8 @@ pub enum OverlayMode {
 /// and last frame (marker `t` values map to `t - start` in the file).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Review {
+    #[serde(default)]
+    pub session: String,
     pub path: String,
     pub start: f64,
     pub end: f64,
@@ -150,6 +157,43 @@ pub struct Review {
     #[serde(default)]
     pub markers: Vec<Marker>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct HistoryState {
+    pub failed_saves: Vec<FailedHistorySave>,
+    pub sessions: Vec<HistorySession>,
+    pub bytes: u64,
+    pub preview_bytes: u64,
+    pub retained_secs: f64,
+    pub target_secs: u32,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FailedHistorySave { pub id:String,pub session:String,pub start:f64,pub end:f64,pub error:String }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HistorySession {
+    pub id: String,
+    pub game: String,
+    pub created_ms: u64,
+    pub ended: bool,
+    pub intervals: Vec<[f64; 2]>,
+    pub events: Vec<TimelineEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TimelineEvent {
+    pub id: String,
+    pub kind: String,
+    pub t: f64,
+    pub end: Option<f64>,
+    pub label: String,
+    pub path: Option<String>,
+    pub marker: Option<Marker>,
+}
+
+pub fn default_history_secs() -> u32 { 4 * 3600 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -291,6 +335,8 @@ pub struct EngineConfig {
     #[serde(default)]
     pub buffer_root: Option<String>,
     pub replay_secs: u32,
+    #[serde(default = "default_history_secs")]
+    pub history_secs: u32,
     pub target: CaptureTarget,
     pub quality: Quality,
     pub fps: u32,
@@ -446,6 +492,8 @@ pub enum CaptureTarget {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Quality {
+    /// H.264 NVENC lossless coding of 8-bit 4:4:4 after RGB conversion. Not RGB bit-exact.
+    Archival,
     Balanced,
     High,
     Maximum,
@@ -489,6 +537,18 @@ pub enum Status {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EngineState {
+    #[serde(default)]
+    pub history_buffered_secs: f64,
+    #[serde(default)]
+    pub frames_encoded: u64,
+    #[serde(default)]
+    pub frames_without_source: u64,
+    #[serde(default)]
+    pub frames_dropped: u64,
+    #[serde(default)]
+    pub frames_repeated: u64,
+    #[serde(default)]
+    pub source_frames_unselected: u64,
     pub status: Status,
     /// Plain-language reason when status is NeedsAttention.
     pub attention: Option<String>,

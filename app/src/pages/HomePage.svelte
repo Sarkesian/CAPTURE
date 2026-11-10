@@ -36,7 +36,7 @@
   });
   const ready = $derived(e?.buffered_secs ?? 0);
   const fill = $derived(Math.min(1, ready / Math.max(1, s.replay_secs)));
-  const measured = $derived(e && live && e.buffered_secs > 8 ? (e.buffer_bytes / e.buffered_secs) * 60 : null);
+  const measured = $derived(e && live && e.history_buffered_secs > 8 ? (e.buffer_bytes / e.history_buffered_secs) * 60 : null);
 
   async function changeFolder() {
     const dir = await open({ directory: true, title: 'Choose where CAPTURE saves clips', defaultPath: s.capture_root });

@@ -1,6 +1,7 @@
 <script lang="ts">
   // Replay: watch the recent buffer while recording continues, jump between markers, save a range.
-  import { app, releaseReview, setReplay, fmtDuration } from '../lib/store.svelte';
+  import { app, releaseReview, setReplay, fmtDuration, engine } from '../lib/store.svelte';
+  import { onMount } from 'svelte';
   import ReviewPanel from '../overlay/ReviewPanel.svelte';
   import Icon from '../components/Icon.svelte';
 
@@ -11,6 +12,7 @@
   // The background recording of a game that has closed stays until a new game starts: it can
   // be watched and clipped just the same.
   const footage = $derived(!!e?.target_name && (e?.buffered_secs ?? 0) >= 3);
+  onMount(() => {engine('history');});
   // Keep the snapshot only while this page is open.
   $effect(() => () => { if (app.review) releaseReview(); });
 </script>
@@ -20,15 +22,12 @@
     <div class="grow">
       <h1>Replay</h1>
       <p class="muted small">
-        {#if live}Your last {fmtDuration(e!.buffered_secs)} of {e!.target_name}. Recording continues while you watch.
-        {:else if footage}{e!.target_name} has closed. Its last {fmtDuration(e!.buffered_secs)} stays here until a new game starts.
-        {:else if e?.past_game}Your last background recording of {e.past_game}. It stays here until the next game is recorded.
-        {:else}Watch and clip your recent gameplay without stopping the recording.{/if}
+        Browse your original-quality gameplay history. Recording continues while you watch.
       </p>
     </div>
   </header>
 
-  {#if live || footage || e?.past_game}
+  {#if live || footage || e?.past_game || app.history?.sessions.length}
     <ReviewPanel onclose={() => onnavigate?.('home')} />
   {:else}
     <div class="empty">

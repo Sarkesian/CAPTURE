@@ -43,6 +43,7 @@ pub struct Selection {
 }
 
 impl Ring {
+    pub fn forget_missing(&mut self) { self.segments.retain(|s|s.end.is_none() || s.path.is_file()); }
     pub fn push(&mut self, seg: Segment) {
         debug_assert!(self.segments.last().is_none_or(|l| l.seq < seg.seq));
         self.segments.push(seg);

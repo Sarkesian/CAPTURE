@@ -117,6 +117,7 @@ fn rate(q: Quality, w: u32, h: u32, fps: u32) -> Rate {
         Quality::Balanced => (0.07, 24),
         Quality::High => (0.12, 21),
         Quality::Maximum => (0.20, 18),
+        Quality::Archival => (0.0, 0),
     };
     Rate { cq, maxrate: (w as f64 * h as f64 * fps as f64 * bpp) as i64 }
 }
@@ -130,23 +131,18 @@ fn rate(q: Quality, w: u32, h: u32, fps: u32) -> Rate {
 /// has about 2x headroom; otherwise the slowest preset that does is used, with CQ one step
 /// lower to keep the picture quality the setting promises.
 fn nvenc_preset(q: Quality, w: u32, h: u32, fps: u32, cq: i32) -> (u32, i32) {
-    // Idle H.264 throughput per preset, million pixels/s (index = preset - 1).
-    const CAPACITY: [f64; 7] = [1830.0, 1830.0, 1450.0, 1080.0, 630.0, 600.0, 570.0];
-    let preferred = match q {
-        Quality::Balanced => 4,
-        Quality::High => 5,
-        Quality::Maximum => 6,
-    };
-    let need = 2.0 * w as f64 * h as f64 * fps as f64 / 1e6;
-    let preset = (1..=preferred).rev().find(|&p| CAPACITY[p as usize - 1] >= need).unwrap_or(1);
-    (preset, if preset < preferred { cq - 1 } else { cq })
+    let preset=match q {Quality::Balanced=>4,Quality::High=>5,Quality::Maximum=>6,Quality::Archival=>1};
+    let _=(w,h,fps); (preset,cq)
 }
 
 impl VideoEncoder {
     /// `software_only`: skip GPU encoders and use Microsoft's software H.264 encoder.
     pub fn open(gpu: Arc<Gpu>, w: u32, h: u32, fps: u32, q: Quality, software_only: bool) -> Result<Self, String> {
         let mut rejected = Vec::new();
-        let candidates: &[(&str, bool)] = if software_only {
+        let candidates: &[(&str, bool)] = if q == Quality::Archival {
+            if software_only {return Err("Archival 4:4:4 requires a supported NVIDIA hardware encoder; choose a different quality explicitly for software encoding".into());}
+            &[("h264_nvenc",true)]
+        } else if software_only {
             rejected.push("GPU encoders: skipped (Software encoder chosen in Settings)".into());
             &[("h264_mf", false)]
         } else {
@@ -161,6 +157,7 @@ impl VideoEncoder {
                 Err(e) => rejected.push(format!("{name}: {e}")),
             }
         }
+        if q==Quality::Archival {return Err(format!("Archival 4:4:4 encoding could not start. No lower-quality fallback was used. {}",rejected.join("; ")));}
         if !software_only {
             rejected.push("h264_qsv: not implemented in this build".into());
         }
@@ -279,6 +276,12 @@ impl VideoEncoder {
                     av::opt(pd, "cq", &cq.to_string())?;
                     av::opt(pd, "profile", "high")?;
                     av::opt(pd, "spatial-aq", "1")?;
+                    if q==Quality::Archival {
+                        av::opt(pd,"tune","lossless")?; av::opt(pd,"rc","constqp")?;
+                        av::opt(pd,"qp","0")?;av::opt(pd,"profile","high444p")?;
+                        av::opt(pd,"rgb_mode","yuv444")?;av::opt(pd,"spatial-aq","0")?;
+                        (*ctx).rc_max_rate=0;(*ctx).rc_buffer_size=0;
+                    }
                     (*ctx).bit_rate = 0; // pure CQ under the maxrate ceiling
                 }
                 "h264_amf" => {
@@ -411,13 +414,39 @@ mod tests {
     use capture_protocol::Quality;
 
     #[test]
-    fn preset_keeps_up_with_the_pixel_rate() {
-        assert_eq!(nvenc_preset(Quality::High, 1920, 1080, 60, 21), (5, 21));
-        assert_eq!(nvenc_preset(Quality::High, 2560, 1440, 60, 21), (5, 21));
-        assert_eq!(nvenc_preset(Quality::Maximum, 2560, 1440, 60, 18), (6, 18));
-        assert_eq!(nvenc_preset(Quality::High, 3840, 2160, 60, 21), (4, 20), "4K60: p5 drops frames under game load");
-        assert_eq!(nvenc_preset(Quality::Maximum, 3840, 2160, 60, 18), (4, 17));
-        assert_eq!(nvenc_preset(Quality::Balanced, 3840, 2160, 60, 24), (4, 24));
-        assert_eq!(nvenc_preset(Quality::High, 3840, 2160, 120, 21), (1, 20));
+    #[ignore = "Explicit NVIDIA D3D11 hardware proof using synthetic textures only"]
+    fn archival_d3d11_encoder_preserves_native_frames_and_444() {
+        use super::*;
+        let gpu=Arc::new(Gpu::create().unwrap());
+        let mut encoder=VideoEncoder::open(gpu.clone(),256,144,60,Quality::Archival,false).unwrap();
+        assert!(encoder.info.hardware);assert_eq!(encoder.info.fps,60);
+        let root=std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-output").join(format!("d3d11-fidelity-{}",crate::history::millis()));std::fs::create_dir_all(&root).unwrap();
+        let segment=root.join("synthetic.ts");
+        let streams=vec![unsafe{crate::mux::StreamDesc::from_ctx(encoder.codec_ctx())}];
+        let mut writer=crate::mux::SegmentWriter::create(&segment,&streams).unwrap();
+        let mut reference=vec![];
+        for n in 0..60 {
+            let mut pixels=vec![0u8;256*144*4];for y in 0..144 {for x in 0..256 {let i=(y*256+x)*4;pixels[i]=(x+n) as u8;pixels[i+1]=(y+n) as u8;pixels[i+2]=(x/2+y/2+n) as u8;pixels[i+3]=255;}}
+            let latest=crate::wgc::synthetic_latest(&gpu,256,144,&pixels);reference.extend_from_slice(&pixels);
+            let frame=encoder.grabber().grab(&latest,n as i64).unwrap();
+            encoder.encode(frame,&mut |p|writer.write(p).unwrap()).unwrap();
+        }
+        encoder.flush(&mut |p|writer.write(p).unwrap());writer.finish();
+        let clip=root.join("archival.mp4");crate::save::remux(&[(segment,0.0)],None,0.0,0.0,1.0,&[],&clip).unwrap();
+        let ffroot=std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../third_party/ffmpeg/bin");
+        let probe=std::process::Command::new(ffroot.join("ffprobe.exe")).args(["-v","error","-count_frames","-show_streams","-of","json"]).arg(&clip).output().unwrap();assert!(probe.status.success());
+        let v:serde_json::Value=serde_json::from_slice(&probe.stdout).unwrap();assert_eq!(v["streams"][0]["pix_fmt"],"yuv444p");assert_eq!(v["streams"][0]["nb_read_frames"],"60");assert_eq!(v["streams"][0]["width"],256);assert_eq!(v["streams"][0]["height"],144);
+        let decoded=std::process::Command::new(ffroot.join("ffmpeg.exe")).args(["-v","error","-i"]).arg(&clip).args(["-pix_fmt","bgra","-f","rawvideo","pipe:1"]).output().unwrap();assert!(decoded.status.success());assert_eq!(decoded.stdout.len(),reference.len());
+        let max=reference.iter().zip(decoded.stdout.iter()).map(|(a,b)|a.abs_diff(*b)).max().unwrap();
+        println!("D3D11 synthetic archival proof: 60/60 frames, 256x144@60, yuv444p; max RGB channel error {max}; output {} bytes",std::fs::metadata(&clip).unwrap().len());
+        assert!(max<=3,"RGB conversion unexpectedly changes color by {max} levels");
+    }
+
+    #[test]
+    fn preset_and_quality_are_never_silently_reduced() {
+        for (w,h,fps) in [(1920,1080,60),(3840,2160,60),(3840,2160,120)] {
+            assert_eq!(nvenc_preset(Quality::High,w,h,fps,21),(5,21));
+            assert_eq!(nvenc_preset(Quality::Maximum,w,h,fps,18),(6,18));
+        }
     }
 }

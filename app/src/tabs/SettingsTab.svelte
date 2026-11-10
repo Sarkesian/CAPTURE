@@ -13,6 +13,8 @@
 
   const s = $derived(app.settings!);
   const e = $derived(app.engine);
+  const bitrate = $derived(e && e.history_buffered_secs>8 ? e.buffer_bytes/e.history_buffered_secs : null);
+  const estimate = $derived(bitrate != null ? bitrate*s.history_secs : e?.encoder && s.quality!=='archival' ? (e.encoder.width*e.encoder.height*e.encoder.fps*({balanced:.07,high:.12,maximum:.20}[s.quality]??.12)/8+48000)*s.history_secs*1.05 : null);
 
   const sections = [
     { id: 'recording', label: 'Recording' },
@@ -29,6 +31,7 @@
   let active = $state('recording');
   let root = $state<HTMLElement | null>(null);
   onMount(() => {
+    engine('history');
     const scroller = root?.closest('main');
     if (!root || !scroller) return;
     const io = new IntersectionObserver(entries => {
@@ -46,7 +49,8 @@
   const qualities: { value: Quality; label: string; hint: string }[] = [
     { value: 'balanced', label: 'Balanced', hint: 'Smaller files; great for sharing.' },
     { value: 'high', label: 'High', hint: 'Sharp detail in fast motion. Recommended.' },
-    { value: 'maximum', label: 'Maximum', hint: 'Near-lossless for editing; large files.' },
+    { value: 'maximum', label: 'Maximum', hint: 'High-quality lossy H.264; large files.' },
+    { value: 'archival', label: 'Archival 4:4:4', hint: 'NVIDIA lossless coding after RGB conversion; not bit-exact RGB. 8-bit SDR, very large files, limited player support. No automatic quality or FPS fallback.' },
   ];
   const lengths = [30, 60, 120, 180, 300, 600, 900, 1200];
 
@@ -125,17 +129,27 @@
         <Segmented label="Frame rate" value={s.fps} options={[{ value: 30, label: '30 fps' }, { value: 60, label: '60 fps' }, { value: 120, label: '120 fps' }]} onchange={v => updateSettings({ fps: v })} />
       </div>
       <div class="field">
-        <div class="lbl"><div>Replay length</div><div class="hint">How much recent gameplay one save keeps.</div></div>
+        <div class="lbl"><div>Instant Replay length</div><div class="hint">How much recent gameplay the hotkey saves. Background history is kept separately.</div></div>
         <select class="select" aria-label="Replay length" value={String(s.replay_secs)} onchange={ev => updateSettings({ replay_secs: Number((ev.target as HTMLSelectElement).value) })}>
           {#each lengths as d (d)}<option value={String(d)}>{fmtDuration(d)}</option>{/each}
           {#if !lengths.includes(s.replay_secs)}<option value={String(s.replay_secs)}>{fmtDuration(s.replay_secs)}</option>{/if}
         </select>
       </div>
       <div class="field">
+        <div class="lbl"><div>Background history</div><div class="hint">Total recorded gameplay across games, within your existing storage budget. Recording quality is never reduced to fit.</div></div>
+        <select class="select" aria-label="Background history duration" value={s.history_secs} onchange={ev=>updateSettings({history_secs:Number(ev.currentTarget.value)})}>
+          {#each [3600,7200,14400,21600] as d}<option value={d}>{d/3600} hours</option>{/each}
+        </select>
+      </div>
+      <div class="field">
         <div class="lbl"><div>Show the mouse cursor</div></div>
         <Toggle checked={s.capture_cursor} label="Show the mouse cursor" onchange={v => updateSettings({ capture_cursor: v })} />
       </div>
-      <p class="foot">H.264 MP4 at the game’s own resolution, playable and editable everywhere. Each audio source is also a separate track.</p>
+      <p class="foot">{#if estimate != null}Estimated {fmtBytes(estimate)} for {s.history_secs/3600} hours ({bitrate!=null?'measured current recording rate':'current resolution/FPS ceiling estimate'}). Budget: {s.buffer_cap_gb} GB. Content changes affect actual usage.{:else}Storage depends on source resolution, FPS and content. Archival storage cannot be predicted from a quality label.{/if}</p>
+      <p class="foot">Original H.264 packets are kept for history and saved clips. Capture is 8-bit SDR; RGB conversion prevents an end-to-end zero-loss claim. Archival 4:4:4 requires compatible playback software.</p>
+      {#if e}
+        <p class="foot">Source arrivals {e.frames_captured} · video packets {e.frames_encoded} · missed recording ticks {e.frames_dropped} · ticks without a picture {e.frames_without_source} · repeated source samples {e.frames_repeated} · source arrivals not selected {e.source_frames_unselected}. Game frames never delivered by Windows cannot be counted here.</p>
+      {/if}
     </section>
 
     <section id="audio">
@@ -277,15 +291,17 @@
         </div>
       </div>
       <div class="field">
-        <label class="lbl" for="cap"><div>Background recording limit</div><div class="hint">Now using {fmtBytes(e?.buffer_bytes ?? 0)}.</div></label>
-        <div class="row"><input class="input num" id="cap" type="number" min="1" max="2000" step="1" value={s.buffer_cap_gb} onchange={ev => updateSettings({ buffer_cap_gb: num(ev) })} /><span class="faint small">GB</span></div>
+        <label class="lbl" for="cap"><div>History and playback storage budget</div><div class="hint">Now using {fmtBytes((app.history?.bytes ?? e?.buffer_bytes ?? 0)+(app.history?.preview_bytes ?? 0))}. Protected jobs and imported recordings are kept safely even when over budget.</div></label>
+        <div class="row"><input class="input num" id="cap" type="number" min="1" max="2000" step="1" value={s.buffer_cap_gb} onchange={ev => updateSettings({ buffer_cap_gb: num(ev) })} /><span class="faint small">GB</span>
+          <select class="select" aria-label="History storage preset" value="" onchange={ev=>{if(ev.currentTarget.value)updateSettings({buffer_cap_gb:Number(ev.currentTarget.value)});}}><option value="">Presets…</option>{#each [20,50,100,200] as gb}<option value={gb}>{gb} GB</option>{/each}</select>
+        </div>
       </div>
       <div class="field">
         <label class="lbl" for="free"><div>Pause when free space is below</div><div class="hint">{e?.free_bytes != null ? `${fmtBytes(e.free_bytes)} free now.` : ''}</div></label>
         <div class="row"><input class="input num" id="free" type="number" min="1" max="2000" step="1" value={s.min_free_gb} onchange={ev => updateSettings({ min_free_gb: num(ev) })} /><span class="faint small">GB</span></div>
       </div>
       <div class="field">
-        <div class="lbl"><div>Leftover background recording</div><div class="hint">From sessions that did not close normally. Saved clips are never touched.</div></div>
+        <div class="lbl"><div>Earlier background recordings</div><div class="hint">Browse and save them in Replay. Cleanup respects active saves and playback. Imported recordings and permanent files are preserved.</div></div>
         <div class="row">
           <span class="small muted">{fmtBytes(e?.leftover_buffer_bytes ?? 0)}</span>
           <button class="btn sm" disabled={!e || e.leftover_buffer_bytes === 0} onclick={() => engine('recover_leftovers')}>Save as clip</button>

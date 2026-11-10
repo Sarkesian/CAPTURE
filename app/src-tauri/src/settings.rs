@@ -28,6 +28,7 @@ pub struct AppSettings {
     pub capture_root: String,
     pub replay_enabled: bool,
     pub replay_secs: u32,
+    pub history_secs: u32,
     pub target: TargetPref,
     pub quality: Quality,
     pub fps: u32,
@@ -73,7 +74,7 @@ pub struct AppSettings {
 }
 
 /// Current settings schema version.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 impl Default for AppSettings {
     fn default() -> Self {
@@ -82,6 +83,7 @@ impl Default for AppSettings {
             capture_root: default_root(),
             replay_enabled: false,
             replay_secs: 120,
+            history_secs: 4 * 3600,
             target: TargetPref::Auto,
             quality: Quality::High,
             fps: 60,
@@ -143,6 +145,7 @@ impl AppSettings {
             capture_root: self.capture_root.clone(),
             buffer_root: self.buffer_root.clone().filter(|b| !b.trim().is_empty()),
             replay_secs: self.replay_secs,
+            history_secs: self.history_secs,
             target: match &self.target {
                 TargetPref::None => CaptureTarget::None,
                 TargetPref::Auto => CaptureTarget::Auto { games: self.games.clone(), ignore: self.ignored.clone() },
@@ -177,6 +180,7 @@ impl AppSettings {
 
     pub fn sanitized(mut self) -> Self {
         self.replay_secs = self.replay_secs.clamp(10, 3600);
+        self.history_secs = self.history_secs.clamp(60, 6 * 3600);
         self.fps = match self.fps {
             30 | 60 | 120 => self.fps,
             _ => 60,
@@ -364,6 +368,13 @@ pub fn save(dir: &Path, s: &AppSettings) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_migration_never_expands_storage_or_hotkey_length() {
+        let old:AppSettings=serde_json::from_str(r#"{"version":2,"replay_secs":120,"buffer_cap_gb":7.5,"min_free_gb":4.0}"#).unwrap();
+        let next=old.sanitized();assert_eq!(next.replay_secs,120);assert_eq!(next.buffer_cap_gb,7.5);assert_eq!(next.min_free_gb,4.0);assert_eq!(next.history_secs,14400);
+        let cfg=next.engine_config();assert_eq!(cfg.history_secs,14400);assert_eq!(cfg.replay_secs,120);assert_eq!(cfg.buffer_cap_bytes,7_500_000_000);
+    }
 
     #[test]
     fn unknown_or_missing_fields_fall_back_to_defaults() {

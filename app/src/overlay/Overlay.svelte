@@ -43,7 +43,7 @@
   });
   const live = $derived(e?.status === 'buffering');
   // A closed game's background recording stays watchable until a new game starts.
-  const footage = $derived((!!e?.target_name && (e?.buffered_secs ?? 0) >= 3) || !!e?.past_game);
+  const footage = $derived((!!e?.target_name && (e?.buffered_secs ?? 0) >= 3) || !!e?.past_game || !!app.history?.sessions.length);
   const presets = [30, 60, 120, 300, 600, 1200];
 
   onMount(() => {
@@ -122,7 +122,7 @@
       <div class="field">
         <span class="grow">Quality</span>
         <Segmented label="Quality" value={s.quality}
-          options={[{ value: 'balanced', label: 'Balanced' }, { value: 'high', label: 'High' }, { value: 'maximum', label: 'Maximum' }] as { value: Quality; label: string }[]}
+          options={[{ value: 'balanced', label: 'Balanced' }, { value: 'high', label: 'High' }, { value: 'maximum', label: 'Maximum' }, {value:'archival',label:'Archival 4:4:4'}] as { value: Quality; label: string }[]}
           onchange={v => updateSettings({ quality: v })} />
       </div>
       <div class="field audio-full"><AudioSources /></div>

@@ -1,4 +1,15 @@
-# CAPTURE quick start (v0.4.1)
+# CAPTURE quick start
+
+## Indexed background history
+
+- **Instant Replay length** controls the hotkey clip only. **Background history** targets four hours of recorded gameplay across sessions, selectable up to six hours, within your existing storage budget. Updating does not increase that budget.
+- Replay groups recordings by game, shows available intervals and gaps, and supports zoom, marker/screenshot navigation, and range selection. Save clip automatically creates a normal permanent MP4; there is no separate export.
+- Capturing a clip immediately says **Saving Clip** and plays the existing feedback. Completion updates Library silently. A failure is shown; protected source footage can be retried from Replay.
+- Original encoded video is shared by history and immediate clips. Saving does not re-encode it. Previews use short byte-bounded playback windows rather than whole-history copies.
+- Balanced, High and Maximum are lossy H.264 settings. **Archival 4:4:4** uses NVIDIA lossless coding after RGB conversion, requires compatible hardware/players, and can use much more storage. It is not bit-exact RGB or an end-to-end zero-loss mode. Audio remains AAC.
+- Native resolution changes start another recording epoch instead of scaling the new gameplay into an older canvas. Manual full recordings continue into another file across that boundary. FPS and encoder quality are never automatically reduced. Unsupported native dimensions or known HDR/wide-color output fail visibly rather than silently converting.
+- The implemented capture path is 8-bit SDR. HDR/10-bit preservation and complete game-present accounting are not established. Diagnostics distinguish delivered source frames, emitted video packets, repeated samples, unselected source arrivals, missed clock ticks and ticks without a source picture.
+- Imported old media is preserved during migration, even if it exceeds the budget. Active/failed saves and marker pins can also limit cleanup. Permanent clips and PNGs remain independent of history retention.
 
 1. **Start** `CAPTURE.exe` (portable: extract the whole zip first; installed: Start menu). CAPTURE keeps its
    settings, cache and logs in the `Data` folder next to it, and asks four first-run questions.
@@ -50,7 +61,7 @@ less sharp; where it can't, a notice and a short falling sound say so, and the k
 G:\Videos\Captures\<Game>\Clips\…_Clip.mp4         saved replays (never deleted automatically)
 G:\Videos\Captures\<Game>\Sessions\…_Session.mp4   full-length recordings
 G:\Videos\Captures\<Game>\Screenshots\….png
-G:\Videos\Captures\Background Recording\            the background recording (size-capped; the last game's stays for Replay until the next game)
+G:\Videos\Captures\Background Recording\            indexed rolling history across games and restarts
 ```
 A clip is a normal MP4: **Preview Mix** (default, sounds normal anywhere) plus Game Audio / Microphone /
 Voice Chat tracks for editing. In an editor that shows all tracks, mute *Preview Mix*. For editors that

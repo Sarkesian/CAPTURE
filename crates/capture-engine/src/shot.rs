@@ -17,9 +17,10 @@ pub fn screenshots_dir(root: &Path, game: &str) -> PathBuf {
 }
 
 /// Copy `latest` to the CPU and write it as PNG. Returns the file path.
-pub fn save(gpu: &Gpu, capture: &wgc::Capture, root: &Path, game: &str) -> Result<PathBuf, String> {
+pub fn save(gpu: &Gpu, capture: &wgc::Capture, root: &Path, game: &str) -> Result<(PathBuf,u64), String> {
     let (w, h) = (capture.width, capture.height);
     let mut pixels = vec![0u8; (w * h * 4) as usize];
+    let frame_qpc;
     unsafe {
         let desc = D3D11_TEXTURE2D_DESC {
             Width: w,
@@ -42,6 +43,7 @@ pub fn save(gpu: &Gpu, capture: &wgc::Capture, root: &Path, game: &str) -> Resul
                 return Err("No picture has been captured yet.".into());
             }
             gpu.context.CopyResource(&staging, &latest.texture);
+            frame_qpc=latest.frame_qpc;
         }
         let mut map = D3D11_MAPPED_SUBRESOURCE::default();
         gpu.context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut map)).map_err(|e| e.to_string())?;
@@ -59,7 +61,7 @@ pub fn save(gpu: &Gpu, capture: &wgc::Capture, root: &Path, game: &str) -> Resul
     let partial = storage::partial_path(&path);
     std::fs::write(&partial, png).map_err(|e| e.to_string())?;
     std::fs::rename(&partial, &path).map_err(|e| e.to_string())?;
-    Ok(path)
+    Ok((path,frame_qpc))
 }
 
 unsafe fn encode_png(bgra: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String> {

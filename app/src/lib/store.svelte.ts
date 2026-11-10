@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { AppInfo, AudioApp, AudioDevice, ClipEntry, PathIssue, DisplayTarget, EngineMessage, EngineState, Review, SavedClip, Settings, WindowTarget } from './types';
+import type { AppInfo, AudioApp, AudioDevice, ClipEntry, PathIssue, DisplayTarget, EngineMessage, EngineState, Review, SavedClip, Settings, WindowTarget, HistoryState } from './types';
 
 interface Toast { id: number; text: string; kind: 'ok' | 'error' | 'info' }
 
@@ -19,6 +19,8 @@ export const app = $state({
   /** Saved folders that are not reachable on this PC right now (setting kept). */
   pathIssues: [] as PathIssue[],
   review: null as Review | null,
+  nextReview: null as Review | null,
+  history: null as HistoryState | null,
   reviewLoading: false,
   reviewError: null as string | null,
   clipInfo: {} as Record<string, { duration: number | null }>,
@@ -80,7 +82,7 @@ function onEngine(m: EngineMessage) {
       app.displays = m.data.displays;
       break;
     case 'capture_triggered':
-      if (!m.data.overlay_notice) toast({ screenshot: 'Screenshot saved', replay: 'Clip Saved', recording_start: 'Recording started', recording_stop: 'Recording saved' }[m.data.action], 'ok', 1800);
+      if (!m.data.overlay_notice) toast({ screenshot: 'Screenshot saved', replay: 'Saving Clip', recording_start: 'Recording started', recording_stop: 'Recording saved' }[m.data.action], 'ok', 1800);
       break;
     case 'save_started':
       break;
@@ -88,6 +90,7 @@ function onEngine(m: EngineMessage) {
       app.lastClip = m.data;
       app.libraryVersion++;
       refreshClips();
+      engine('history');
       break;
     case 'save_failed':
       toast(`Not saved: ${m.data.message}`, 'error', 9000);
@@ -99,18 +102,13 @@ function onEngine(m: EngineMessage) {
       toast(`Marker added at ${m.data.at}`, 'ok', 2500);
       break;
     case 'review_ready':
-      // Engine events reach every window (the main one and the overlay): only the window that
-      // asked for a snapshot takes it, or the other one would later "release" a snapshot it
-      // never showed and pull the footage out from under this one.
-      if (!app.reviewLoading) break;
-      app.review = m.data;
-      app.reviewLoading = false;
-      app.reviewError = null;
+      reviewReply(m);
       break;
     case 'review_failed':
-      if (!app.reviewLoading) break;
-      app.reviewLoading = false;
-      app.reviewError = m.data.message;
+      reviewReply(m);
+      break;
+    case 'history_ready':
+      app.history = m.data;
       break;
     case 'audio_devices':
       app.inputs = m.data.inputs;
@@ -160,17 +158,54 @@ export function engine(cmd: string, args?: Record<string, unknown>) {
 export const addMarker = () => engine('add_marker', {});
 export const toggleSession = () => engine(app.engine?.session_secs != null ? 'stop_session' : 'start_session');
 export function prepareReview() {
-  app.reviewLoading = true;
-  app.reviewError = null;
-  return engine('prepare_review');
+  return requestReview('prepare_review', undefined, false);
 }
 export const releaseReview = () => {
+  currentReviewGeneration++;
+  nextReviewGeneration++;
   const path = app.review?.path ?? null;
   app.review = null;
   app.reviewLoading = false;
+  if (app.nextReview) engine('release_review', { path: app.nextReview.path });
+  app.nextReview = null;
+  for (const [id] of reviewRequests) reviewRequests.set(id, 'cancelled');
   return engine('release_review', { path });
 };
 export const saveRange = (start: number, end: number) => engine('save_range', { start, end });
+const reviewRequests = new Map<number, 'current' | 'next' | 'cancelled'>();
+let currentReviewGeneration = 0;
+let nextReviewGeneration = 0;
+const earlyReplies = new Map<number, EngineMessage>();
+function reviewReply(m: EngineMessage) {
+  if (m.re == null) return;
+  const slot = reviewRequests.get(m.re);
+  if (!slot) { earlyReplies.set(m.re, m); if (earlyReplies.size > 32) earlyReplies.delete(earlyReplies.keys().next().value!); return; }
+  reviewRequests.delete(m.re);
+  if (m.event === 'review_ready') {
+    if (slot === 'cancelled') { engine('release_review', { path: m.data.path }); return; }
+    const old = slot === 'next' ? app.nextReview : app.review;
+    if (slot === 'next') app.nextReview = m.data;
+    else { app.review = m.data; app.reviewLoading = false; app.reviewError = null; }
+    if (old) setTimeout(() => engine('release_review', { path: old.path }), 300);
+  } else if (m.event === 'review_failed' && slot === 'current') { app.reviewLoading = false; app.reviewError = m.data.message; }
+}
+async function requestReview(cmd: string, args: Record<string, unknown> | undefined, prefetch: boolean) {
+  const generation = prefetch ? ++nextReviewGeneration : ++currentReviewGeneration;
+  if (!prefetch) {
+    nextReviewGeneration++;
+    if (app.nextReview) engine('release_review', { path: app.nextReview.path });
+    app.nextReview = null;
+    app.reviewLoading = true; app.reviewError = null;
+    for (const [id] of reviewRequests) reviewRequests.set(id, 'cancelled');
+  }
+  const id = await engine(cmd, args);
+  if (id == null) { if (!prefetch) app.reviewLoading = false; return; }
+  const cancelled = generation !== (prefetch ? nextReviewGeneration : currentReviewGeneration);
+  reviewRequests.set(id, cancelled ? 'cancelled' : prefetch ? 'next' : 'current');
+  const reply = earlyReplies.get(id); if (reply) { earlyReplies.delete(id); reviewReply(reply); }
+}
+export const historyReview = (session: string, at: number, prefetch = false) => requestReview('history_review', { session, at }, prefetch);
+export const historySave = (session: string, start: number, end: number) => engine('history_save', { session, start, end });
 export function requestClipInfo(path: string) {
   if (!(path in app.clipInfo)) {
     app.clipInfo[path] = { duration: null };
