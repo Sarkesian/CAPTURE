@@ -283,6 +283,10 @@ impl Pipeline {
             SourceKind::Window(h) => wgc::Source::Window(h),
             SourceKind::Monitor(h) => wgc::Source::Monitor(h),
         };
+        // Compatibility path: an HDR display never blocks recording. Windows converts the HDR
+        // picture to 8-bit SDR for this capture; HDR is not preserved, and the session says so.
+        let hdr_display = wgc::display_is_hdr(&gpu, &source);
+        eprintln!("capture: display HDR {:?}; recording 8-bit SDR{}", hdr_display, if hdr_display==Some(true) {" (Windows converts the HDR picture to SDR; HDR is not preserved)"} else {""});
         let capture = Arc::new(wgc::Capture::start_native(&gpu, source, s.cursor)?);
         capture.native_resolution.store(true,Ordering::Relaxed);
         let encoder = VideoEncoder::open(gpu.clone(), capture.width, capture.height, s.fps, s.quality, s.software_encoder)?;
@@ -326,7 +330,7 @@ impl Pipeline {
             "started_unix_ms":crate::history::millis(),
             "game": s.game_name,
             "exe": s.exe,
-            "video": { "encoder": info.name, "width": info.width, "height": info.height, "fps": info.fps, "quality":s.quality,"capture_format":"BGRA8 SDR","encoded_chroma":"4:2:0","color":"BT.709 limited","rgb_bit_exact":false },
+            "video": { "encoder": info.name, "width": info.width, "height": info.height, "fps": info.fps, "quality":s.quality,"capture_format":if hdr_display==Some(true) {"BGRA8 SDR (converted by Windows from an HDR display; HDR not preserved)"} else {"BGRA8 SDR"},"source_display_hdr":hdr_display,"encoded_chroma":"4:2:0","color":"BT.709 limited","rgb_bit_exact":false },
             "audio_tracks": track_names,
             "segment_container": "mpegts",
         });

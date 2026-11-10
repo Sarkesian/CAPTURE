@@ -219,7 +219,9 @@ impl Capture {
             Source::Monitor(_) => None,
         };
         let crop0 = window.and_then(client_crop);
-        let dimension=|v:i32|if native {v.max(2) as u32} else {even(v)};
+        // 4:2:0 H.264 needs even dimensions: an odd window size loses its last pixel row or
+        // column (as in 0.6.3) instead of failing to record.
+        let dimension=even;
         let (width, height) = match crop0 {
             Some((_, _, w, h)) => (dimension(w.min(size.Width)), dimension(h.min(size.Height))),
             None => (dimension(size.Width), dimension(size.Height)),
@@ -302,7 +304,7 @@ impl Capture {
                     let (sw, sh) = ((rect.right - rect.left) as u32, (rect.bottom - rect.top) as u32);
                     // Same size as the recording (the usual case): a plain copy below. Otherwise
                     // scale it into the recording size so nothing is cut off or left half-empty.
-                    let resized = if native_resolution.load(Ordering::Relaxed) {(sw,sh)!=(width,height)} else {(even(sw as i32),even(sh as i32))!=(width,height)};
+                    let resized = (even(sw as i32),even(sh as i32))!=(width,height);
                     if resized && native_resolution.load(Ordering::Relaxed) {
                         resolution_changed.store(true,Ordering::Relaxed);
                         l.has_frame=false;
@@ -368,6 +370,27 @@ impl Capture {
         session.StartCapture().map_err(|e| format!("Capture could not start: {e}"))?;
         Ok(Self { width, height, latest, frames, closed, session, pool, resolution_changed,native_resolution })
     }
+}
+
+/// Whether the display showing `source` is in an HDR (or other non-SDR) color mode. `None`
+/// when it cannot be determined. Informational only: recording is 8-bit SDR either way, and on
+/// an HDR display Windows converts the picture to SDR before CAPTURE receives it.
+pub fn display_is_hdr(gpu:&Gpu,source:&Source)->Option<bool> {
+    use windows::Win32::Graphics::Dxgi::IDXGIOutput6;
+    use windows::Win32::Graphics::Gdi::{MonitorFromWindow,MONITOR_DEFAULTTONEAREST};
+    let monitor=match source {Source::Monitor(h)=>HMONITOR(*h as *mut _),Source::Window(h)=>unsafe{MonitorFromWindow(HWND(*h as *mut _),MONITOR_DEFAULTTONEAREST)}};
+    unsafe {
+        let adapter=gpu.device.cast::<IDXGIDevice>().and_then(|d|d.GetAdapter()).ok()?;
+        let mut index=0;
+        while let Ok(output)=adapter.EnumOutputs(index) {
+            index+=1;
+            if output.GetDesc().map(|d|d.Monitor==monitor).unwrap_or(false) {
+                let color=output.cast::<IDXGIOutput6>().ok()?.GetDesc1().ok()?.ColorSpace;
+                return Some(color!=DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 && color!=DXGI_COLOR_SPACE_RGB_STUDIO_G22_NONE_P709);
+            }
+        }
+    }
+    None
 }
 
 impl Drop for Capture {
