@@ -44,6 +44,10 @@ try{
  await cdp('Runtime.enable');await cdp('Emulation.setDeviceMetricsOverride',{width:1100,height:800,deviceScaleFactor:1,mobile:false});
  for(let n=0;n<100&&!await js('window.fixtureReady && document.querySelector("video")');n++)await sleep(100);
  assert.equal(await js('!!document.querySelector("video")'),true,'Replay rendered');
+ for(let n=0;n<50&&!await js('document.querySelector("video").readyState>=2 || !!document.querySelector("video").error');n++)await sleep(100);
+ const playback=await js('(()=>{const v=document.querySelector("video");return {readyState:v.readyState,width:v.videoWidth,height:v.videoHeight,error:v.error?.code??null,message:document.body.innerText.includes("compatible player or installed codec")};})()');
+ assert.ok((playback.readyState>=2&&playback.width>0) || playback.message,'Replay decodes video or explicitly explains the codec requirement, including audio-only browser fallback');
+ if(playback.width>0){await js('document.querySelector("video").muted=true;document.querySelector("video").play()');await sleep(350);playback.presented=await js('document.querySelector("video").getVideoPlaybackQuality().totalVideoFrames');await js('document.querySelector("video").pause()');assert.ok(playback.presented>1,'Replay presents moving video');}
  assert.equal(await js(`document.querySelectorAll('select[aria-label="Game and recording"] option').length`),2);
  assert.equal(await js('document.body.innerText.includes("Late moment")'),true);
  await js(`document.querySelector('select[aria-label="Timeline zoom"]').value="16";document.querySelector('select[aria-label="Timeline zoom"]').dispatchEvent(new Event("change",{bubbles:true}))`);
@@ -62,6 +66,6 @@ try{
  const compact=await cdp('Page.captureScreenshot',{format:'png'});fs.writeFileSync(path.join(dir,'replay-compact.png'),Buffer.from(compact.result.data,'base64'));
  await js('window.fixtureReview("a",90);window.fixtureRelease()');await sleep(100);assert.equal(await js('window.fixtureApp.review===null'),true,'Late reply after closing is released');
  assert.equal(errors.length,0,JSON.stringify(errors));
- fs.writeFileSync(path.join(dir,'results.json'),JSON.stringify({passed:true,checks:11,screenshot:path.join(dir,'replay.png')},null,2));console.log(JSON.stringify({passed:true,checks:11,output:dir},null,2));
+ fs.writeFileSync(path.join(dir,'results.json'),JSON.stringify({passed:true,checks:12,codec:result.codec,playback,screenshot:path.join(dir,'replay.png')},null,2));console.log(JSON.stringify({passed:true,checks:12,codec:result.codec,playback,output:dir},null,2));
  await cdp('Browser.close');
 }finally{ws?.close();edge.kill();await server.close();}

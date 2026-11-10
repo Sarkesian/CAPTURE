@@ -13,6 +13,7 @@
   let want: {t:number;play:boolean} | null = null;
   let prefetchedFor = '';
   let error = $state('');
+  const codecMessage='This player cannot decode the video track. HEVC HDR and Archival 4:4:4 require a compatible player or installed codec; the original footage is unchanged.';
   let renaming = $state('');
   let markerName = $state('');
   let scrub = $state<number | null>(null);
@@ -48,11 +49,11 @@
   function seek(t:number,play=!paused){
     if(t>=last)t=Math.max(first,last-.05);
     if(!available(t)){error='No recording at this position.';return;}error='';
-    if(rv?.session===selected && t>=rv.start && t<rv.end-0.05){video.currentTime=t-rv.start;return;}
+    if(rv?.session===selected && t>=rv.start && t<rv.end-0.05){video.currentTime=t-rv.start;if(video.readyState>=1&&!video.videoWidth)error=codecMessage;return;}
     want={t,play};prefetchedFor='';historyReview(selected,t);
   }
-  function loaded(){if(!video || !rv)return;const w=want;want=null;local=Math.max(0,Math.min((w?.t??rv.start)-rv.start,Math.max(0,video.duration-.05)));video.currentTime=local;if(w?.play)video.play().catch(()=>{});}
-  function toggle(){if(video)video.paused?video.play().catch(()=>{}):video.pause();}
+  function loaded(){if(!video || !rv)return;if(!video.videoWidth){video.pause();error=codecMessage;return;}const w=want;want=null;local=Math.max(0,Math.min((w?.t??rv.start)-rv.start,Math.max(0,video.duration-.05)));video.currentTime=local;if(w?.play)video.play().catch(()=>{});}
+  function toggle(){if(!video?.videoWidth){error=codecMessage;return;}video.paused?video.play().catch(()=>{}):video.pause();}
   function advance(){
     if(!rv || !session)return;
     const nextAt=session.intervals.find(([,b])=>b>rv.end+.1);
@@ -94,7 +95,7 @@
     <div class="stage">
       {#if rv}
         <!-- svelte-ignore a11y_media_has_caption -->
-        <video bind:this={video} src={convertFileSrc(rv.path)} bind:currentTime={local} bind:paused onloadedmetadata={loaded} onended={advance} ontimeupdate={timeupdate} onclick={toggle} onerror={()=>error='This player cannot decode this recording. Archival 4:4:4 may require a compatible external player; the original footage is unchanged.'}></video>
+        <video bind:this={video} src={convertFileSrc(rv.path)} bind:currentTime={local} bind:paused onloadedmetadata={loaded} onended={advance} ontimeupdate={timeupdate} onclick={toggle} onerror={()=>error=codecMessage}></video>
       {/if}
       {#if app.reviewLoading}<span class="busy">Opening gameplay…</span>{/if}
     </div>

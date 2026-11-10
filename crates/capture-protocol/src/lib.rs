@@ -339,6 +339,8 @@ pub struct EngineConfig {
     pub history_secs: u32,
     pub target: CaptureTarget,
     pub quality: Quality,
+    #[serde(default)]
+    pub recording_output: RecordingOutput,
     pub fps: u32,
     pub capture_cursor: bool,
     pub audio: AudioConfig,
@@ -487,6 +489,15 @@ pub enum CaptureTarget {
     /// is not running the engine reports "waiting" and starts automatically when it appears.
     App { exe: String },
     Display { index: u32 },
+}
+
+/// Output preference is independent of source detection and encoding quality.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingOutput {
+    #[default]
+    Compatible,
+    OriginalHdr,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

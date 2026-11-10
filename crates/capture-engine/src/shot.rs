@@ -21,6 +21,8 @@ pub fn save(gpu: &Gpu, capture: &wgc::Capture, root: &Path, game: &str) -> Resul
     let (w, h) = (capture.width, capture.height);
     let mut pixels = vec![0u8; (w * h * 4) as usize];
     let frame_qpc;
+    // PNG remains an SDR screenshot; never copy FP16 bytes into a BGRA resource.
+    let tone=if capture.color.hdr {Some((crate::hdr::Converter::new_sdr(gpu,w,h,capture.color.sdr_white)?,crate::hdr::sdr_texture(gpu,w,h)?))}else{None};
     unsafe {
         let desc = D3D11_TEXTURE2D_DESC {
             Width: w,
@@ -42,7 +44,10 @@ pub fn save(gpu: &Gpu, capture: &wgc::Capture, root: &Path, game: &str) -> Resul
             if !latest.has_frame {
                 return Err("No picture has been captured yet.".into());
             }
-            gpu.context.CopyResource(&staging, &latest.texture);
+            if let Some((converter,dst))=&tone {
+                converter.convert(gpu,&latest.texture,dst,0)?;
+                gpu.context.CopyResource(&staging,dst);
+            } else {gpu.context.CopyResource(&staging, &latest.texture);}
             frame_qpc=latest.frame_qpc;
         }
         let mut map = D3D11_MAPPED_SUBRESOURCE::default();

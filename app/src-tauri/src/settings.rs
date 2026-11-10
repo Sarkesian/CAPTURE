@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use capture_protocol::{AudioConfig, CaptureTarget, EncoderChoice, EngineConfig, GameRule, Hotkeys, MarkerConfig, Notices, Quality, Volumes};
+use capture_protocol::{AudioConfig, CaptureTarget, EncoderChoice, EngineConfig, GameRule, Hotkeys, MarkerConfig, Notices, Quality, RecordingOutput, Volumes};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -31,6 +31,7 @@ pub struct AppSettings {
     pub history_secs: u32,
     pub target: TargetPref,
     pub quality: Quality,
+    pub recording_output: RecordingOutput,
     pub fps: u32,
     pub capture_cursor: bool,
     pub game_audio: bool,
@@ -74,7 +75,7 @@ pub struct AppSettings {
 }
 
 /// Current settings schema version.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 impl Default for AppSettings {
     fn default() -> Self {
@@ -86,6 +87,7 @@ impl Default for AppSettings {
             history_secs: 4 * 3600,
             target: TargetPref::Auto,
             quality: Quality::High,
+            recording_output: RecordingOutput::Compatible,
             fps: 60,
             capture_cursor: true,
             game_audio: true,
@@ -153,6 +155,7 @@ impl AppSettings {
                 TargetPref::Display { index, .. } => CaptureTarget::Display { index: *index },
             },
             quality: self.quality,
+            recording_output: self.recording_output,
             fps: self.fps,
             capture_cursor: self.capture_cursor,
             audio: AudioConfig {
@@ -374,6 +377,18 @@ mod tests {
         let old:AppSettings=serde_json::from_str(r#"{"version":2,"replay_secs":120,"buffer_cap_gb":7.5,"min_free_gb":4.0}"#).unwrap();
         let next=old.sanitized();assert_eq!(next.replay_secs,120);assert_eq!(next.buffer_cap_gb,7.5);assert_eq!(next.min_free_gb,4.0);assert_eq!(next.history_secs,14400);
         let cfg=next.engine_config();assert_eq!(cfg.history_secs,14400);assert_eq!(cfg.replay_secs,120);assert_eq!(cfg.buffer_cap_bytes,7_500_000_000);
+    }
+
+    #[test]
+    fn recording_format_migration_and_hdr_preference_roundtrip() {
+        let old:AppSettings=serde_json::from_str(r#"{"version":3,"quality":"archival","fps":60,"buffer_cap_gb":7.5}"#).unwrap();
+        assert_eq!(old.recording_output,RecordingOutput::Compatible);
+        assert_eq!(old.quality,Quality::Archival);
+        assert_eq!(old.fps,60);
+        assert_eq!(old.buffer_cap_gb,7.5);
+        let mut next=old;next.recording_output=RecordingOutput::OriginalHdr;
+        let restored:AppSettings=serde_json::from_slice(&serde_json::to_vec(&next).unwrap()).unwrap();
+        assert_eq!(restored.engine_config().recording_output,RecordingOutput::OriginalHdr);
     }
 
     #[test]

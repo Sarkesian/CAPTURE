@@ -49,7 +49,7 @@
   const qualities: { value: Quality; label: string; hint: string }[] = [
     { value: 'balanced', label: 'Balanced', hint: 'Smaller files; great for sharing.' },
     { value: 'high', label: 'High', hint: 'Sharp detail in fast motion. Recommended.' },
-    { value: 'maximum', label: 'Maximum', hint: 'High-quality lossy H.264; large files.' },
+    { value: 'maximum', label: 'Maximum', hint: 'High-quality video; large files.' },
     { value: 'archival', label: 'Archival 4:4:4', hint: 'NVIDIA lossless coding after RGB conversion; not bit-exact RGB. 8-bit SDR, very large files, limited player support. No automatic quality or FPS fallback.' },
   ];
   const lengths = [30, 60, 120, 180, 300, 600, 900, 1200];
@@ -121,11 +121,18 @@
     <section id="recording">
       <h2>Recording</h2>
       <div class="field">
-        <div class="lbl"><div>Quality</div><div class="hint">{qualities.find(q => q.value === s.quality)?.hint}</div></div>
-        <Segmented label="Quality" value={s.quality} options={qualities} onchange={v => updateSettings({ quality: v })} />
+        <div class="lbl"><div>Recording format</div><div class="hint">{s.recording_output === 'original_hdr' ? 'HEVC Main10 preserves HDR display composition on supported NVIDIA hardware. SDR sources stay H.264 SDR. HDR playback requires HEVC/HDR support.' : 'H.264 SDR MP4 for broad compatibility. HDR display composition is tone mapped to SDR; HDR dynamic range is not preserved.'}</div></div>
+        <select class="select" aria-label="Recording format" value={s.recording_output ?? 'compatible'} onchange={ev => updateSettings({ recording_output: ev.currentTarget.value as 'compatible' | 'original_hdr' })}>
+          <option value="compatible">Compatible Recording</option>
+          <option value="original_hdr">Original HDR Recording</option>
+        </select>
       </div>
       <div class="field">
-        <div class="lbl"><div>Frame rate</div><div class="hint">Recordings are always a constant frame rate.</div></div>
+        <div class="lbl"><div>Quality</div><div class="hint">{qualities.find(q => q.value === s.quality)?.hint}</div></div>
+        <Segmented label="Quality" value={s.quality} options={qualities.filter(q => q.value !== 'archival' || s.quality === 'archival')} onchange={v => updateSettings({ quality: v })} />
+      </div>
+      <div class="field">
+        <div class="lbl"><div>Frame rate</div><div class="hint">Requested frame rate. Missed deadlines are reported without lowering resolution or quality.</div></div>
         <Segmented label="Frame rate" value={s.fps} options={[{ value: 30, label: '30 fps' }, { value: 60, label: '60 fps' }, { value: 120, label: '120 fps' }]} onchange={v => updateSettings({ fps: v })} />
       </div>
       <div class="field">
@@ -332,6 +339,10 @@
     <section id="advanced">
       <h2>Advanced</h2>
       <div class="field">
+        <div class="lbl"><div>Archival 4:4:4 SDR</div><div class="hint">Advanced NVIDIA fidelity option. Lossless coding after RGB conversion, large files and limited player support. Unavailable for HDR sources.</div></div>
+        <Toggle label="Archival 4:4:4 SDR" checked={s.quality === 'archival'} onchange={v => updateSettings({ quality: v ? 'archival' : 'high' })} />
+      </div>
+      <div class="field">
         <div class="lbl"><div>Encoder</div><div class="hint">Software works on any PC but uses the processor. Use it only if the GPU encoder causes problems.</div></div>
         <Segmented label="Encoder choice" value={s.encoder}
           options={[{ value: 'auto', label: 'Automatic (GPU)' }, { value: 'software', label: 'Software' }] as { value: 'auto' | 'software'; label: string }[]}
@@ -340,7 +351,9 @@
       <dl>
         <dt>Encoder in use</dt><dd>{e?.encoder ? `${e.encoder.name} (${e.encoder.hardware ? 'hardware' : 'software'})` : 'Chosen when recording starts'}</dd>
         {#if e?.encoder?.rejected.length}<dt>Encoders not used</dt><dd>{#each e.encoder.rejected as r}<div>{r}</div>{/each}</dd>{/if}
-        <dt>Frames from Windows</dt><dd>{e?.capture_fps ?? 0} fps. Windows sends frames only when the picture changes; recordings stay at {s.fps} fps.</dd>
+        <dt>Frames from Windows</dt><dd>{e?.capture_fps ?? 0} fps. Windows sends frames when the picture changes. Encoder target: {e?.encoder?.fps ?? s.fps} fps.</dd>
+        <dt>Recording frames</dt><dd>{e?.frames_encoded ?? 0} encoded; {e?.frames_dropped ?? 0} missed deadlines; {e?.frames_repeated ?? 0} repeated source samples; {e?.frames_without_source ?? 0} ticks without a source frame.</dd>
+        <dt>Source frames not sampled</dt><dd>{e?.source_frames_unselected ?? 0}. These counters measure capture and encoding; they cannot count game frames Windows never supplied.</dd>
         <dt>Audio tracks</dt><dd>{#each e?.tracks ?? [] as t}<div>{t.name}: {t.mode}, {t.source}{t.error ? ` (${t.error})` : ''}</div>{:else}None while recording is off{/each}</dd>
         <dt>Free space</dt><dd>{e?.free_bytes != null ? fmtBytes(e.free_bytes) : 'Unknown'}</dd>
       </dl>

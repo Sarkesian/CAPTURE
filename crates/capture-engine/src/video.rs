@@ -32,6 +32,8 @@ pub struct VideoEncoder {
     gpu: Arc<Gpu>,
     pkt: *mut ff::AVPacket,
     pub info: EncoderInfo,
+    hdr: Option<Arc<crate::hdr::Converter>>,
+    converted: Option<ID3D11Texture2D>,
 }
 
 unsafe impl Send for VideoEncoder {}
@@ -46,6 +48,8 @@ enum GrabKind {
 /// so the frame lock (which the capture callback also needs) is held for microseconds, never
 /// for the duration of an encode.
 pub struct Grabber {
+    hdr:Option<Arc<crate::hdr::Converter>>,
+    converted:Option<ID3D11Texture2D>,
     kind: GrabKind,
     gpu: Arc<Gpu>,
 }
@@ -87,9 +91,14 @@ impl Grabber {
                     let raw = (*g.frame).data[0] as *mut std::ffi::c_void;
                     let dst = ID3D11Texture2D::from_raw_borrowed(&raw).ok_or("null texture")?;
                     let index = (*g.frame).data[1] as usize as u32;
-                    ctx.CopySubresourceRegion(dst, index, 0, 0, 0, &latest.texture, 0, None);
+                    if let Some(hdr)=&self.hdr {hdr.convert(&self.gpu,&latest.texture,dst,index)?;} else {ctx.CopySubresourceRegion(dst, index, 0, 0, 0, &latest.texture, 0, None);}
                 }
-                GrabKind::Cpu(staging) => ctx.CopyResource(staging, &latest.texture),
+                GrabKind::Cpu(staging) => {
+                    if let (Some(converter),Some(dst))=(&self.hdr,&self.converted) {
+                        converter.convert(&self.gpu,&latest.texture,dst,0)?;
+                        ctx.CopyResource(staging,dst);
+                    } else { ctx.CopyResource(staging, &latest.texture); }
+                },
             }
             // Submit now: the GPU (shared with a busy game) gets the copy as early as possible,
             // so it is done by the time the encoder needs it.
@@ -124,12 +133,8 @@ fn rate(q: Quality, w: u32, h: u32, fps: u32) -> Rate {
 
 /// NVENC preset (1..=7) and CQ for a quality at a given pixel rate.
 ///
-/// Each quality has a preferred preset, but slower presets cannot keep up at high pixel rates:
-/// measured on an RTX 4090 with the GPU otherwise idle, H.264 at 4K managed p5 76 fps, p4 130,
-/// p3 175, p1-p2 ~220, and with a game sharing the GPU throughput fell to ~60 % of that (p5
-/// then encoded ~48 fps at 4K60: dropped frames). So the preferred preset is kept only while it
-/// has about 2x headroom; otherwise the slowest preset that does is used, with CQ one step
-/// lower to keep the picture quality the setting promises.
+/// Keep the selected quality at every pixel rate. Overload is measured by the pipeline;
+/// it must never silently switch to a faster preset or a different CQ.
 fn nvenc_preset(q: Quality, w: u32, h: u32, fps: u32, cq: i32) -> (u32, i32) {
     let preset=match q {Quality::Balanced=>4,Quality::High=>5,Quality::Maximum=>6,Quality::Archival=>1};
     let _=(w,h,fps); (preset,cq)
@@ -149,10 +154,10 @@ impl VideoEncoder {
             &[("h264_nvenc", true), ("h264_amf", true), ("h264_mf", false)]
         };
         for &(name, hardware_input) in candidates {
-            match unsafe { Self::try_open(&gpu, name, hardware_input, w, h, fps, q, software_only) } {
+            match unsafe { Self::try_open(&gpu, name, hardware_input, w, h, fps, q, software_only, false) } {
                 Ok((ctx, input, hardware)) => {
                     let info = EncoderInfo { name: name.into(), hardware, width: w, height: h, fps, rejected };
-                    return Ok(Self { ctx, input, gpu, pkt: unsafe { ff::av_packet_alloc() }, info });
+                    return Ok(Self { ctx, input, gpu, pkt: unsafe { ff::av_packet_alloc() }, info, hdr:None, converted:None });
                 }
                 Err(e) => rejected.push(format!("{name}: {e}")),
             }
@@ -162,6 +167,24 @@ impl VideoEncoder {
             rejected.push("h264_qsv: not implemented in this build".into());
         }
         Err(format!("No H.264 encoder could be started. {}", rejected.join("; ")))
+    }
+
+    pub fn open_tonemapped(gpu:Arc<Gpu>,w:u32,h:u32,fps:u32,q:Quality,software_only:bool,white:f32)->Result<Self,String> {
+        if q==Quality::Archival {return Err("Archival 4:4:4 is an SDR-only advanced option. Choose High/Maximum with Compatible Recording for tone-mapped HDR, or Original HDR Recording for Main10 preservation.".into());}
+        let converter=Arc::new(crate::hdr::Converter::new_sdr(&gpu,w,h,white)?);
+        let mut enc=Self::open(gpu.clone(),w,h,fps,q,software_only)?;
+        if matches!(enc.input,Input::Cpu{..}) {enc.converted=Some(crate::hdr::sdr_texture(&gpu,w,h)?);}
+        enc.hdr=Some(converter);
+        enc.info.name.push_str(" (HDR to SDR)");
+        Ok(enc)
+    }
+
+    pub fn open_hdr(gpu:Arc<Gpu>,w:u32,h:u32,fps:u32,q:Quality,software_only:bool)->Result<Self,String> {
+        if software_only || q==Quality::Archival {return Err("HDR Main10 requires NVIDIA hardware and a validated 4:2:0 quality mode. HDR archival 4:4:4 is not validated; no fallback was made.".into());}
+        let converter=Arc::new(crate::hdr::Converter::new(&gpu,w,h)?);
+        let(ctx,input,hardware)=unsafe{Self::try_open(&gpu,"hevc_nvenc",true,w,h,fps,q,false,true)}
+            .map_err(|e|format!("Original HDR could not start NVIDIA HEVC Main10 encoding: {e}. No SDR conversion or lower-quality fallback was used."))?;
+        Ok(Self{ctx,input,gpu,pkt:unsafe{ff::av_packet_alloc()},hdr:Some(converter),converted:None,info:EncoderInfo{name:"hevc_nvenc Main10 HDR (PQ)".into(),hardware,width:w,height:h,fps,rejected:vec![]}})
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -174,6 +197,7 @@ impl VideoEncoder {
         fps: u32,
         q: Quality,
         software_only: bool,
+        hdr: bool,
     ) -> Result<(*mut ff::AVCodecContext, Input, bool), String> {
         let codec = ff::avcodec_find_encoder_by_name(av::cstr(name).as_ptr());
         if codec.is_null() {
@@ -204,12 +228,14 @@ impl VideoEncoder {
             (*ctx).color_trc = ff::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
             (*ctx).colorspace = ff::AVColorSpace::AVCOL_SPC_BT709;
             (*ctx).color_range = ff::AVColorRange::AVCOL_RANGE_MPEG;
+            if hdr {(*ctx).color_primaries=ff::AVColorPrimaries::AVCOL_PRI_BT2020;(*ctx).color_trc=ff::AVColorTransferCharacteristic::AVCOL_TRC_SMPTE2084;(*ctx).colorspace=ff::AVColorSpace::AVCOL_SPC_BT2020_NCL;}
             let pd = (*ctx).priv_data;
             let input = if gpu_input {
                 let frames = ff::av_hwframe_ctx_alloc(gpu.hw_device);
                 let fc = (*frames).data as *mut ff::AVHWFramesContext;
                 (*fc).format = ff::AVPixelFormat::AV_PIX_FMT_D3D11;
-                (*fc).sw_format = ff::AVPixelFormat::AV_PIX_FMT_BGRA;
+                (*fc).sw_format = if hdr {ff::AVPixelFormat::AV_PIX_FMT_P010LE}else{ff::AVPixelFormat::AV_PIX_FMT_BGRA};
+                let d3d=(*fc).hwctx as *mut crate::av::AVD3D11VAFramesContext;(*d3d).bind_flags=(D3D11_BIND_RENDER_TARGET.0|D3D11_BIND_SHADER_RESOURCE.0) as u32;
                 (*fc).width = w as i32;
                 (*fc).height = h as i32;
                 (*fc).initial_pool_size = 0;
@@ -268,13 +294,13 @@ impl VideoEncoder {
                 Input::Cpu { staging: staging.unwrap(), sws }
             };
             match name {
-                "h264_nvenc" => {
+                "h264_nvenc" | "hevc_nvenc" => {
                     let (preset, cq) = nvenc_preset(q, w, h, fps, r.cq);
                     av::opt(pd, "preset", &format!("p{preset}"))?;
                     av::opt(pd, "tune", "hq")?;
                     av::opt(pd, "rc", "vbr")?;
                     av::opt(pd, "cq", &cq.to_string())?;
-                    av::opt(pd, "profile", "high")?;
+                    av::opt(pd, "profile", if hdr {"main10"}else{"high"})?;
                     av::opt(pd, "spatial-aq", "1")?;
                     if q==Quality::Archival {
                         av::opt(pd,"tune","lossless")?; av::opt(pd,"rc","constqp")?;
@@ -325,7 +351,7 @@ impl VideoEncoder {
             Input::Gpu { frames } => GrabKind::Gpu(unsafe { ff::av_buffer_ref(*frames) }),
             Input::Cpu { staging, .. } => GrabKind::Cpu(staging.clone()),
         };
-        Grabber { kind, gpu: self.gpu.clone() }
+        Grabber { kind, gpu: self.gpu.clone(),hdr:self.hdr.clone(),converted:self.converted.clone() }
     }
 
     /// Encode a picture taken by [`Grabber::grab`] and hand finished packets to `out`.
@@ -364,6 +390,10 @@ impl VideoEncoder {
                     }
                 };
                 (*f).pts = n;
+                (*f).color_primaries=(*self.ctx).color_primaries;
+                (*f).color_trc=(*self.ctx).color_trc;
+                (*f).colorspace=(*self.ctx).colorspace;
+                (*f).color_range=(*self.ctx).color_range;
                 let t_send = crate::clock::now_100ns();
                 check(ff::avcodec_send_frame(self.ctx, f), "encode")?;
                 let t_sent = crate::clock::now_100ns();
@@ -412,6 +442,29 @@ impl Drop for VideoEncoder {
 mod tests {
     use super::nvenc_preset;
     use capture_protocol::Quality;
+
+    #[test]
+    #[ignore="Explicit synthetic FP16 GPU HDR proof; no screen capture"]
+    fn hdr_main10_gpu_color_roundtrip() {
+        use super::*;
+        let gpu=Arc::new(Gpu::create().unwrap());
+        let mut encoder=VideoEncoder::open_hdr(gpu.clone(),256,144,60,Quality::Maximum,false).unwrap();
+        let root=std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-output").join(format!("hdr-proof-{}",crate::history::millis()));std::fs::create_dir_all(&root).unwrap();
+        let bands=[[0.0,0.0,0.0],[1.0,1.0,1.0],[12.5,12.5,12.5],[4.0,0.1,0.1],[0.1,4.0,0.1],[0.1,0.1,4.0],[0.01,0.01,0.01],[2.5375,2.5375,2.5375]];
+        let mut pixels=vec![0u16;256*144*4];for y in 0..144 {for x in 0..256 {let rgb=bands[x/32];let i=(y*256+x)*4;for c in 0..3{pixels[i+c]=crate::hdr::test_half(rgb[c] as f32);}pixels[i+3]=crate::hdr::test_half(1.0);}}
+        let latest=crate::wgc::synthetic_hdr(&gpu,256,144,&pixels);
+        let segment=root.join("hdr.ts");let streams=vec![unsafe{crate::mux::StreamDesc::from_ctx(encoder.codec_ctx())}];let mut writer=crate::mux::SegmentWriter::create(&segment,&streams).unwrap();
+        for n in 0..60 {let grab=encoder.grabber().grab(&latest,n).unwrap();encoder.encode(grab,&mut |p|writer.write(p).unwrap()).unwrap();}encoder.flush(&mut |p|writer.write(p).unwrap());writer.finish();
+        let clip=root.join("hdr.mp4");crate::save::remux(&[(segment,0.0)],None,0.0,0.0,1.0,&[],&clip).unwrap();
+        let ffroot=std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../third_party/ffmpeg/bin");
+        let probe=std::process::Command::new(ffroot.join("ffprobe.exe")).args(["-v","error","-count_frames","-show_streams","-of","json"]).arg(&clip).output().unwrap();assert!(probe.status.success());
+        let v:serde_json::Value=serde_json::from_slice(&probe.stdout).unwrap();let s=&v["streams"][0];println!("HDR stream: {s}");
+        assert_eq!(s["pix_fmt"],"yuv420p10le");assert_eq!(s["color_primaries"],"bt2020");assert_eq!(s["color_transfer"],"smpte2084");assert_eq!(s["color_space"],"bt2020nc");assert_eq!(s["nb_read_frames"],"60");assert_eq!(s["profile"],"Main 10");
+        let raw=std::process::Command::new(ffroot.join("ffmpeg.exe")).args(["-v","error","-i"]).arg(&clip).args(["-pix_fmt","yuv420p10le","-f","rawvideo","pipe:1"]).output().unwrap();assert!(raw.status.success());assert_eq!(raw.stdout.len(),256*144*3*60);
+        let read=|offset:usize|u16::from_le_bytes([raw.stdout[offset*2],raw.stdout[offset*2+1]]) as f64;
+        let mut max_error=0.0f64; for (n,rgb) in bands.into_iter().enumerate(){let rgb=crate::hdr::rgb2020(rgb).map(|v|crate::hdr::pq(v*80.0));let y=0.2627*rgb[0]+0.6780*rgb[1]+0.0593*rgb[2];let expected=[64.0+876.0*y,512.0+896.0*(rgb[2]-y)/(2.0*(1.0-0.0593)),512.0+896.0*(rgb[0]-y)/(2.0*(1.0-0.2627))];let x=n*32+16;let actual=[read(72*256+x),read(256*144+36*128+x/2),read(256*144+128*72+36*128+x/2)];println!("band {n}: expected {expected:?}, actual {actual:?}");for i in 0..3{max_error=max_error.max((actual[i]-expected[i]).abs());}}
+        println!("HDR proof MP4 {}",clip.display());assert!(max_error<8.0,"HDR color conversion mismatch: {max_error}");
+    }
 
     #[test]
     #[ignore = "Explicit NVIDIA D3D11 hardware proof using synthetic textures only"]

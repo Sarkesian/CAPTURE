@@ -28,7 +28,14 @@ unsafe extern "system" fn wndproc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRES
 }
 
 fn main() {
+    unsafe {
+        use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext,DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+        let _=SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
     let args: Vec<String> = std::env::args().collect();
+    let hdr=args.iter().any(|a| a=="--hdr");
+    let rate=args.iter().position(|a|a=="--rate").and_then(|i|args.get(i+1)).and_then(|s|s.parse::<u32>().ok()).unwrap_or(0);
+    let render_format=if hdr {DXGI_FORMAT_R16G16B16A16_FLOAT}else{DXGI_FORMAT_R8G8B8A8_UNORM};
     let fullscreen = args.iter().any(|a| a == "--fullscreen");
     let flip = args.iter().any(|a| a == "--flip");
     // Stdio-driven changes exercise real DXGI back-buffer and window mode changes,
@@ -66,9 +73,12 @@ fn main() {
         )
         .unwrap();
         let _ = ShowWindow(hwnd, SW_SHOW);
+        // A hidden-console launcher controls the first ShowWindow through STARTUPINFO.
+        // The fixture's actual DX11 target must still be visible to WGC.
+        let _ = ShowWindow(hwnd, SW_SHOW);
 
         let desc = DXGI_SWAP_CHAIN_DESC {
-            BufferDesc: DXGI_MODE_DESC { Width: w as u32, Height: h as u32, Format: DXGI_FORMAT_R8G8B8A8_UNORM, ..Default::default() },
+            BufferDesc: DXGI_MODE_DESC { Width: w as u32, Height: h as u32, Format: render_format, ..Default::default() },
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
             BufferCount: 2,
@@ -80,6 +90,9 @@ fn main() {
         let (mut sc, mut dev, mut ctx) = (None, None, None);
         D3D11CreateDeviceAndSwapChain(None, D3D_DRIVER_TYPE_HARDWARE, HMODULE::default(), D3D11_CREATE_DEVICE_FLAG(0), None, D3D11_SDK_VERSION, Some(&desc), Some(&mut sc), Some(&mut dev), None, Some(&mut ctx)).unwrap();
         let (sc, dev, ctx): (IDXGISwapChain, ID3D11Device, ID3D11DeviceContext) = (sc.unwrap(), dev.unwrap(), ctx.unwrap());
+        if hdr {
+            sc.cast::<IDXGISwapChain3>().unwrap().SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709).unwrap();
+        }
         if fullscreen {
             if let Err(e) = sc.SetFullscreenState(true, None) {
                 eprintln!("exclusive fullscreen refused: {e}");
@@ -91,6 +104,7 @@ fn main() {
         let mut rtv: Option<ID3D11RenderTargetView> = None;
         let mut msg = MSG::default();
         let mut frames = 0u64;
+        let mut reported=0;
         let context1: ID3D11DeviceContext1 = ctx.cast().unwrap();
         while start.elapsed() < Duration::from_secs_f64(secs) {
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
@@ -121,12 +135,13 @@ fn main() {
                 SetWindowLongPtrW(hwnd, GWL_STYLE, style.0 as isize);
                 let mut outer = RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 };
                 AdjustWindowRect(&mut outer, style, false).unwrap();
-                SetWindowPos(hwnd, None, 40, 40, outer.right - outer.left, outer.bottom - outer.top, SWP_FRAMECHANGED | SWP_NOZORDER).unwrap();
+                let origin=if style==WS_POPUP {0}else{40};
+                SetWindowPos(hwnd, None, origin, origin, outer.right - outer.left, outer.bottom - outer.top, SWP_FRAMECHANGED | SWP_NOZORDER).unwrap();
                 let _ = ShowWindow(hwnd, SW_RESTORE);
                 if parts[0] == "exclusive" {
                     let _ = SetForegroundWindow(hwnd);
                     sc.SetFullscreenState(true, None).unwrap();
-                    sc.ResizeTarget(&DXGI_MODE_DESC { Width: w, Height: h, Format: DXGI_FORMAT_R8G8B8A8_UNORM, ..Default::default() }).unwrap();
+                    sc.ResizeTarget(&DXGI_MODE_DESC { Width: w, Height: h, Format: render_format, ..Default::default() }).unwrap();
                 }
                 sc.ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH).unwrap();
                 println!("phase {} {w} {h}", parts[0]);
@@ -145,9 +160,9 @@ fn main() {
                 let mut d = D3D11_TEXTURE2D_DESC::default();
                 bb.GetDesc(&mut d);
                 let (w, h) = (d.Width as i32, d.Height as i32);
-                ctx.ClearRenderTargetView(rtv.as_ref().unwrap(), &[0.0, 0.0, 1.0, 1.0]);
+                ctx.ClearRenderTargetView(rtv.as_ref().unwrap(), &if hdr {[0.01,0.01,0.01,1.0]}else{[0.0, 0.0, 1.0, 1.0]});
                 let (cw, ch) = (w / 6, h / 6);
-                context1.ClearView(rtv.as_ref().unwrap(), &[1.0, 0.0, 0.0, 1.0], Some(&[
+                context1.ClearView(rtv.as_ref().unwrap(), &if hdr {[12.5,12.5,12.5,1.0]}else{[1.0, 0.0, 0.0, 1.0]}, Some(&[
                     RECT { left: 0, top: 0, right: cw, bottom: ch },
                     RECT { left: w-cw, top: 0, right: w, bottom: ch },
                     RECT { left: 0, top: h-ch, right: cw, bottom: h },
@@ -158,8 +173,16 @@ fn main() {
                     RECT { left: w/3, top: h/3, right: w*2/3, bottom: h*2/3 },
                 ]));
             }
-            let _ = sc.Present(1, DXGI_PRESENT(0));
+            // A robust binary frame ID for capture/decoded-frame accounting. This
+            // belongs to the diagnostic target only, never to recorded gameplay.
+            if rate>0 {
+                let bb:ID3D11Texture2D=sc.GetBuffer(0).unwrap();let mut d=D3D11_TEXTURE2D_DESC::default();bb.GetDesc(&mut d);
+                for bit in 0..16 {let value=if frames&(1<<bit)!=0 {1.0}else{0.0};context1.ClearView(rtv.as_ref().unwrap(),&[value,value,value,1.0],Some(&[RECT{left:bit*8,top:d.Height as i32-16,right:(bit+1)*8,bottom:d.Height as i32}]));}
+            }
+            let _ = sc.Present(if rate>0 {0}else{1}, DXGI_PRESENT(0));
             frames += 1;
+            if rate>0 {let due=Duration::from_secs_f64(frames as f64/rate as f64);if let Some(wait)=due.checked_sub(start.elapsed()){std::thread::sleep(wait);}}
+            if start.elapsed().as_secs()>reported {reported=start.elapsed().as_secs();println!("present frames={frames} elapsed={:.6}",start.elapsed().as_secs_f64());}
         }
         if fullscreen || resolution_test {
             let _ = sc.SetFullscreenState(false, None);

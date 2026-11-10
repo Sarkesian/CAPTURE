@@ -182,7 +182,10 @@ unsafe fn remux_inner(segments: &[(PathBuf, f64)], lead_in: Option<&Path>, seg0_
         // Untagged HD video is read as BT.601 by some programs and BT.709 by others, so say what
         // CAPTURE encodes: BT.709, limited range (encoders that do tag, e.g. NVENC, keep theirs).
         let cp = (*ost).codecpar;
-        if is_video && (*cp).color_space == ff::AVColorSpace::AVCOL_SPC_UNSPECIFIED {
+        if (*cp).codec_id == ff::AVCodecID::AV_CODEC_ID_HEVC {
+            (*cp).codec_tag = u32::from_le_bytes(*b"hvc1");
+        }
+        if is_video && (*cp).codec_id == ff::AVCodecID::AV_CODEC_ID_H264 && (*cp).color_space == ff::AVColorSpace::AVCOL_SPC_UNSPECIFIED {
             (*cp).color_space = ff::AVColorSpace::AVCOL_SPC_BT709;
             (*cp).color_primaries = ff::AVColorPrimaries::AVCOL_PRI_BT709;
             (*cp).color_trc = ff::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
@@ -243,6 +246,16 @@ unsafe fn remux_inner(segments: &[(PathBuf, f64)], lead_in: Option<&Path>, seg0_
                 continue;
             }
             return Err("Buffer segments changed layout mid-clip".into());
+        }
+        if !audio_only {
+            for i in 0..n {
+                let src=(*(*(*ic.0).streams.add(i))).codecpar;
+                let dst=(*(*(*oc.0).streams.add(i))).codecpar;
+                if (*src).codec_id!=(*dst).codec_id || (*src).width!=(*dst).width || (*src).height!=(*dst).height
+                    || (*src).sample_rate!=(*dst).sample_rate || (*src).ch_layout.nb_channels!=(*dst).ch_layout.nb_channels {
+                    return Err("This range crosses a recording format or resolution change. Save each recording epoch separately in Replay; original footage is retained.".into());
+                }
+            }
         }
         while ff::av_read_frame(ic.0, pkt) >= 0 {
             let si = (*pkt).stream_index as usize;

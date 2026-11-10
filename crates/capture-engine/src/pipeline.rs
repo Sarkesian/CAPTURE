@@ -30,6 +30,7 @@ pub struct Settings {
     pub source: SourceKind,
     pub fps: u32,
     pub quality: Quality,
+    pub recording_output: capture_protocol::RecordingOutput,
     pub software_encoder: bool,
     pub cursor: bool,
     pub audio: Vec<Source>,
@@ -285,7 +286,15 @@ impl Pipeline {
         };
         let capture = Arc::new(wgc::Capture::start_native(&gpu, source, s.cursor)?);
         capture.native_resolution.store(true,Ordering::Relaxed);
-        let encoder = VideoEncoder::open(gpu.clone(), capture.width, capture.height, s.fps, s.quality, s.software_encoder)?;
+        let encoder = if capture.color.hdr {
+            if s.recording_output == capture_protocol::RecordingOutput::OriginalHdr {
+                VideoEncoder::open_hdr(gpu.clone(), capture.width, capture.height, s.fps, s.quality, s.software_encoder)?
+            } else {
+                VideoEncoder::open_tonemapped(gpu.clone(), capture.width, capture.height, s.fps, s.quality, s.software_encoder, capture.color.sdr_white)?
+            }
+        } else {
+            VideoEncoder::open(gpu.clone(), capture.width, capture.height, s.fps, s.quality, s.software_encoder)?
+        };
         let info = encoder.info.clone();
 
         let buffer = s.buffer.clone();
@@ -326,7 +335,15 @@ impl Pipeline {
             "started_unix_ms":crate::history::millis(),
             "game": s.game_name,
             "exe": s.exe,
-            "video": { "encoder": info.name, "width": info.width, "height": info.height, "fps": info.fps, "quality":s.quality,"capture_format":"BGRA8 SDR","encoded_chroma":if s.quality==Quality::Archival {"4:4:4"}else{"4:2:0"},"color":"BT.709 limited","rgb_bit_exact":false },
+            "video": { "encoder": info.name, "width": info.width, "height": info.height, "fps": info.fps, "quality":s.quality,
+                "recording_output":s.recording_output,
+                "capture_format":if capture.color.hdr {"FP16 linear scRGB"}else{"BGRA8 SDR"},
+                "source_hdr_display":capture.color.hdr,
+                "sdr_white_nits":capture.color.sdr_white,
+                "encoded_chroma":if s.quality==Quality::Archival {"4:4:4"}else{"4:2:0"},
+                "color":if capture.color.hdr && s.recording_output==capture_protocol::RecordingOutput::OriginalHdr {"BT.2020 NCL / PQ / limited / 10-bit"}else{"BT.709 limited / 8-bit"},
+                "tone_mapped":capture.color.hdr && s.recording_output==capture_protocol::RecordingOutput::Compatible,
+                "rgb_bit_exact":false },
             "audio_tracks": track_names,
             "segment_container": "mpegts",
         });
@@ -534,6 +551,22 @@ impl Drop for Pipeline {
         if let Some(t) = self.mux_thread.take() {
             let _ = t.join();
         }
+        // Keep the measured counters with the epoch, including after resolution/color
+        // changes. Configured FPS alone is never evidence of complete delivery.
+        let metrics=serde_json::json!({
+            "width":self.encoder.width,"height":self.encoder.height,"requested_fps":self.encoder.fps,
+            "epoch_wall_secs":self.shared.now(),
+            "source_arrivals":self.capture.frames.load(Ordering::Relaxed),
+            "encoded_packets":self.shared.frames_encoded.load(Ordering::Relaxed),
+            "missed_deadline_ticks":self.shared.frames_dropped.load(Ordering::Relaxed),
+            "repeated_source_samples":self.shared.frames_repeated.load(Ordering::Relaxed),
+            "ticks_without_source":self.shared.frames_without_source.load(Ordering::Relaxed),
+            "source_arrivals_not_selected":self.shared.source_frames_unselected.load(Ordering::Relaxed),
+            "note":"Counts do not measure game presents never delivered by Windows or prove pixel uniqueness."
+        });
+        if let Err(e)=std::fs::write(self.shared.session_dir.join("recording-metrics.json"),serde_json::to_vec_pretty(&metrics).unwrap()) {
+            eprintln!("Could not preserve recording measurements: {e}");
+        }
         self.shared.dropped.store(true, Ordering::SeqCst);
         self.shared.history.end(&self.shared.session_id);
         // A review snapshot nobody released (window closed meanwhile) would keep its segments
@@ -613,6 +646,7 @@ fn run_video(shared: Arc<Shared>, capture: Arc<wgc::Capture>, enc: VideoEncoder,
         let t_lock = clock::now_100ns();
         let latest = capture.latest.lock().unwrap();
         let generation=capture.frames.load(Ordering::Relaxed);
+        crate::trace::ev("sample",clock::now_100ns(),n,generation as i64,latest.frame_qpc as i64);
         let t_locked = clock::now_100ns();
         let grab = latest.has_frame.then(|| grabber.grab(&latest, n));
         drop(latest);

@@ -41,6 +41,7 @@ impl Drop for FrameLease {
     fn drop(&mut self) { let _ = self.0.Close(); }
 }
 
+#[derive(Clone, Copy)]
 pub enum Source {
     Window(isize),
     Monitor(isize),
@@ -151,6 +152,8 @@ impl Scaler {
 }
 
 pub struct Capture {
+    pub color: ColorState,
+    source: Source,
     pub resolution_changed: Arc<AtomicBool>,
     pub native_resolution: Arc<AtomicBool>,
     pub width: u32,
@@ -196,14 +199,23 @@ pub fn client_crop(hwnd: isize) -> Option<(i32, i32, i32, i32)> {
 }
 
 impl Capture {
+    /// Also notices SDR-white-level changes while an HDR desktop is otherwise static.
+    pub fn check_color(&self, gpu:&Gpu) {
+        match source_color(&gpu.device, &self.source, true) {
+            Ok(now) if now != self.color => { self.resolution_changed.store(true,Ordering::Relaxed); self.latest.lock().unwrap().has_frame=false; },
+            Err(e) => { let mut l=self.latest.lock().unwrap();l.has_frame=false;l.error=Some(e); },
+            _ => {}
+        }
+    }
     pub fn start(gpu: &Gpu, source: Source, cursor: bool) -> Result<Self, String> {
         Self::start_with_native(gpu,source,cursor,false)
     }
     pub fn start_native(gpu:&Gpu,source:Source,cursor:bool)->Result<Self,String> {
-        validate_native_color(gpu,&source)?;
         Self::start_with_native(gpu,source,cursor,true)
     }
     fn start_with_native(gpu:&Gpu,source:Source,cursor:bool,native:bool)->Result<Self,String> {
+        let color = if native { source_color(&gpu.device, &source, true)? } else { ColorState::sdr() };
+        let format = if color.hdr { DirectXPixelFormat::R16G16B16A16Float } else { DirectXPixelFormat::B8G8R8A8UIntNormalized };
         let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
             .map_err(|e| format!("Windows Graphics Capture is unavailable: {e}"))?;
         let item: GraphicsCaptureItem = unsafe {
@@ -231,7 +243,7 @@ impl Capture {
             CreateDirect3D11DeviceFromDXGIDevice(&dxgi).map_err(|e| e.to_string())?.cast().map_err(|e| e.to_string())?
         };
 
-        let mut initial = make_latest(gpu, width, height)?;
+        let mut initial = make_latest_format(gpu, width, height, if color.hdr {DXGI_FORMAT_R16G16B16A16_FLOAT} else {DXGI_FORMAT_B8G8R8A8_UNORM})?;
         initial.last_size = size; // pool size includes window decorations; encoder size does not
         let latest = Arc::new(Mutex::new(initial));
         let frames = Arc::new(AtomicU64::new(0));
@@ -241,12 +253,23 @@ impl Capture {
 
         let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             &winrt_device,
-            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            format,
             POOL_FRAMES,
             size,
         )
         .map_err(|e| e.to_string())?;
         let session = pool.CreateCaptureSession(&item).map_err(|e| e.to_string())?;
+        // The Windows default can quantize a ~16 ms minimum to three refreshes on
+        // a 144 Hz display (~48 arrivals/sec). Let WGC deliver source updates;
+        // the configured encoder clock still selects the requested output FPS.
+        let prior_interval=session.MinUpdateInterval().ok().map(|v|v.Duration);
+        let legacy_pacing=cfg!(debug_assertions) && std::env::var("CAPTURE_WGC_DEFAULT_PACING").as_deref()==Ok("1");
+        if !legacy_pacing {
+            if let Err(e)=session.SetMinUpdateInterval(windows::Foundation::TimeSpan{Duration:0}) {
+                eprintln!("WGC minimum update interval is unavailable: {e}; measured capture pacing remains visible in diagnostics");
+            }
+        }
+        eprintln!("WGC minimum update interval (100 ns): {prior_interval:?} -> {:?}",session.MinUpdateInterval().ok().map(|v|v.Duration));
         let _ = session.SetIsBorderRequired(false); // Win11; ignored where unsupported
         let _ = session.SetIsCursorCaptureEnabled(cursor);
 
@@ -257,10 +280,14 @@ impl Capture {
             // WGC callback thread is safe.
             let ctx = SendCtx(gpu.context.clone(), winrt_device.clone());
             let dev3d = SendDev(gpu.device.clone());
-            let callback = Mutex::new(());
+            // IsCurrent is the cheap per-frame invalidation check recommended by DXGI.
+            // Enumerating outputs and querying HDR characteristics on every frame can
+            // serialize with Present on the game; do that only after invalidation/moves.
+            let factory=unsafe { windows::Win32::Graphics::Dxgi::CreateDXGIFactory1::<windows::Win32::Graphics::Dxgi::IDXGIFactory1>() }.map_err(|e|e.to_string())?;
+            let callback = Mutex::new(factory);
             pool.FrameArrived(&TypedEventHandler::<Direct3D11CaptureFramePool, IInspectable>::new(
                 move |pool, _| {
-                    let _callback = callback.lock().unwrap();
+                    let mut callback = callback.lock().unwrap();
                     let ctx = &ctx; // capture the whole Send wrapper, not its fields
                     let (context, dev) = (&ctx.0, &ctx.1);
                     let dev3d = &dev3d.0;
@@ -271,6 +298,18 @@ impl Capture {
                     let content = frame.ContentSize()?;
                     let tex: ID3D11Texture2D = unsafe { frame.Surface()?.cast::<IDirect3DDxgiInterfaceAccess>()?.GetInterface()? };
                     let mut l = latest.lock().unwrap();
+                    // Check before publishing: never feed a new display transfer function into
+                    // the previous epoch's encoder. Display capabilities are not game metadata.
+                    if resolution_changed.load(Ordering::Relaxed) {l.has_frame=false;return Ok(());}
+                    if native && (source_monitor(&source)!=color.monitor || !unsafe {callback.IsCurrent()}.as_bool()) {
+                        match source_color(dev3d, &source, false) {
+                            Ok(now) if now.same_signal(&color) => {
+                                *callback=unsafe {windows::Win32::Graphics::Dxgi::CreateDXGIFactory1()?};
+                            },
+                            Ok(_) => { l.has_frame=false; resolution_changed.store(true, Ordering::Relaxed); return Ok(()); },
+                            Err(e) => {l.has_frame=false; l.error=Some(e); return Ok(());}
+                        }
+                    }
                     if crate::trace::enabled() {
                         let shown = frame.SystemRelativeTime().map(|t| t.Duration).unwrap_or(0);
                         let now = crate::clock::now_100ns();
@@ -285,7 +324,7 @@ impl Capture {
                         drop(lease);
                         drop(l); // Recreate may wait for Windows; never stall the encoder clock.
                         if content.Width < 16 || content.Height < 16 { return Ok(()) }
-                        if let Err(e) = pool.Recreate(dev, DirectXPixelFormat::B8G8R8A8UIntNormalized, POOL_FRAMES, content) {
+                        if let Err(e) = pool.Recreate(dev, format, POOL_FRAMES, content) {
                             latest.lock().unwrap().error = Some(format!("Could not resize the capture buffers: {e}"));
                             return Ok(());
                         }
@@ -351,7 +390,8 @@ impl Capture {
                         l.error = None;
                         l.has_frame = true;
                         l.frame_qpc=frame.SystemRelativeTime().map(|t|t.Duration.max(0) as u64).unwrap_or(t_arrive);
-                        frames.fetch_add(1, Ordering::Relaxed);
+                        let generation=frames.fetch_add(1, Ordering::Relaxed)+1;
+                        crate::trace::ev("src",t_arrive,l.frame_qpc as i64,generation as i64,0);
                     }
                     Ok(())
                 },
@@ -367,32 +407,80 @@ impl Capture {
             .map_err(|e| e.to_string())?;
         }
         session.StartCapture().map_err(|e| format!("Capture could not start: {e}"))?;
-        Ok(Self { width, height, latest, frames, closed, session, pool, resolution_changed,native_resolution })
+        Ok(Self { width, height, latest, frames, closed, session, pool, resolution_changed,native_resolution, color, source })
     }
 }
 
-fn validate_native_color(gpu:&Gpu,source:&Source)->Result<(),String> {
-    use windows::Win32::Graphics::Gdi::{MonitorFromWindow,MONITOR_DEFAULTTONEAREST};
-    let monitor=match source {Source::Monitor(h)=>HMONITOR(*h as *mut _),Source::Window(h)=>unsafe{MonitorFromWindow(HWND(*h as *mut _),MONITOR_DEFAULTTONEAREST)}};
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColorState {pub hdr:bool, pub sdr_white:f32, monitor:isize, space:DXGI_COLOR_SPACE_TYPE}
+impl ColorState {
+    fn sdr()->Self {Self{hdr:false,sdr_white:80.0,monitor:0,space:DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709}}
+    fn same_signal(&self, other:&Self)->bool {self.monitor==other.monitor && self.space==other.space}
+}
+
+fn classify_color(color:DXGI_COLOR_SPACE_TYPE)->Result<bool,String> {
+    if color==DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 || color==DXGI_COLOR_SPACE_RGB_STUDIO_G22_NONE_P709 {Ok(false)}
+    else if color==DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 || color==DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 {Ok(true)}
+    else {Err(format!("Unsupported display color space {color:?}. Recording was not silently converted."))}
+}
+
+fn source_color(device:&ID3D11Device,source:&Source,white:bool)->Result<ColorState,String> {
+    let monitor=HMONITOR(source_monitor(source) as *mut _);
     unsafe {
-        let adapter=gpu.device.cast::<IDXGIDevice>().and_then(|d|d.GetAdapter()).map_err(|e|format!("Cannot verify source color format: {e}"))?;
+        let mut adapter=device.cast::<IDXGIDevice>().and_then(|d|d.GetAdapter()).map_err(|e|format!("Cannot verify source color format: {e}"))?;
+        // DXGI caches display characteristics in its factory. Refresh enumeration after
+        // HDR/topology changes, matching the capture device by LUID rather than GPU index.
+        let factory:windows::Win32::Graphics::Dxgi::IDXGIFactory1=adapter.GetParent().map_err(|e|e.to_string())?;
+        if !factory.IsCurrent().as_bool() {
+            use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1,IDXGIFactory1};
+            let luid=adapter.GetDesc().map_err(|e|e.to_string())?.AdapterLuid;
+            let fresh:IDXGIFactory1=CreateDXGIFactory1().map_err(|e|e.to_string())?;
+            let mut n=0;
+            while let Ok(candidate)=fresh.EnumAdapters1(n) {
+                n+=1;
+                if candidate.GetDesc1().map_err(|e|e.to_string())?.AdapterLuid==luid {
+                    adapter=candidate.cast().map_err(|e|e.to_string())?;break;
+                }
+            }
+        }
         let mut index=0;
         while let Ok(output)=adapter.EnumOutputs(index) {
             index+=1;
-            if output.GetDesc().map(|d|d.Monitor==monitor).unwrap_or(false) {
-                let output=output.cast::<IDXGIOutput6>().map_err(|e|format!("Cannot verify source color format: {e}"))?;
-                let color=output.GetDesc1().map_err(|e|e.to_string())?.ColorSpace;
-                return validate_sdr_color(color);
+            let desc=output.GetDesc().map_err(|e|e.to_string())?;
+            if desc.Monitor==monitor {
+                let color=output.cast::<IDXGIOutput6>().and_then(|o|o.GetDesc1()).map_err(|e|format!("Cannot verify source color format: {e}"))?.ColorSpace;
+                let hdr=classify_color(color)?;
+                let sdr_white=if hdr && white {sdr_white_level(&String::from_utf16_lossy(&desc.DeviceName).trim_end_matches('\0'))?}else{80.0};
+                return Ok(ColorState{hdr,sdr_white,monitor:monitor.0 as isize,space:color});
             }
         }
     }
-    Err("Cannot verify this display's color format on the capture GPU. Recording was not silently converted; multi-adapter color capture needs validation.".into())
+    Err("Cannot verify this display's color format on the capture GPU. Multi-adapter capture is not supported by this path.".into())
 }
 
-fn validate_sdr_color(color:DXGI_COLOR_SPACE_TYPE)->Result<(),String> {
-    if color==DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 || color==DXGI_COLOR_SPACE_RGB_STUDIO_G22_NONE_P709 {Ok(())}
-    else {Err("This display uses HDR or an unsupported color space. The current recorder preserves 8-bit SDR only; recording has not been silently converted. HDR/10-bit preservation requires a different validated capture and encoding path.".into())}
+fn source_monitor(source:&Source)->isize {
+    use windows::Win32::Graphics::Gdi::{MonitorFromWindow,MONITOR_DEFAULTTONEAREST};
+    match source {Source::Monitor(h)=>*h,Source::Window(h)=>unsafe{MonitorFromWindow(HWND(*h as *mut _),MONITOR_DEFAULTTONEAREST).0 as isize}}
 }
+
+// Windows reports SDR white as a multiplier of 80 nits (1000 = 80 nits).
+fn sdr_white_level(display:&str)->Result<f32,String> {unsafe {
+    use windows::Win32::Devices::Display::*;
+    let(mut np,mut nm)=(0,0);
+    GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS,&mut np,&mut nm).ok().map_err(|e|e.to_string())?;
+    let(mut paths,mut modes)=(vec![DISPLAYCONFIG_PATH_INFO::default();np as usize],vec![DISPLAYCONFIG_MODE_INFO::default();nm as usize]);
+    QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS,&mut np,paths.as_mut_ptr(),&mut nm,modes.as_mut_ptr(),None).ok().map_err(|e|e.to_string())?;
+    for path in paths.into_iter().take(np as usize) {
+        let mut name=DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+        name.header=DISPLAYCONFIG_DEVICE_INFO_HEADER{r#type:DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,size:std::mem::size_of_val(&name) as u32,adapterId:path.sourceInfo.adapterId,id:path.sourceInfo.id};
+        if DisplayConfigGetDeviceInfo(&mut name.header)!=0 {continue;}
+        if String::from_utf16_lossy(&name.viewGdiDeviceName).trim_end_matches('\0')!=display {continue;}
+        let mut level=DISPLAYCONFIG_SDR_WHITE_LEVEL::default();
+        level.header=DISPLAYCONFIG_DEVICE_INFO_HEADER{r#type:DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,size:std::mem::size_of_val(&level) as u32,adapterId:path.targetInfo.adapterId,id:path.targetInfo.id};
+        if DisplayConfigGetDeviceInfo(&mut level.header)==0 && level.SDRWhiteLevel>0 {return Ok(level.SDRWhiteLevel as f32*0.08);}
+    }
+    Err("Cannot read Windows SDR white level for the HDR display. No guessed exposure was applied; retry after the display transition.".into())
+}}
 
 impl Drop for Capture {
     fn drop(&mut self) {
@@ -401,13 +489,17 @@ impl Drop for Capture {
     }
 }
 
+#[cfg(test)]
 fn make_latest(gpu: &Gpu, width: u32, height: u32) -> Result<Latest, String> {
+    make_latest_format(gpu,width,height,DXGI_FORMAT_B8G8R8A8_UNORM)
+}
+fn make_latest_format(gpu:&Gpu,width:u32,height:u32,format:DXGI_FORMAT)->Result<Latest,String> {
     let desc = D3D11_TEXTURE2D_DESC {
         Width: width,
         Height: height,
         MipLevels: 1,
         ArraySize: 1,
-        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        Format: format,
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         Usage: D3D11_USAGE_DEFAULT,
         BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
@@ -432,14 +524,22 @@ pub(crate) fn synthetic_latest(gpu:&Gpu,width:u32,height:u32,pixels:&[u8])->Late
 }
 
 #[cfg(test)]
+pub(crate) fn synthetic_hdr(gpu:&Gpu,width:u32,height:u32,pixels:&[u16])->Latest {
+    let mut latest=make_latest_format(gpu,width,height,DXGI_FORMAT_R16G16B16A16_FLOAT).unwrap();
+    unsafe{gpu.context.UpdateSubresource(&latest.texture,0,None,pixels.as_ptr().cast(),width*8,0);}
+    latest.has_frame=true;latest
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn unsupported_hdr_is_never_silently_treated_as_sdr() {
-        assert!(validate_sdr_color(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709).is_ok());
-        assert!(validate_sdr_color(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020).is_err());
-        assert!(validate_sdr_color(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709).is_err());
+    fn hdr_and_sdr_are_classified_without_guessing_game_metadata() {
+        assert_eq!(classify_color(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709).unwrap(),false);
+        assert_eq!(classify_color(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020).unwrap(),true);
+        assert_eq!(classify_color(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709).unwrap(),true);
+        assert!(classify_color(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020).is_err());
     }
 
     #[test]

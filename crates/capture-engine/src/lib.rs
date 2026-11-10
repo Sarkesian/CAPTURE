@@ -9,6 +9,9 @@ pub mod devices;
 pub mod gpu;
 pub mod hotkey;
 pub mod history;
+pub mod hdr;
+#[cfg(test)]
+mod quality_tests;
 pub mod inject;
 pub mod mic;
 pub mod mirror;
@@ -501,6 +504,7 @@ impl Engine {
             Some(old) => {
                 old.fps != cfg.fps
                     || old.quality != cfg.quality
+                    || old.recording_output != cfg.recording_output
                     || old.encoder != cfg.encoder
                     || old.capture_cursor != cfg.capture_cursor
                     || !old.audio.same_sources(&cfg.audio)
@@ -790,6 +794,7 @@ impl Engine {
                 if let Err(e)=h.refresh_files().and_then(|_|h.retain(c.history_secs,c.buffer_cap_bytes,c.min_free_bytes).map(|_|())) {eprintln!("history maintenance: {e}");}
             }
         }
+        if let Some(p) = &self.pipeline { p.capture.check_color(&p.gpu); }
         if self.pipeline.as_ref().is_some_and(|p|p.capture.resolution_changed.load(Ordering::Relaxed)) {
             let recording=self.pipeline.as_ref().is_some_and(|p|p.shared.session_start.lock().unwrap().is_some());
             self.start_pipeline();
@@ -1285,6 +1290,7 @@ fn settings_for_window(cfg: &EngineConfig, w: &WindowTarget, detected_by: Option
         source: SourceKind::Window(w.hwnd as isize),
         fps: cfg.fps.clamp(10, 240),
         quality: cfg.quality,
+        recording_output: cfg.recording_output,
         software_encoder: cfg.encoder == EncoderChoice::Software,
         cursor: cfg.capture_cursor,
         audio,
@@ -1336,6 +1342,7 @@ fn resolve(cfg: &EngineConfig) -> Result<Settings, Unresolved> {
                 source: SourceKind::Monitor(m.handle),
                 fps: cfg.fps.clamp(10, 240),
                 quality: cfg.quality,
+        recording_output: cfg.recording_output,
                 software_encoder: cfg.encoder == EncoderChoice::Software,
                 cursor: cfg.capture_cursor,
                 audio,

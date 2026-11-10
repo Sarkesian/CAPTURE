@@ -17,6 +17,7 @@ export interface Settings {
   history_secs: number;
   target: TargetPref;
   quality: Quality;
+  recording_output: 'compatible' | 'original_hdr';
   fps: number;
   capture_cursor: boolean;
   game_audio: boolean;

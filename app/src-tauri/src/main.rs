@@ -948,8 +948,6 @@ fn build_tray(app: &AppHandle) -> tauri::Result<Tray> {
     Ok(Tray { icon, status, toggle, save })
 }
 
-const SINGLE_INSTANCE_MUTEX: windows::core::PCWSTR = windows::core::w!("app.capture.local-sim"); // tauri-plugin-single-instance: "<identifier>-sim"
-
 fn context() -> tauri::Context<tauri::Wry> {
     tauri::generate_context!()
 }
@@ -965,7 +963,9 @@ fn message(title: &str, text: &str, style: windows::Win32::UI::WindowsAndMessagi
 fn instance_running() -> bool {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
-    match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, SINGLE_INSTANCE_MUTEX) } {
+    // Match the plugin's configured identifier, including isolated validation builds.
+    let mutex=windows::core::HSTRING::from(format!("{}-sim",context().config().identifier));
+    match unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, &mutex) } {
         Ok(h) => {
             let _ = unsafe { CloseHandle(h) };
             true
