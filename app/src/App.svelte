@@ -1,21 +1,20 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { app, init, refreshClips, fmtDuration } from './lib/store.svelte';
+  import { app, init, navigate, refreshClips, fmtDuration } from './lib/store.svelte';
   import Icon from './components/Icon.svelte';
   import HomePage from './pages/HomePage.svelte';
-  import ReplayPage from './pages/ReplayPage.svelte';
   import LibraryTab from './tabs/LibraryTab.svelte';
   import SettingsTab from './tabs/SettingsTab.svelte';
 
   type Page = 'home' | 'replay' | 'library' | 'settings';
   const pages: { id: Page; label: string; icon: string }[] = [
     { id: 'home', label: 'Home', icon: 'home' },
-    { id: 'replay', label: 'Replay', icon: 'replay' },
     { id: 'library', label: 'Library', icon: 'library' },
     { id: 'settings', label: 'Settings', icon: 'settings' },
   ];
   let failed = $state<string | null>(null);
   let main = $state<HTMLElement | null>(null);
+  let viewingMedia = $state(false);
   const scroll: Record<string, number> = {};
   const page = $derived<Page>((app.tab as string) === 'capture' ? 'home' : (app.tab as Page));
 
@@ -23,7 +22,7 @@
 
   async function go(p: Page) {
     if (main) scroll[page] = main.scrollTop;
-    app.tab = p as typeof app.tab;
+    navigate(p);
     if (p === 'library') refreshClips();
     await tick();
     if (main) main.scrollTop = scroll[p] ?? 0;
@@ -52,7 +51,7 @@
   });
 </script>
 
-<div class="shell">
+<div class="shell" class:immersive={page === 'library' && viewingMedia}>
   <nav aria-label="Main">
     <div class="brand"><span class="mark" aria-hidden="true"></span><span class="label">CAPTURE</span></div>
     <ul>
@@ -75,17 +74,15 @@
   </nav>
 
   <main bind:this={main}>
-    <div class="content" class:replaying={page === 'replay'}>
+    <div class="content" class:media={page === 'library'}>
       {#if failed}
         <div class="banner warn">CAPTURE could not load its settings: {failed}</div>
       {:else if !app.settings}
         <p class="muted">Loading…</p>
       {:else if page === 'home'}
         <HomePage onnavigate={go} />
-      {:else if page === 'replay'}
-        <ReplayPage onnavigate={go} />
       {:else if page === 'library'}
-        <LibraryTab />
+        <LibraryTab bind:active={viewingMedia} />
       {:else}
         <SettingsTab />
       {/if}
@@ -128,7 +125,10 @@
 
   main { flex: 1; min-width: 0; overflow-y: auto; background: var(--bg); border-top-left-radius: var(--r-lg); }
   .content { max-width: var(--content-max); margin: 0 auto; padding: var(--s6) var(--s8) var(--s10); }
-  .content.replaying { max-width: 1800px; }
+  .content.media { max-width: 1960px; }
+  .immersive nav { display: none; }
+  .immersive main { border-radius: 0; }
+  .immersive .content.media { max-width: none; padding: 0; }
 
   @media (max-width: 900px) {
     nav { width: var(--nav-w-compact); align-items: center; }

@@ -16,12 +16,21 @@ foreach($entry in $baselineManifest.files){
 }
 Copy-Item -LiteralPath "$repo\target\release\CAPTURE.exe" -Destination "$out\CAPTURE.exe" -Force
 Copy-Item -LiteralPath "$PSScriptRoot\Review.ps1" -Destination $out
-Copy-Item -LiteralPath "$repo\docs\REPLAY_OVERHAUL.md" -Destination "$out\Resources\REPLAY_REVIEW.md"
+Copy-Item -LiteralPath "$repo\docs\LIBRARY_REPLAY_REVIEW.md" -Destination "$out\Resources\REPLAY_REVIEW.md"
 $fixtures=Join-Path $repo 'test-output\native-replay-media'
 New-Item -ItemType Directory -Path "$out\ReviewCaptures\Background Recording" | Out-Null
 # Only the five deliberately generated fixtures, never the live regression captures/catalog.
 foreach($session in Get-ChildItem -LiteralPath "$fixtures\Background Recording" -Directory | Where-Object {$_.Name -like '2026-11-10_12-00-0*'}){
     Copy-Item -LiteralPath $session.FullName -Destination "$out\ReviewCaptures\Background Recording" -Recurse
+    $journal=Join-Path "$out\ReviewCaptures\Background Recording\$($session.Name)" 'events.jsonl'
+    $moments=foreach($line in Get-Content -LiteralPath $journal){
+        $event=$line | ConvertFrom-Json
+        if($event.kind -in 'marker','screenshot'){
+            if($event.path){$event.path=[IO.Path]::GetFileName($event.path)}
+            $event | ConvertTo-Json -Depth 8 -Compress
+        }
+    }
+    [IO.File]::WriteAllLines($journal,[string[]]$moments,[Text.UTF8Encoding]::new($false))
 }
 foreach($game in @('Hollow Knight','The Witcher 3')){
     New-Item -ItemType Directory -Force -Path "$out\ReviewCaptures\$game\Screenshots" | Out-Null
@@ -30,18 +39,18 @@ foreach($game in @('Hollow Knight','The Witcher 3')){
 $readme=@"
 CAPTURE $version — Replay review candidate
 
-Extract the whole folder. Run Review.ps1 to initialize its own disposable ReviewCaptures
-and Data folders, then open Replay. Recording starts OFF. No installed settings are imported.
+Extract the whole folder. Run Review.ps1 to open Library with its own disposable ReviewCaptures
+and Data folders. Recording starts OFF. No installed settings are imported.
 If you run CAPTURE.exe directly before Review.ps1, it uses normal first-run defaults instead.
 
 The samples represent 2-minute, 30-minute, 2-hour, 4-hour and 6-hour spans using short
 encoded windows separated by intentional gaps. They are not continuous hours of gameplay.
 The six-hour sample has a dense group near 2:00:06 and a final highlight near 5:59:52.
-Open Moments, select a marker or screenshot, use Clip around or Select clip, adjust the
-handles, and Save Clip. Saves go only to this review folder's Library.
+Open a Background card, use Moments to find a marker or screenshot, and click Clip.
+Drag either handle, then click Save Clip. Saves go only to this review folder's Library.
 
 The Runtime files are byte-identical to the installed 0.6.4 release. Only CAPTURE.exe
-contains the new UI. Nothing has been installed. See Resources\REPLAY_REVIEW.md for the
+contains the new UI. The review build has its own Windows app identity. See Resources\REPLAY_REVIEW.md for the
 implementation report, verified behavior, limitations and source rollback point.
 "@
 [IO.File]::WriteAllText("$out\REVIEW.txt",$readme,[Text.UTF8Encoding]::new($false))

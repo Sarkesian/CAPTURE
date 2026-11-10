@@ -21,4 +21,4 @@ if (-not (Test-Path -LiteralPath $settingsFile)) {
     $settings = @{version=3;capture_root=$media;replay_enabled=$false;history_secs=21600;target=@{kind='none'};first_run_done=$true;close_to_tray=$false;save_hotkey='';hotkeys=@{marker='';overlay='';session='';screenshot='';mic_mute=''};notify_on_save=$false;min_free_gb=1}
     [IO.File]::WriteAllText($settingsFile, ($settings | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
 }
-if(-not $InitializeOnly){Start-Process -FilePath (Join-Path $PSScriptRoot 'CAPTURE.exe') -WorkingDirectory $PSScriptRoot}
+if(-not $InitializeOnly){Start-Process -FilePath (Join-Path $PSScriptRoot 'CAPTURE.exe') -ArgumentList '--library' -WorkingDirectory $PSScriptRoot}

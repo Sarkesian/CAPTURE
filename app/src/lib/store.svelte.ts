@@ -25,6 +25,8 @@ export const app = $state({
   reviewError: null as string | null,
   clipInfo: {} as Record<string, { duration: number | null }>,
   tab: 'home' as 'home' | 'replay' | 'library' | 'settings',
+  libraryFilter: 'all' as 'all' | 'recordings' | 'clips' | 'screenshots',
+  libraryNavigation: 0,
   inputs: [] as AudioDevice[],
   outputs: [] as AudioDevice[],
   apps: [] as AudioApp[],
@@ -63,10 +65,18 @@ export async function init() {
   await listen<Settings>('settings', e => { app.settings = e.payload; checkPaths(); });
   // The engine's last state is no longer true (no recording, no session, nothing saving).
   await listen<string>('engine_down', e => { app.engineDown = e.payload; app.engine = null; });
-  await listen<string>('goto', e => { app.tab = e.payload as typeof app.tab; refreshClips(); });
+  await listen<string>('goto', e => { navigate(e.payload as typeof app.tab); refreshClips(); });
   refreshTargets();
   refreshClips();
   engine('history');
+}
+
+export function navigate(tab: typeof app.tab) {
+  if (tab === 'library' || tab === 'replay') {
+    app.libraryFilter = tab === 'replay' ? 'recordings' : 'all';
+    app.libraryNavigation++;
+  }
+  app.tab = tab === 'replay' ? 'library' : tab;
 }
 
 function onEngine(m: EngineMessage) {

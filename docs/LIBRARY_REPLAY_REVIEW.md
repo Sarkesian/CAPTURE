@@ -1,0 +1,17 @@
+# CAPTURE Library and Replay — 0.6.5-rc.2
+
+Library is now the home for background recordings, saved recordings, clips and screenshots. Temporary background footage has its own group, with cards ordered by game and recency. The All, Recordings, Clips and Screenshots filters share the same game and search controls. Game names and dates appear on the thumbnails when hovered or keyboard focused, without moving the grid. Where Steam has cached artwork for an installed game, the app reads it locally; otherwise it uses a capture screenshot or a title card. No artwork downloads or additional package dependencies are required.
+
+Opening a recording replaces the gallery with a large video, a slim Library return bar and one timeline. Playback is centered under the video, with Moments, fullscreen and mute at the left and Clip at the right. Zoom and pan act on that same timeline. Gaps remain visible, and nearby markers and screenshots group into clickable lists. Saved clips open a plain video player. Back returns to the same Library filters and scroll position.
+
+Clip highlights a range around the playhead and becomes Save Clip. Drag the left or right handle; holding a handle against an edge pans the timeline while extending the range. The duration remains visible near Save Clip. Gaps cannot be included in a save. Saving uses the configured capture folder and the existing stream-copy MP4 path, with immediate acknowledgement and no second completion notification. Clip starts remain keyframe-aligned.
+
+The 0.6.4 worker, hooks and FFmpeg DLLs are byte-identical to the installed release. Capture settings, codecs, HDR behavior, audio, retention, hotkeys and the engine protocol were not changed. The compact overlay shares the new viewer, and Home's history links land in Library. The portable review build uses a separate app identity and does not import the installed settings. Its launcher opens Library with recording off and a disposable capture folder.
+
+- Production frontend and native Windows release builds passed. Workspace tests: **82 passed**. The timeline model passed at 2-minute, 30-minute, 2-hour, 4-hour and 6-hour scales.
+- **34 browser interaction checks passed**, including hover without layout shift, gallery and game filters, one timeline, cursor zoom and pan, clustered markers, screenshot hover and seeking, lengthening and shortening the clip, keyboard trim, edge panning and release, saving feedback, playback-window handoff, 760×600 layout, and the compact overlay panel.
+- **8 native WebView2 checks passed** on the disposable candidate. Local Steam artwork loaded. The six-hour test history opened from Library; a marker at 2:00:06 sought to the correct footage; trimming and saving wrote a 12.07-second H.264/AAC MP4 in the configured folder. The file appeared in about 104 ms in that test, played in the Library, decoded with FFmpeg, and persisted with the source markers and screenshots after restart.
+
+The six-hour sample uses short real video windows at spaced timestamps with intentional gaps. It is not a six-hour recording soak. This revision did not reverify true exclusive-fullscreen hook interaction or make a new A/V continuity benchmark. The installed application and user recordings were left untouched.
+
+Source: `feature/replay-experience`, in `D:\Projects\CAPTURE-replay`. Previous UI checkpoint: `f21b329`. Recording foundation: `107fc45` (0.6.4).

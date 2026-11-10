@@ -1,11 +1,15 @@
 import {mount} from 'svelte';
 import Panel from '../../src/overlay/HistoryPanel.svelte';
+import App from '../../src/App.svelte';
 import {app,init,historyReview,releaseReview} from '../../src/lib/store.svelte';
 import '../../src/app.css';
 const callbacks=new Map(),listeners=new Map();let callback=0,serial=0;
 const folder=location.pathname.slice(0,location.pathname.lastIndexOf('/'));
 const calls=[];window.fixtureCalls=calls;window.fixtureApp=app;window.fixtureReview=historyReview;window.fixtureRelease=releaseReview;
 const settings={version:3,capture_root:'fixture',replay_secs:120,history_secs:21600,markers:{protect_before_secs:30,protect_after_secs:15},per_game:[]};
+const saved=[];
+const entry=(kind,name,p,game)=>({kind,name,path:folder+'/'+p,game,bytes:123456,modified_ms:1794340800000,has_stems:false,has_markers:false});
+const media=[entry('session','Boss run.mp4','clip.mp4?session','The Witcher 3'),entry('screenshot','Victory.png','shot.svg','The Witcher 3'),entry('screenshot','Rest.png','shot.svg?rest','Hollow Knight')];
 const sessions=[120,1800,7200,14400,21600].map((n,i)=>({id:'s'+i,game:i<2?'Hollow Knight':'The Witcher 3',created_ms:1794340800000+i*100000,ended:true,intervals:[[0,n]],events:[{id:'m'+i,kind:'marker',t:n/2,end:null,label:'Midpoint '+i,path:null,marker:null}]}));
 const long=sessions.at(-1);long.intervals=[[100,9000],[9060,21600]];
 long.events=[{id:'expired',kind:'marker',t:5,label:'Expired moment',path:null,end:null,marker:null},...Array.from({length:250},(_,i)=>({id:'dense'+i,kind:i%3===0?'screenshot':'marker',t:7200+i*.025,end:null,label:'Battle moment '+i,path:i%3===0?folder+'/shot.svg':null,marker:null})),{id:'late',kind:'marker',t:21580,end:null,label:'Final victory',path:null,marker:null},{id:'late-shot',kind:'screenshot',t:21582,end:null,label:'Victory screenshot',path:folder+'/shot.svg',marker:null}];
@@ -13,16 +17,21 @@ const emit=(payload)=>{const handler=listeners.get('engine');if(handler)callback
 window.__TAURI_INTERNALS__={transformCallback(fn){callbacks.set(++callback,fn);return callback;},unregisterCallback(id){callbacks.delete(id);},convertFileSrc(p){return p;},async invoke(cmd,args){
  if(cmd==='bootstrap')return {settings,data_dir:'fixture',last_state:null,engine_down:null,app:null,path_issues:[],notices:[]};
  if(cmd==='plugin:event|listen'){listeners.set(args.event,args.handler);return ++serial;}
- if(cmd==='list_clips'||cmd==='check_paths')return [];
+ if(cmd==='list_clips')return [...saved,...media].filter(c=>c.kind===({clips:'clip',sessions:'session',screenshots:'screenshot'}[args?.kind??'clips']));
+ if(cmd==='check_paths')return [];
+ if(cmd==='library_game_art')return {};
  if(cmd==='engine_command'){
   const id=++serial,c=args.command;calls.push(c);
   const reply=(event,data)=>setTimeout(()=>emit({v:1,re:id,event,data}),30);
   if(c.cmd==='history')reply('history_ready',{sessions,bytes:1e8,preview_bytes:0,retained_secs:53000,target_secs:21600,reason:null,failed_saves:[]});
   if(c.cmd==='history_review'){const start=Math.floor(c.args.at/3)*3;reply('review_ready',{session:c.args.session,path:folder+'/clip.mp4?at='+start,start,end:start+4,game:'Fixture',past:true,markers:[]});}
-  if(c.cmd==='history_save'){reply('capture_triggered',{action:'replay',overlay_notice:false});setTimeout(()=>emit({v:1,re:id,event:'save_finished',data:{path:'permanent.mp4'}}),80);}
+  if(c.cmd==='history_save'){reply('capture_triggered',{action:'replay',overlay_notice:false});setTimeout(()=>{const clip=entry('clip','Saved moment.mp4','clip.mp4?saved','The Witcher 3');saved.push(clip);emit({v:1,re:id,event:'save_finished',data:{path:clip.path}});},80);}
   if(c.cmd==='history_marker'){const ev=long.events.find(e=>e.id===c.args.id);if(ev)ev.label=c.args.label;}
   return id;
  }return null;
 }};
 window.__TAURI_EVENT_PLUGIN_INTERNALS__={unregisterListener(){}};
-await init();mount(Panel,{target:document.getElementById('app'),props:{compact:location.hash==='#compact',onclose(){}}});window.fixtureReady=true;
+const target=document.getElementById('app');
+if(location.hash==='#compact'){await init();mount(Panel,{target,props:{compact:true,onclose(){}}});}
+else {app.tab='library';mount(App,{target});}
+window.fixtureReady=true;

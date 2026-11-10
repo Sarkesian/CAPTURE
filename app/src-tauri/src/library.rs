@@ -6,6 +6,57 @@ use std::time::UNIX_EPOCH;
 
 use serde::Serialize;
 
+/// Read the installed Steam client's cached art. A missing Steam install, manifest or
+/// artwork is normal; Library falls back to a screenshot or its own title card.
+pub fn steam_art() -> std::collections::BTreeMap<String, PathBuf> {
+    use windows::{core::w, Win32::System::Registry::*};
+    let mut result = std::collections::BTreeMap::new();
+    let mut buf = [0u16; 2048];
+    let mut len = (buf.len() * 2) as u32;
+    let value = unsafe { RegGetValueW(HKEY_CURRENT_USER, w!("Software\\Valve\\Steam"), w!("SteamPath"), RRF_RT_REG_SZ, None, Some(buf.as_mut_ptr().cast()), Some(&mut len)) };
+    if value.0 != 0 { return result; }
+    let steam = PathBuf::from(String::from_utf16_lossy(&buf[..buf.iter().position(|&c| c == 0).unwrap_or(buf.len())]));
+    let Ok(cache) = steam.join("appcache/librarycache").canonicalize() else { return result; };
+    let mut libraries = vec![steam.clone()];
+    if let Ok(folders) = std::fs::read_to_string(steam.join("steamapps/libraryfolders.vdf")) {
+        libraries.extend(folders.lines().filter_map(|line| vdf_field(line, "path")).map(PathBuf::from));
+    }
+    for root in libraries {
+        for entry in std::fs::read_dir(root.join("steamapps")).into_iter().flatten().flatten() {
+            let filename = entry.file_name();
+            let Some(id) = filename.to_str().and_then(|s| s.strip_prefix("appmanifest_")).and_then(|s| s.strip_suffix(".acf")) else { continue; };
+            if id.is_empty() || !id.bytes().all(|c| c.is_ascii_digit()) { continue; }
+            let Some(image) = cached_art(&cache, id) else { continue; };
+            let Ok(data) = std::fs::read_to_string(entry.path()) else { continue; };
+            for label in ["name", "installdir"].into_iter().filter_map(|k| data.lines().find_map(|line| vdf_field(line, k))) {
+                let key: String = label.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_lowercase()).collect();
+                if !key.is_empty() { result.entry(key).or_insert_with(|| image.clone()); }
+            }
+        }
+    }
+    result
+}
+
+fn vdf_field(line: &str, key: &str) -> Option<String> {
+    let line = line.trim_start().strip_prefix('"')?;
+    let (field, value) = line.split_once('"')?;
+    if field != key { return None; }
+    let quoted = value.trim().strip_prefix('"')?.strip_suffix('"')?;
+    Some(quoted.replace("\\\\", "\\").replace("\\\"", "\""))
+}
+
+fn cached_art(cache: &Path, id: &str) -> Option<PathBuf> {
+    let dir = cache.join(id);
+    let mut variants = vec![dir.clone()];
+    variants.extend(std::fs::read_dir(&dir).into_iter().flatten().flatten()
+        .filter(|d| d.file_type().is_ok_and(|t| t.is_dir())).map(|d| d.path()));
+    variants.sort();
+    let candidates = ["library_header.jpg", "library_hero.jpg"].into_iter()
+        .flat_map(|name| variants.iter().map(move |dir| dir.join(name)))
+        .chain([cache.join(format!("{id}_header.jpg")), cache.join(format!("{id}_library_hero.jpg"))]);
+    candidates.filter_map(|p| p.canonicalize().ok()).find(|p| p.starts_with(cache) && p.is_file())
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ClipEntry {
     pub path: String,

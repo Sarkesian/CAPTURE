@@ -1,7 +1,7 @@
 // Non-UI acceptance of an extracted candidate after Review.ps1 -InitializeOnly.
 import fs from 'node:fs';import path from 'node:path';import crypto from 'node:crypto';import {spawn} from 'node:child_process';import readline from 'node:readline';import assert from 'node:assert/strict';
 const dir=path.resolve(process.argv[2]),manifest=JSON.parse(fs.readFileSync(path.join(dir,'manifest.json')));
-assert.equal(manifest.version,'0.6.5-rc.1');
+assert.equal(manifest.version,'0.6.5-rc.2');
 for(const f of manifest.files){const p=path.join(dir,f.path);assert.equal(fs.statSync(p).size,f.size,f.path);assert.equal(crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex'),f.sha256,f.path);}
 const settings=JSON.parse(fs.readFileSync(path.join(dir,'Data/Settings/settings.json'))),root=path.join(dir,'ReviewCaptures');
 assert.equal(settings.capture_root,root);assert.equal(settings.replay_enabled,false);assert.equal(settings.target.kind,'none');
@@ -14,7 +14,7 @@ try{
  await wait(e=>e.event==='hello');
  send('configure',{capture_root:root,replay_secs:120,history_secs:21600,target:{kind:'none'},quality:'high',fps:60,capture_cursor:false,audio:{game_audio:false},save_hotkey:'',hotkeys:{marker:'',overlay:'',session:'',screenshot:'',mic_mute:''},overlay:false,buffer_cap_bytes:20e9,min_free_bytes:1e9});
  let history;
- for(let n=0;n<100;n++){const id=send('history');history=(await wait(e=>e.re===id&&e.event==='history_ready')).data;if(history.sessions.length===5&&!history.reason?.includes('Recovering'))break;await sleep(100);}
+ for(let n=0;n<180;n++){const id=send('history');history=(await wait(e=>e.re===id&&e.event==='history_ready')).data;if(history.sessions.length===5&&history.sessions.every(s=>s.intervals.length)&&!history.reason?.includes('Recovering'))break;await sleep(250);}
  assert.equal(history.sessions.length,5);const session=history.sessions.find(s=>s.events.length===109);assert.ok(session);assert.ok(session.intervals.at(-1)[1]>21600);
  assert.ok(session.events.some(e=>e.kind==='marker'&&e.t===7206));
  const screenshots=history.sessions.flatMap(s=>s.events.filter(e=>e.kind==='screenshot'));assert.ok(screenshots.length>30);assert.ok(screenshots.every(e=>fs.existsSync(e.path)&&e.path.startsWith(root)));

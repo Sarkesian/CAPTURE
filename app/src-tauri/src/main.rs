@@ -708,6 +708,15 @@ fn list_clips(state: State<AppState>, kind: Option<String>) -> Vec<library::Clip
 }
 
 #[tauri::command]
+async fn library_game_art(app: AppHandle) -> std::collections::BTreeMap<String, String> {
+    let art = tauri::async_runtime::spawn_blocking(library::steam_art).await.unwrap_or_default();
+    art.into_iter().filter_map(|(name, path)| {
+        app.asset_protocol_scope().allow_file(&path).ok()?;
+        Some((name, path.to_string_lossy().into_owned()))
+    }).collect()
+}
+
+#[tauri::command]
 fn rename_clip(state: State<AppState>, path: String, name: String) -> Result<String, String> {
     let p = recording_path(&state, &path)?;
     library::rename(&p, &name).map(|t| t.to_string_lossy().into_owned())
@@ -1156,6 +1165,7 @@ fn main() {
             list_targets,
             clear_temp_cache,
             list_clips,
+            library_game_art,
             open_path,
             reveal_path,
             open_capture_folder,
@@ -1180,7 +1190,8 @@ fn main() {
             // Started from Windows sign-in: stay in the tray until opened.
             let start_hidden = std::env::args().any(|a| a == "--tray");
             let dark_bg = tauri::window::Color(0x12, 0x14, 0x18, 0xff);
-            let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+            let entry = if std::env::args().any(|a| a == "--library") { "index.html#library" } else { "index.html" };
+            let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::App(entry.into()))
                 .visible(!start_hidden)
                 .background_color(dark_bg) // no white flash before the page paints
                 .title("CAPTURE")
