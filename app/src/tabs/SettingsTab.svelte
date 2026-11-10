@@ -46,12 +46,12 @@
     document.getElementById(id)?.scrollIntoView({ block: 'start', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
   }
 
-  const qualities: { value: Quality; label: string; hint: string }[] = [
+  const qualities = $derived<{ value: Quality; label: string; hint: string }[]>([
     { value: 'balanced', label: 'Balanced', hint: 'Smaller files; great for sharing.' },
     { value: 'high', label: 'High', hint: 'Sharp detail in fast motion. Recommended.' },
     { value: 'maximum', label: 'Maximum', hint: 'High-quality lossy H.264; large files.' },
-    { value: 'archival', label: 'Archival 4:4:4', hint: 'NVIDIA lossless coding after RGB conversion; not bit-exact RGB. 8-bit SDR, very large files, limited player support. No automatic quality or FPS fallback.' },
-  ];
+    ...(s.quality === 'archival' ? [{ value: 'archival' as Quality, label: 'Archival (separate build)', hint: 'Saved preference preserved. Select Balanced, High or Maximum for this history-focused build.' }] : []),
+  ]);
   const lengths = [30, 60, 120, 180, 300, 600, 900, 1200];
 
   // Games that can have their own settings: your games list, existing rules, and the current game.
@@ -146,7 +146,7 @@
         <Toggle checked={s.capture_cursor} label="Show the mouse cursor" onchange={v => updateSettings({ capture_cursor: v })} />
       </div>
       <p class="foot">{#if estimate != null}Estimated {fmtBytes(estimate)} for {s.history_secs/3600} hours ({bitrate!=null?'measured current recording rate':'current resolution/FPS ceiling estimate'}). Budget: {s.buffer_cap_gb} GB. Content changes affect actual usage.{:else}Storage depends on source resolution, FPS and content. Archival storage cannot be predicted from a quality label.{/if}</p>
-      <p class="foot">Original H.264 packets are kept for history and saved clips. Capture is 8-bit SDR; RGB conversion prevents an end-to-end zero-loss claim. Archival 4:4:4 requires compatible playback software.</p>
+      <p class="foot">Original H.264 packets are kept for history and saved clips. Capture is 8-bit SDR; RGB conversion prevents an end-to-end zero-loss claim. The recording format remains H.264 SDR for broad compatibility.</p>
       {#if e}
         <p class="foot">Source arrivals {e.frames_captured} · video packets {e.frames_encoded} · missed recording ticks {e.frames_dropped} · ticks without a picture {e.frames_without_source} · repeated source samples {e.frames_repeated} · source arrivals not selected {e.source_frames_unselected}. Game frames never delivered by Windows cannot be counted here.</p>
       {/if}

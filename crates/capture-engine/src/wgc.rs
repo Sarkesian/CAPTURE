@@ -17,7 +17,7 @@ use windows::Graphics::SizeInt32;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows::Win32::Graphics::Dxgi::{IDXGIDevice,IDXGIOutput6};
+use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess};
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
@@ -200,7 +200,6 @@ impl Capture {
         Self::start_with_native(gpu,source,cursor,false)
     }
     pub fn start_native(gpu:&Gpu,source:Source,cursor:bool)->Result<Self,String> {
-        validate_native_color(gpu,&source)?;
         Self::start_with_native(gpu,source,cursor,true)
     }
     fn start_with_native(gpu:&Gpu,source:Source,cursor:bool,native:bool)->Result<Self,String> {
@@ -371,29 +370,6 @@ impl Capture {
     }
 }
 
-fn validate_native_color(gpu:&Gpu,source:&Source)->Result<(),String> {
-    use windows::Win32::Graphics::Gdi::{MonitorFromWindow,MONITOR_DEFAULTTONEAREST};
-    let monitor=match source {Source::Monitor(h)=>HMONITOR(*h as *mut _),Source::Window(h)=>unsafe{MonitorFromWindow(HWND(*h as *mut _),MONITOR_DEFAULTTONEAREST)}};
-    unsafe {
-        let adapter=gpu.device.cast::<IDXGIDevice>().and_then(|d|d.GetAdapter()).map_err(|e|format!("Cannot verify source color format: {e}"))?;
-        let mut index=0;
-        while let Ok(output)=adapter.EnumOutputs(index) {
-            index+=1;
-            if output.GetDesc().map(|d|d.Monitor==monitor).unwrap_or(false) {
-                let output=output.cast::<IDXGIOutput6>().map_err(|e|format!("Cannot verify source color format: {e}"))?;
-                let color=output.GetDesc1().map_err(|e|e.to_string())?.ColorSpace;
-                return validate_sdr_color(color);
-            }
-        }
-    }
-    Err("Cannot verify this display's color format on the capture GPU. Recording was not silently converted; multi-adapter color capture needs validation.".into())
-}
-
-fn validate_sdr_color(color:DXGI_COLOR_SPACE_TYPE)->Result<(),String> {
-    if color==DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 || color==DXGI_COLOR_SPACE_RGB_STUDIO_G22_NONE_P709 {Ok(())}
-    else {Err("This display uses HDR or an unsupported color space. The current recorder preserves 8-bit SDR only; recording has not been silently converted. HDR/10-bit preservation requires a different validated capture and encoding path.".into())}
-}
-
 impl Drop for Capture {
     fn drop(&mut self) {
         let _ = self.session.Close();
@@ -434,13 +410,6 @@ pub(crate) fn synthetic_latest(gpu:&Gpu,width:u32,height:u32,pixels:&[u8])->Late
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn unsupported_hdr_is_never_silently_treated_as_sdr() {
-        assert!(validate_sdr_color(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709).is_ok());
-        assert!(validate_sdr_color(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020).is_err());
-        assert!(validate_sdr_color(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709).is_err());
-    }
 
     #[test]
     fn size_transitions_never_publish_a_partial_surface() {

@@ -122,7 +122,7 @@
       <div class="field">
         <span class="grow">Quality</span>
         <Segmented label="Quality" value={s.quality}
-          options={[{ value: 'balanced', label: 'Balanced' }, { value: 'high', label: 'High' }, { value: 'maximum', label: 'Maximum' }, {value:'archival',label:'Archival 4:4:4'}] as { value: Quality; label: string }[]}
+          options={[{ value: 'balanced', label: 'Balanced' }, { value: 'high', label: 'High' }, { value: 'maximum', label: 'Maximum' }] as { value: Quality; label: string }[]}
           onchange={v => updateSettings({ quality: v })} />
       </div>
       <div class="field audio-full"><AudioSources /></div>

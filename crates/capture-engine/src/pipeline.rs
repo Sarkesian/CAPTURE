@@ -326,7 +326,7 @@ impl Pipeline {
             "started_unix_ms":crate::history::millis(),
             "game": s.game_name,
             "exe": s.exe,
-            "video": { "encoder": info.name, "width": info.width, "height": info.height, "fps": info.fps, "quality":s.quality,"capture_format":"BGRA8 SDR","encoded_chroma":if s.quality==Quality::Archival {"4:4:4"}else{"4:2:0"},"color":"BT.709 limited","rgb_bit_exact":false },
+            "video": { "encoder": info.name, "width": info.width, "height": info.height, "fps": info.fps, "quality":s.quality,"capture_format":"BGRA8 SDR","encoded_chroma":"4:2:0","color":"BT.709 limited","rgb_bit_exact":false },
             "audio_tracks": track_names,
             "segment_container": "mpegts",
         });

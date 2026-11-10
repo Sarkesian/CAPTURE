@@ -14,5 +14,6 @@ fn main() {
     let v: serde_json::Value = serde_json::from_str(&conf).expect("tauri.conf.json is JSON");
     println!("cargo:rustc-env=CAPTURE_VERSION={}", v["version"].as_str().expect("version"));
     println!("cargo:rerun-if-changed=tauri.conf.json");
+    println!("cargo:rerun-if-changed=../dist");
     tauri_build::build()
 }
