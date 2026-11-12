@@ -135,9 +135,10 @@
       <div class="filters"><select class="select" aria-label="Filter by game" bind:value={game} onchange={()=>count=60}><option value="">All games</option>{#each games as g (g)}<option value={g}>{g}</option>{/each}</select>
       <label class="search"><Icon name="search" size={16}/><input class="input" type="search" placeholder="Search library" aria-label="Search library" bind:value={query} oninput={()=>count=60}/></label></div>
     </div>
-    {#if (showBackground && background.length) || shown.length}
-      <div class="grid" aria-label="Recordings, clips and screenshots">
-        {#if showBackground}
+    {#if showBackground && background.length}
+      <section aria-label="Background recordings">
+        <div class="section-head"><h2>Background recordings</h2><span class="temp">Temporary</span><span class="section-note">{app.history?.reason ?? 'Your most recent gameplay, kept automatically. Open one and clip what you want to keep.'}</span></div>
+        <div class="grid">
           {#each background as g (g.name)}
             {@const image = cover(g.name)}
             {@const key = 'game:'+g.name}
@@ -161,7 +162,13 @@
               <div class="card-text"><strong title={g.name}>{g.name}</strong><small>Background recording · {date(g.latest.created_ms)}{g.clips?` · ${g.clips} clip${g.clips===1?'':'s'} saved`:''}</small></div>
             </article>
           {/each}
-        {/if}
+        </div>
+      </section>
+    {/if}
+    {#if shown.length}
+      <section aria-label="Saved media">
+        <div class="section-head"><h2>{app.libraryFilter==='clips'?'Saved clips':app.libraryFilter==='screenshots'?'Screenshots':app.libraryFilter==='recordings'?'Saved recordings':'Saved media'}</h2></div>
+        <div class="grid">
           {#each shown.slice(0,count) as c (c.path)}
             <article class="saved-card" class:open={menu===c.path}>
               <div class="cover">
@@ -192,8 +199,8 @@
             </article>
           {/each}
       </div>
-      {#if shown.length>count}<button class="btn more-items" onclick={()=>count+=60}>Show more</button>{/if}
-      {#if showBackground && background.length}<p class="legend"><span class="temp">Temporary</span> {app.history?.reason ?? 'Background recordings keep your most recent gameplay automatically. Open one and clip what you want to keep; everything else here is saved for good.'}</p>{/if}
+        {#if shown.length>count}<button class="btn more-items" onclick={()=>count+=60}>Show more</button>{/if}
+      </section>
     {/if}
     {#if !shown.length && (!showBackground || !background.length)}
       <div class="empty"><Icon name="library" size={34}/><h2>{!loaded || (showBackground&&!app.history)?'Loading your Library…':game||query?'Nothing matches':'Nothing here yet'}</h2><p>{game||query?'Try another game or search.':'Play a game with recording on: your sessions appear here, and so does everything you clip or screenshot.'}</p>{#if game||query}<button class="btn" onclick={()=>{game='';query='';}}>Clear filters</button>{/if}</div>
@@ -206,10 +213,9 @@
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(188px,1fr));gap:12px}.saved-card{min-width:0;border:1px solid var(--line);border-radius:9px;background:var(--surface);color:var(--text);text-align:left;position:relative}.saved-card:hover{border-color:var(--accent)}.cover{position:relative;aspect-ratio:16/9;display:block;background:var(--surface-2);border-radius:8px}.cover>img,.tile>img{width:100%;height:100%;object-fit:cover;position:absolute;inset:0;border-radius:inherit}.fallback{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;gap:12px;padding:12px;color:#e3edf9;border-radius:inherit;background:radial-gradient(ellipse at 85% 10%,hsl(var(--cover-hue) 55% 35%),transparent 67%),linear-gradient(125deg,hsl(var(--cover-hue) 40% 23%),#111927 75%)}.fallback b{font-size:clamp(13px,1.3vw,20px);overflow:hidden;text-overflow:ellipsis}.tag,.duration{position:absolute;top:7px;display:flex;align-items:center;gap:5px;padding:3px 6px;border-radius:4px;background:#10151de8;color:#f0f5fc;font-size:10px;pointer-events:none;white-space:nowrap}.tag{left:7px}.duration{right:7px;font-variant-numeric:tabular-nums}.card-text{position:absolute;inset:auto 0 0;display:flex;flex-direction:column;gap:2px;padding:21px 10px 9px;min-width:0;color:#f0f5fc;background:linear-gradient(transparent,#0c111ae8 45%,#0c111a);border-radius:0 0 8px 8px;opacity:0;pointer-events:none;transition:opacity 110ms ease}.saved-card .tag,.saved-card .duration{opacity:0}.saved-card:is(:hover,:focus-within,.open) :is(.tag,.duration){opacity:1}.saved-card .duration{right:40px}.card-text strong{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.card-text small{font-size:11px;color:#c4ceda;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.card-text input{height:26px;width:100%;pointer-events:auto}
   .tile{position:absolute;inset:0;border:0;padding:0;border-radius:inherit;background:transparent;cursor:pointer;overflow:hidden}.tile-play{position:absolute;inset:0;display:grid;place-items:center;background:#0005;color:white;opacity:0}.tile:hover .tile-play,.tile:focus-visible .tile-play{opacity:1}.more{position:absolute;right:6px;top:6px;display:grid;place-items:center;width:28px;height:28px;border:0;border-radius:5px;background:#10151de8;color:white;cursor:pointer;opacity:0}.saved-card:hover .more,.saved-card:focus-within .more,.saved-card.open .more{opacity:1}.menu{position:absolute;z-index:10;right:6px;top:39px;min-width:180px;display:flex;flex-direction:column;padding:4px;background:var(--surface-3);border:1px solid var(--line-strong);border-radius:7px;box-shadow:var(--shadow-pop)}.menu button{border:0;padding:7px 9px;border-radius:4px;background:none;color:var(--text);text-align:left;cursor:pointer}.menu button:hover{background:var(--surface-2)}.menu .danger{color:var(--danger)}.more-items{margin-top:12px}
   .empty{display:grid;justify-items:center;gap:12px;padding:54px 16px;color:var(--text-2);text-align:center}.empty h2{font-size:18px;color:var(--text)}.viewer{display:flex;flex-direction:column;gap:0;min-height:450px;height:100vh}.viewer-header{display:grid;grid-template-columns:1fr minmax(0,2fr) 1fr;min-height:48px;padding:0 12px;border-bottom:1px solid var(--line);background:var(--chrome)}.viewer-header>button:first-child{justify-self:start}.viewer-header>button:last-child:not(:first-child){justify-self:end}.viewer-title{min-width:0;text-align:center}.viewer-title h1{font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.viewer-title p{margin:0;font-size:12px}.saved-stage{flex:1;min-height:0;display:grid;place-items:center;background:#080a0e;overflow:hidden}.saved-stage video,.saved-stage img{width:100%;height:100%;min-height:0;object-fit:contain}
-  .saved-card{overflow:visible}.saved-card .cover{border-radius:8px 8px 0 0}.saved-card .card-text{position:static;opacity:1;pointer-events:auto;background:none;color:var(--text);padding:8px 10px 9px;border-radius:0}.saved-card .card-text small{color:var(--text-2)}
-  .saved-card .tag,.saved-card .duration{opacity:1}.saved-card .duration{right:7px;top:auto;bottom:7px}.rec .tag.now{color:#fff;background:var(--danger)}.rec .dot{width:6px;height:6px;border-radius:50%;background:#fff}
+  .saved-card:is(:hover,:focus-within,.open) .card-text{opacity:1}.saved-card .card-text{z-index:2}.rec .tag{opacity:1}.rec .tag.now{color:#fff;background:var(--danger)}.rec .dot{width:6px;height:6px;border-radius:50%;background:#fff}
   .rec .cover>img{z-index:0}.rec .tile{z-index:1}.saved-card .tag,.saved-card .duration,.saved-card .more,.saved-card .menu{z-index:2}.menu{z-index:10!important}
-  .rec{border-color:color-mix(in srgb,var(--accent) 45%,var(--line))}.rec .tag{color:#a9d0ff}.legend{display:flex;align-items:center;gap:8px;margin-top:2px;color:var(--text-2);font-size:12px}
+  .rec{border-color:color-mix(in srgb,var(--accent) 45%,var(--line))}.rec .tag{color:#a9d0ff}.section-head{display:flex;align-items:center;gap:12px;margin-bottom:10px}.section-head h2{font-size:16px;font-weight:650}.section-note{margin-left:auto;color:var(--text-2);font-size:12px;text-align:right;min-width:0}
   .menu-note{margin:0;padding:2px 9px 7px;font-size:11px;color:var(--text-2);max-width:200px}.menu button:disabled{opacity:.45;cursor:default}
   @media(max-width:850px){.library{gap:17px}.heading h1{font-size:26px}.grid{grid-template-columns:repeat(auto-fill,minmax(164px,1fr));gap:9px}.search input{width:145px}}
   @media(prefers-reduced-motion:reduce){.card-text{transition:none}}

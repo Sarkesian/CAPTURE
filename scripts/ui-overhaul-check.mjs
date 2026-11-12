@@ -68,13 +68,21 @@ try {
 
   // ---- Library: one grid, games side by side ---------------------------------------------------
   await wait('window.fixtureReady && document.querySelectorAll(".rec").length===2', 'game cards');
-  check(await js('document.querySelectorAll(".grid").length===1 && document.querySelectorAll(".grid > .saved-card").length===4'), 'one grid holds the background recordings and the saved media');
-  check(await js('new Set([...document.querySelectorAll(".grid > .saved-card")].map(c=>Math.round(c.getBoundingClientRect().top))).size===1'), 'games and saved media sit side by side, not stacked');
+  check(await js('document.querySelectorAll("section .grid").length===2 && document.querySelectorAll("section[aria-label=\\"Background recordings\\"] .rec").length===2 && document.querySelectorAll("section[aria-label=\\"Saved media\\"] .saved-card:not(.rec)").length===2'), 'two sections: background recordings (one per game), then saved media');
+  check(await js('[...document.querySelectorAll("section .grid")].every(g=>new Set([...g.children].map(c=>Math.round(c.getBoundingClientRect().top))).size===1)'), 'cards sit side by side within each section');
   check(await js('[...document.querySelectorAll(".rec .card-text strong")].map(e=>e.textContent).join("|")') === 'Hollow Knight|The Witcher 3', 'one background-recording card per game, most recently played first');
   check(await js(`${card('The Witcher 3')}.querySelector('.duration').textContent.trim()`) === '2h 28m', 'a game\'s card shows all of its recorded time');
   await wait('document.querySelectorAll(".rec .thumb img").length===2', 'game thumbnails');
   check(await js('new Set([...document.querySelectorAll(".rec .thumb img")].map(i=>i.src)).size===2'), 'each card shows a frame of its own footage');
-  check(await js('[...document.querySelectorAll(".saved-card .card-text")].every(e=>getComputedStyle(e).opacity==="1" && e.innerText.trim().length>5)'), 'names, dates and durations are readable without hovering');
+  check(await js('[...document.querySelectorAll(".saved-card .card-text")].every(e=>getComputedStyle(e).opacity==="0") && [...document.querySelectorAll(".saved-card:not(.rec) .tag")].every(e=>getComputedStyle(e).opacity==="0")'), 'thumbnails are clean at rest: no name, time or type over them');
+  check(await js('[...document.querySelectorAll(".rec .tag")].every(e=>getComputedStyle(e).opacity==="1")'), 'background recordings keep their Background tag');
+  const tile = await rect('section[aria-label="Saved media"] .saved-card');
+  await mouse('mouseMoved', tile.x + tile.w / 2, tile.y + tile.h / 2);
+  await sleep(220);
+  check(await js('(()=>{const c=document.querySelector("section[aria-label=\\"Saved media\\"] .saved-card");return getComputedStyle(c.querySelector(".card-text")).opacity==="1" && getComputedStyle(c.querySelector(".tag")).opacity==="1"})()') && (await rect('section[aria-label="Saved media"] .saved-card')).h === tile.h, 'hovering shows name, time and type without moving the card');
+  await shot('library-hover');
+  await mouse('mouseMoved', 5, 5);
+  await sleep(200);
   check(await js(`${card('Hollow Knight')}.querySelector('.now').textContent.includes('Recording') && document.body.innerText.includes('Temporary')`), 'what is being recorded is marked, and temporary footage is told apart from saved media');
   await shot('library');
 

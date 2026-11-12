@@ -72,9 +72,10 @@ Settings → Audio → **Create separate audio files for editors** to get them a
 each WAV track takes about 12× the space of the same track inside the MP4).
 
 ## Library
-One grid: a **Background Recording** card per game (temporary: the most recent gameplay, kept
-automatically up to your history length and storage limit), then your saved clips, recordings and
-screenshots, with search, a game filter and a type filter. Click a card to open it. The **…** menu on
+Two sections. **Background recordings**: one card per game (temporary: the most recent gameplay, kept
+automatically up to your history length and storage limit). **Saved media**: your clips, recordings and
+screenshots, with search, a game filter and a type filter. Thumbnails are shown clean; hover a card for
+its name, date and type. Click a card to open it. The **…** menu on
 saved media: Show in folder, Save a copy, Open externally, Copy path, Editor audio files, Rename, and
 Delete (to the Recycle Bin, after confirmation). On a background recording: **Delete footage**, which
 removes only that game's temporary footage; clips and screenshots you saved are kept.
