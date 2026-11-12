@@ -30,7 +30,7 @@ static NEXT: AtomicU64 = AtomicU64::new(1);
 static STORES: OnceLock<Mutex<HashMap<PathBuf, Weak<Catalog>>>> = OnceLock::new();
 
 /// Playback windows: a seek opens a short one (ready fast), playback continues in long ones.
-pub const QUICK_SECS: f64 = 8.0;
+pub const QUICK_SECS: f64 = 4.0;
 pub const QUICK_BYTES: u64 = 32 * 1024 * 1024;
 pub const WINDOW_SECS: f64 = 30.0;
 pub const WINDOW_BYTES: u64 = 96 * 1024 * 1024;
@@ -40,6 +40,8 @@ pub const WINDOW_BYTES: u64 = 96 * 1024 * 1024;
 pub const PREVIEW_BUDGET: u64 = 512 * 1024 * 1024;
 const PREVIEW_KEEP: usize = 6;
 const PREVIEW_IDLE_MS: u64 = 10 * 60 * 1000;
+/// How long a released window survives housekeeping, so a player still reading it is safe.
+const PREVIEW_RELEASE_GRACE_MS: u64 = 60 * 1000;
 /// A break shorter than this between two recordings of the same game continues the session.
 pub const SESSION_GAP_MS: i64 = 15 * 60 * 1000;
 const THUMB_WIDTH: i32 = 320;
@@ -696,9 +698,12 @@ impl Catalog {
     }
 
     /// A viewer is done with a window. Windows stay cached for the next seek; this only makes
-    /// the window the first to go when room is needed.
+    /// the window the first to go when room is needed. It is not made idle at once: a player
+    /// that is still reading it (it does not keep the file open between reads) must not have it
+    /// deleted underneath it by the next housekeeping pass.
     pub fn release_preview(&self, path: &str) {
-        let _ = self.db.lock().unwrap().execute("UPDATE previews SET used=0 WHERE path=?1", [path]);
+        let grace = self.clock.load(Ordering::SeqCst).max(millis()).saturating_sub(PREVIEW_IDLE_MS - PREVIEW_RELEASE_GRACE_MS);
+        let _ = self.db.lock().unwrap().execute("UPDATE previews SET used=MIN(used,?2) WHERE path=?1", params![path, grace as i64]);
     }
 
     // ---- Thumbnails -----------------------------------------------------------------------

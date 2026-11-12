@@ -33,6 +33,15 @@ pub unsafe fn opt(obj: *mut std::ffi::c_void, key: &str, val: &str) -> Result<()
     Ok(())
 }
 
+/// Make `avformat_find_stream_info` on one of CAPTURE's own 2 s recording segments cheap: the
+/// stream layout and codec parameters are in the first packets (every segment starts on a
+/// keyframe), so the frame-rate probe (which reads and decodes ~20 frames) and a long analysis
+/// window only cost time. For Replay previews; saved clips keep the full probe.
+pub unsafe fn quick_probe(ic: *mut ff::AVFormatContext) {
+    let _ = opt(ic as *mut std::ffi::c_void, "fpsprobesize", "0");
+    let _ = opt(ic as *mut std::ffi::c_void, "analyzeduration", "300000");
+}
+
 pub unsafe fn dict_set(d: *mut *mut ff::AVDictionary, k: &str, v: &str) {
     ff::av_dict_set(d, cstr(k).as_ptr(), cstr(v).as_ptr(), 0);
 }

@@ -7,8 +7,10 @@
   import { viewer } from '../lib/store.svelte';
 
   type Edge = 'a' | 'b';
+  /** Width of the break between two stretches of footage, at every zoom (like a seam, not a span of time). */
+  const BREAK_PX = 3;
   type DragMode = 'scrub' | 'pan' | Edge;
-  let { locate, clockAt, wallAt, labels = [], first, last, intervals, events, clips = [], position, selection = $bindable(null), view = $bindable(),
+  let { locate, clockAt, wallAt, labels = [], first, last, intervals, seams = [], events, clips = [], position, selection = $bindable(null), view = $bindable(),
     editable = true, onseek, onevent, ontrim, onstep }: {
     /** Timeline time to the session and session time there (null where nothing was recorded). */
     locate: (time: number) => { session: string; t: number } | null;
@@ -17,6 +19,8 @@
     /** Where each gameplay session begins. */
     labels?: { t: number; text: string }[];
     first: number; last: number; intervals: [number, number][]; events: TimelineEvent[];
+    /** Per interval: a break follows it (drawn a fixed few pixels wide, whatever the zoom). */
+    seams?: boolean[];
     /** Clips already saved from this session (shown at their place on the timeline). */
     clips?: TimelineEvent[];
     position: number; selection: Range | null; view: Range;
@@ -219,10 +223,11 @@
       onpointerdown={event => start(event, 'scrub')} onpointermove={move} onpointerleave={clearHover}
       onpointerup={event => finish(event)} onpointercancel={event => finish(event, true)} onlostpointercapture={event => finish(event, true)}>
       <div class="footage-lane">
-        {#each intervals as [a,b]}
+        {#each intervals as [a,b], i}
           {#if b > view.a && a < view.b}
-            <div class="footage" style:left="{pct(a)}%" style:width="{pct(b)-pct(a)}%"></div>
-            {#if !selection && position > a}<div class="played" style:left="{pct(a)}%" style:width="{pct(Math.min(b,position))-pct(a)}%"></div>{/if}
+            {@const cut = seams[i] && b <= view.b ? BREAK_PX : 0}
+            <div class="footage" style:left="{pct(a)}%" style:width="max(1px, calc({pct(b)-pct(a)}% - {cut}px))"></div>
+            {#if !selection && position > a}<div class="played" style:left="{pct(a)}%" style:width="max(0px, calc({pct(Math.min(b,position))-pct(a)}% - {position >= b ? cut : 0}px))"></div>{/if}
           {/if}
         {/each}
         {#if selection}
@@ -283,8 +288,7 @@
   .timeline { position: relative; flex: none; padding: 0 18px; background: var(--surface); }
   .seek-strip { position: relative; height: 58px; margin-top: 4px; }
   .detail { position: absolute; inset: 0; touch-action: none; cursor: crosshair; user-select: none; }
-  .footage-lane { position: absolute; inset: 21px 0 auto; height: 9px; overflow: hidden; border-radius: 3px;
-    background: repeating-linear-gradient(135deg, var(--bg) 0 4px, var(--surface-3) 4px 5px); }
+  .footage-lane { position: absolute; inset: 21px 0 auto; height: 9px; overflow: hidden; border-radius: 3px; background: transparent; }
   .footage, .played, .dim, .clip-range { position: absolute; height: 100%; }
   .footage { background: color-mix(in srgb, var(--accent) 34%, var(--surface-3)); min-width: 1px; }
   .played { background: color-mix(in srgb, var(--accent) 80%, var(--surface)); }

@@ -1,10 +1,11 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { convertFileSrc } from '@tauri-apps/api/core';
-  import { app, cancelPendingReview, engine, fmtDuration, historyFrames, historyReview, releaseReview, saveTrim, toast } from '../lib/store.svelte';
+  import { app, cancelPendingReview, engine, fmtDuration, historyFrames, historyReview, releaseLater, releaseReview, saveTrim, toast } from '../lib/store.svelte';
   import type { FrameTiming, HistorySession, TimelineEvent } from '../lib/types';
   import { clamp, clock, containing, fitView, selectionAround, validSelection, zoomView, type Range } from '../lib/timeline';
-  import { buildLine, emptyLine, footage, toLine, toReal, wallClock, type GameLine } from '../lib/gameline';
+  import { cachedThumb } from '../lib/thumbs';
+  import { buildLine, emptyLine, seams, footage, toLine, toReal, wallClock, type GameLine } from '../lib/gameline';
   import ReplayTimeline from '../components/ReplayTimeline.svelte';
   import Icon from '../components/Icon.svelte';
   // `gameName`: the game whose recording history to open (otherwise the one being recorded, else the most recent).
@@ -36,6 +37,8 @@
   let markerName = $state('');
   let saving = $state(false);
   let focusedEvent = $state('');
+  /** Play the clip selection over and over while trimming. */
+  let loop = $state(false);
   let pending = $state<{ t: number; play: boolean } | null>(null);
   let prefetchedFor = '';
   let seekTimer: ReturnType<typeof setTimeout> | undefined;
@@ -89,6 +92,12 @@
   const zoomed = $derived(view.b-view.a < last-first-.001);
   const title = (ev: TimelineEvent) => ev.label || (ev.kind==='screenshot'?'Screenshot':'Marker');
   const available = (t: number) => !!containing(intervals,t);
+  // While a moment opens, the picture already seen there (the hover preview) stands in for it.
+  const poster = $derived.by(() => {
+    if(!pending && !app.reviewLoading)return null;
+    const at=real(pending?.t ?? position);
+    return at ? (cachedThumb(at.session,at.t,true) ?? cachedThumb(at.session,at.t,false))?.image ?? null : null;
+  });
   onMount(() => {
     engine('history');
     const timer = setInterval(() => engine('history'), 2500);
@@ -153,8 +162,10 @@
     position=at;pending={t:at,play:false};open(at);
   }
   function pause() { video?.pause();paused=true;if(pending)pending={...pending,play:false}; }
+  /** Playing, or about to once the moment being opened is ready. */
+  const playing = () => !paused || !!pending?.play;
   function seek(t: number, play=false) {
-    stepGeneration++;
+    stepGeneration++;resumeLoop=false;
     clearTimeout(seekTimer);cancelAnimationFrame(seekFrame);t=clamp(t,first,Math.max(first,last-.0001));pause();position=t;focusedEvent='';
     if(!available(t)) {
       // A click in a gap lands on the nearest recorded moment instead of on nothing.
@@ -164,7 +175,8 @@
     }
     error='';
     if(rv && t>=rv.start && t<rv.end-.0001 && video?.readyState>=1 && !app.reviewLoading) {
-      pending=null;video.currentTime=t-rv.start;if(play)video.play().catch(()=>{});return;
+      // `paused` is bound to the player: left true here, the binding would pause it again right after play().
+      pending=null;video.currentTime=t-rv.start;if(play){paused=false;video.play().catch(()=>{});}return;
     }
     pending={t,play};prefetchedFor='';open(t);
   }
@@ -183,7 +195,7 @@
       const next = delta > 0 ? intervals.find(([a]) => a > position)?.[0] : [...intervals].reverse().find(([, b]) => b <= position)?.[1];
       t = next === undefined ? (delta > 0 ? (intervals.at(-1)?.[1] ?? last) - .05 : intervals[0]?.[0] ?? first) : delta > 0 ? next : next - Math.min(-delta, 5);
     }
-    seek(t, !paused);
+    seek(t, playing());
   }
   function scrub(t: number, final: boolean) {
     pause();
@@ -209,6 +221,16 @@
     position=rv.start+video.currentTime;pending=null;
     if(target?.play)video.play().catch(()=>{});
   }
+  // A window that cannot be read (its file went away) is rebuilt once, quietly, before saying so.
+  let retriedPath = '';
+  function playbackError() {
+    const path=rv?.path;
+    if(path && retriedPath!==path) {
+      retriedPath=path;const at=position,play=!!pending?.play;
+      releaseReview();pending={t:at,play};open(at);return;
+    }
+    error='This moment could not be played. Try again, or clip it: the recording itself is intact.';
+  }
   function toggle() {
     if(!rv || error || app.reviewLoading){seek(position,true);return;}
     if(video?.paused)video.play().catch(()=>{});else pause();
@@ -218,12 +240,40 @@
     const interval=intervals.find(([,b])=>b>rv.end+.1);
     return interval ? Math.max(rv.end,interval[0]) : null;
   }
+  // Looping is checked on every presented frame (timeupdate only fires ~4 times a second), and
+  // jumps back one frame before the out point so the frame after it is never shown.
+  $effect(() => {
+    const v=video, sel=selection, r=rv;
+    if(!loop || !sel || !v || !r || paused)return;
+    // The range changed under the playhead: start over from its new In point.
+    if(untrack(()=>position)<sel.a-.001 || untrack(()=>position)>=sel.b){queueMicrotask(()=>seek(sel.a,true));return;}
+    let id=0, done=false, prev=-1, jumped=false;
+    const check=(_: number, meta: VideoFrameCallbackMetadata)=>{
+      if(done)return;
+      // The spacing between presented frames: the next frame would be about that far ahead.
+      const step=prev>=0 && meta.mediaTime>prev ? Math.min(meta.mediaTime-prev,.1) : 0;
+      prev=meta.mediaTime;
+      const past=r.start+meta.mediaTime+step>=sel.b-.0005;
+      // Jump once per pass; frames still shown from before the jump landed are not a second pass.
+      if(past && !jumped){jumped=true;prev=-1;seek(sel.a,true);}
+      else if(!past)jumped=false;
+      if(!done)id=v.requestVideoFrameCallback(check);
+    };
+    id=v.requestVideoFrameCallback(check);
+    return ()=>{done=true;v.cancelVideoFrameCallback(id);};
+  });
   function advance() {
-    const at=nextWindow();if(at==null){paused=true;return;}
-    if(app.nextReview?.session===selected && app.nextReview.start<=at+.1 && app.nextReview.end>at) {
+    const at=nextWindow();
+    // A playback window is shorter than most clips: loop only when this one reaches the Out
+    // point (or nothing follows it), otherwise carry on into the next window.
+    if(loop && selection && (at==null || !rv || rv.end>=selection.b-.1)){seek(selection.a,true);return;}
+    if(at==null){paused=true;return;}
+    // The prefetched window is in session time; the playhead is in line time.
+    const queued=app.nextReview, queuedAt=queued ? toLine(line,queued.session,queued.start) : null;
+    if(queued && queuedAt!==null && queuedAt<=at+.1 && queuedAt+(queued.end-queued.start)>at) {
       const old=rv;video?.pause();pending={t:at,play:true};position=at;
-      app.review=app.nextReview;app.nextReview=null;prefetchedFor='';
-      if(old)setTimeout(()=>engine('release_review',{path:old.path}),300);
+      app.review=queued;app.nextReview=null;prefetchedFor='';
+      if(old)releaseLater(old.path);
     }else seek(at,true);
   }
   function timeupdate() {
@@ -296,10 +346,18 @@
     selection={a,b};
   }
 
+  /** Looping playback stopped by a handle edit, to pick up again over the new range. */
+  let resumeLoop=false;
   function trimDrag(active: boolean) {
     dragging=active;
-    if (active) { pause();trimGeneration++;aligning=false;trimMessage=''; }
-    else alignSelection();
+    if (active) { resumeLoop ||= loop && playing();pause();trimGeneration++;aligning=false;trimMessage=''; }
+    // Restart once the handles have snapped to real frames, so the loop begins at the true In point.
+    else alignSelection().then(restartLoop);
+  }
+  function restartLoop() {
+    if(!resumeLoop || dragging || !alive)return;
+    resumeLoop=false;
+    if(loop && selection)seek(selection.a,true);
   }
 
   function cancelTrim() {
@@ -309,28 +367,32 @@
     aligning=false;
     dragging=false;
     trimMessage='';
+    resumeLoop=false;
   }
 
   async function stepFrame(direction: number, edge?: 'a'|'b') {
     if (edge && (!selection || dragging || saving)) return;
+    if (edge) resumeLoop ||= loop && playing();
     pause();
     const generation=++stepGeneration;
     const edit=trimGeneration;
     const id=selected;
     const at=edge ? selection![edge] : position;
     const interval=containing(intervals,edge==='b'?at-.000001:at);
-    if(!interval)return;
+    // A handle that cannot move further still gives the loop back.
+    if(!interval){if(edge)restartLoop();return;}
     const frames=await framesAt(at);
     if (!alive || generation!==stepGeneration || id!==selected || (edge && edit!==trimGeneration)) return;
     const times=frames.filter(frame=>frame.start>=interval[0]-.000001 && frame.end<=interval[1]+.05 && (edge!=='a'||frame.key))
       .map(frame=>edge==='b'?frame.end:frame.start);
     const index=times.findLastIndex(t=>t<=at+.000001);
     const next=times[index+direction];
-    if(next===undefined)return;
-    if (!edge) { seek(next,false);return; }
-    if (!selection || (edge==='a' ? next>=selection.b : next<=selection.a)) return;
-    selection={...selection,[edge]:next};
-    alignSelection();
+    if (!edge) { if(next!==undefined)seek(next,false);return; }
+    if (next!==undefined && selection && (edge==='a' ? next<selection.b : next>selection.a)) {
+      selection={...selection,[edge]:next};
+      await alignSelection();
+    }
+    restartLoop();
   }
 
   function setEdge(edge:'a'|'b') {
@@ -395,9 +457,10 @@
       {#if rv}
         {#key rv.path}
           <!-- svelte-ignore a11y_media_has_caption -->
-          <video bind:this={video} src={convertFileSrc(rv.path)} preload="auto" {muted} bind:volume bind:paused onloadedmetadata={loaded} onended={advance} ontimeupdate={timeupdate} onclick={toggle} ondblclick={fullscreen} onerror={()=>error='This moment could not be played. Try again, or clip it: the recording itself is intact.'}></video>
+          <video bind:this={video} src={convertFileSrc(rv.path)} preload="auto" {muted} bind:volume bind:paused onloadedmetadata={loaded} onended={advance} ontimeupdate={timeupdate} onclick={toggle} ondblclick={fullscreen} onerror={playbackError}></video>
         {/key}
       {:else}<div class="stage-empty"><span>▷</span><p>{intervals.length?(error?'Footage unavailable':'Opening gameplay…'):'Video no longer kept'}</p><p class="small muted">{selected}</p></div>{/if}
+      {#if poster}<img class="poster" src={poster} alt="" />{/if}
       {#if app.reviewLoading}<span class="busy" role="status">Opening moment…</span>{/if}
       {#if error}<div class="stage-message" role="status">{error}</div>{/if}
     </div>
@@ -411,7 +474,7 @@
           {/if}
         </div>
       {/if}
-      <ReplayTimeline bind:this={timeline} locate={real} clockAt={foot} wallAt={v=>wallClock(line,v)} {labels} {first} {last} {intervals} {events} {clips} {position}
+      <ReplayTimeline bind:this={timeline} locate={real} clockAt={foot} wallAt={v=>wallClock(line,v)} {labels} {first} {last} {intervals} seams={seams(line)} {events} {clips} {position}
         bind:selection bind:view editable={!saving} onseek={scrub} onevent={eventClick} ontrim={trimDrag}
         onstep={(edge,direction)=>stepFrame(direction,edge)} />
       <div class="transport">
@@ -446,6 +509,9 @@
         </div>
         <div class="transport-end">
           {#if selection}
+            <button class="btn ghost sm" title="Go to the clip start" aria-label="Go to clip start" onclick={()=>selection&&seek(selection.a,playing())}>⇤ In</button>
+            <button class="btn ghost sm" title="Go to the clip end" aria-label="Go to clip end" onclick={()=>selection&&seek(Math.max(selection.a,selection.b-.05),false)}>Out ⇥</button>
+            <button class="btn ghost sm" class:active={loop} aria-pressed={loop} title="Loop the clip" onclick={()=>{loop=!loop;if(loop&&selection&&(position<selection.a||position>=selection.b))seek(selection.a,playing());}}>⟲ Loop</button>
             <output class="selected-duration" aria-label="Clip duration" title={'In '+clock(foot(selection.a),3)+' · Out '+clock(foot(selection.b),3)}>{(selection.b-selection.a).toFixed(3)}s</output>
             <button class="btn ghost cancel" aria-label="Cancel clip" disabled={saving} onclick={cancelTrim}>Cancel</button>
             <button class="btn primary" disabled={!valid||saving||dragging||aligning} onclick={save}>{saving?'Saving…':'Save Clip'}</button>
@@ -473,8 +539,9 @@
   .volume{width:72px;accent-color:var(--accent)}
   .stage{flex:1;min-height:220px;position:relative;overflow:hidden;isolation:isolate;background:#080a0e;}
   .stage video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;display:block;cursor:pointer}.stage:fullscreen{border:0;border-radius:0}
+  .poster{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;pointer-events:none;z-index:1}
   .stage-empty{position:absolute;inset:0;display:grid;place-content:center;justify-items:center;gap:5px;color:#a4abb8}.stage-empty>span{font-size:34px;color:#727a89}
-  .busy,.stage-message{position:absolute;background:#1c2027ed;color:#e8ebf0;border-radius:7px;padding:8px 12px;font-size:12px}.busy{top:12px;right:12px}.stage-message{bottom:12px;left:12px;right:12px;text-align:center}
+  .busy,.stage-message{position:absolute;background:#1c2027ed;color:#e8ebf0;border-radius:7px;padding:8px 12px;font-size:12px}.busy{top:12px;right:12px;z-index:2}.stage-message{bottom:12px;left:12px;right:12px;text-align:center}
   .viewer-dock { position: relative; flex: none; background: var(--surface); }
   .transport { display: grid; grid-template-columns: minmax(0,1fr) auto minmax(0,1fr); gap: 6px; align-items: center; padding: 0 14px 8px; }
   .viewer-tools, .playback, .transport-end { display: flex; gap: 3px; align-items: center; }

@@ -29,11 +29,25 @@ impl Drop for Input {
 }
 
 unsafe fn open_input(p: &Path) -> Result<Input, String> {
-    let mut ic = null_mut();
-    check(ff::avformat_open_input(&mut ic, av::cstr(&p.to_string_lossy()).as_ptr(), null(), null_mut()), "open segment")?;
-    let ic = Input(ic);
+    open_probed(p, false)
+}
+
+/// `quick`: a light probe (see `av::quick_probe`), for Replay playback windows.
+unsafe fn open_probed(p: &Path, quick: bool) -> Result<Input, String> {
+    let ic = open_raw(p)?;
+    if quick {
+        av::quick_probe(ic.0);
+    }
     check(ff::avformat_find_stream_info(ic.0, null_mut()), "read segment")?;
     Ok(ic)
+}
+
+/// Opened without any probing: enough to copy packets when the stream layout is already known
+/// (MPEG-TS declares its streams up front).
+unsafe fn open_raw(p: &Path) -> Result<Input, String> {
+    let mut ic = null_mut();
+    check(ff::avformat_open_input(&mut ic, av::cstr(&p.to_string_lossy()).as_ptr(), null(), null_mut()), "open segment")?;
+    Ok(Input(ic))
 }
 
 /// `segments`: (path, timeline start secs) in order; the first starts on a keyframe at timeline
@@ -87,7 +101,7 @@ fn write_clip(
             return Err(e);
         }
     };
-    let verified = verify(&partial, track_names.len() as u32);
+    let verified = verify_with(&partial, track_names.len() as u32, !faststart);
     let res = match verified {
         Ok(mut v) => {
             if aligned && (v.duration_secs - (clip_end - actual_start)).abs() > 0.004 {
@@ -222,7 +236,10 @@ pub fn pick_origin(keys: &[i64], want: i64) -> Option<i64> {
 /// audio at or after the clip's first frame is used; its video is never.
 unsafe fn remux_inner(segments: &[(PathBuf, f64)], lead_in: Option<&Path>, seg0_start: f64, want_start: f64, clip_end: f64, names: &[String], out: &Path, aligned: bool, faststart: bool) -> Result<f64, String> {
     let first = segments.first().ok_or("No footage in the buffer yet")?;
-    let ic0 = open_input(&first.0)?;
+    // A playback window (no faststart) is for looking at, not keeping: probe lightly, and copy
+    // the following segments without probing them at all when their layout matches.
+    let quick = !faststart;
+    let ic0 = open_probed(&first.0, quick)?;
     let n = (*ic0.0).nb_streams as usize;
 
     let cpath = av::cstr(&out.to_string_lossy());
@@ -309,7 +326,8 @@ unsafe fn remux_inner(segments: &[(PathBuf, f64)], lead_in: Option<&Path>, seg0_
     let span = (end_pts - origin_pts) as f64 * vtb.num as f64 / vtb.den as f64;
     let inputs = lead_in.map(|p| (p.to_path_buf(), true)).into_iter().chain(segments.iter().map(|(p, _)| (p.clone(), false)));
     for (path, audio_only) in inputs {
-        let ic = match open_input(&path) {
+        let raw = if quick { open_raw(&path).ok().filter(|ic| (*ic.0).nb_streams as usize == n) } else { None };
+        let ic = match raw.map(Ok).unwrap_or_else(|| open_input(&path)) {
             Ok(ic) => ic,
             Err(e) => return Err(format!("A required recording segment could not be read: {e}. Original footage has been retained.")),
         };
@@ -379,10 +397,19 @@ mod tests {
 /// Independent re-open of the written file: stream layout, labels, duration, and that the
 /// first video packet is a keyframe. Nothing is called "Saved" unless this passes.
 pub fn verify(path: &Path, expected_audio: u32) -> Result<ClipResult, String> {
+    verify_with(path, expected_audio, false)
+}
+
+/// `quick`: a playback window just written by us, whose MP4 header already says everything
+/// checked here; only a light probe (see `av::quick_probe`).
+fn verify_with(path: &Path, expected_audio: u32, quick: bool) -> Result<ClipResult, String> {
     unsafe {
         let mut ic = null_mut();
         check(ff::avformat_open_input(&mut ic, av::cstr(&path.to_string_lossy()).as_ptr(), null(), null_mut()), "verify open")?;
         let ic = Input(ic);
+        if quick {
+            av::quick_probe(ic.0);
+        }
         check(ff::avformat_find_stream_info(ic.0, null_mut()), "verify streams")?;
         let mut video = 0;
         let mut audio = Vec::new();

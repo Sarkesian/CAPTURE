@@ -56,6 +56,7 @@ unsafe fn frame_jpeg_inner(segment: &Path, segment_start: f64, target: f64, exac
     let mut ic = null_mut();
     check(ff::avformat_open_input(&mut ic, crate::av::cstr(&segment.to_string_lossy()).as_ptr(), null(), null_mut()), "open recording")?;
     let ic = Input(ic);
+    crate::av::quick_probe(ic.0);
     check(ff::avformat_find_stream_info(ic.0, null_mut()), "read recording")?;
     let streams = std::slice::from_raw_parts((*ic.0).streams, (*ic.0).nb_streams as usize);
     let index = streams

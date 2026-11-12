@@ -202,9 +202,16 @@ export function cancelPendingReview() {
   nextReviewGeneration++;
   app.reviewLoading = false;
   app.reviewError = null;
-  if (app.nextReview) engine('release_review', { path: app.nextReview.path });
+  const next = app.nextReview?.path;
   app.nextReview = null;
+  if (next) releaseLater(next, 0);
   for (const [id] of reviewRequests) reviewRequests.set(id, 'cancelled');
+}
+/** Let the engine reuse a window's file, unless it is still on screen or queued next (the
+ * engine often answers a new request with the same cached file; releasing it then would get
+ * the playing file deleted underneath the player). */
+export function releaseLater(path: string, delay = 300) {
+  setTimeout(() => { if (app.review?.path !== path && app.nextReview?.path !== path) engine('release_review', { path }); }, delay);
 }
 export const releaseReview = () => {
   cancelPendingReview();
@@ -223,19 +230,20 @@ function reviewReply(m: EngineMessage) {
   if (!slot) { earlyReplies.set(m.re, m); if (earlyReplies.size > 32) earlyReplies.delete(earlyReplies.keys().next().value!); return; }
   reviewRequests.delete(m.re);
   if (m.event === 'review_ready') {
-    if (slot === 'cancelled') { engine('release_review', { path: m.data.path }); return; }
+    if (slot === 'cancelled') { releaseLater(m.data.path, 0); return; }
     const old = slot === 'next' ? app.nextReview : app.review;
     if (slot === 'next') app.nextReview = m.data;
     else { app.review = m.data; app.reviewLoading = false; app.reviewError = null; }
-    if (old) setTimeout(() => engine('release_review', { path: old.path }), 300);
+    if (old && old.path !== m.data.path) releaseLater(old.path);
   } else if (m.event === 'review_failed' && slot === 'current' && !m.data.superseded) { app.reviewLoading = false; app.reviewError = m.data.message; }
 }
 async function requestReview(cmd: string, args: Record<string, unknown> | undefined, prefetch: boolean) {
   const generation = prefetch ? ++nextReviewGeneration : ++currentReviewGeneration;
   if (!prefetch) {
     nextReviewGeneration++;
-    if (app.nextReview) engine('release_review', { path: app.nextReview.path });
+    const next = app.nextReview?.path;
     app.nextReview = null;
+    if (next) releaseLater(next, 0);
     app.reviewLoading = true; app.reviewError = null;
     for (const [id] of reviewRequests) reviewRequests.set(id, 'cancelled');
   }
