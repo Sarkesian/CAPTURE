@@ -36,6 +36,9 @@ export const app = $state({
   stemsBusy: {} as Record<string, boolean>,
 });
 
+/** Which Replay view this window is, so the engine can drop this view's outdated requests. */
+export const viewer = location.hash === '#overlay' ? 'overlay' : 'main';
+
 let toastId = 0;
 export function toast(text: string, kind: Toast['kind'] = 'info', ms = 5000) {
   const id = ++toastId;
@@ -64,7 +67,13 @@ export async function init() {
   await listen<EngineMessage>('engine', e => onEngine(e.payload));
   await listen<Settings>('settings', e => { app.settings = e.payload; checkPaths(); });
   // The engine's last state is no longer true (no recording, no session, nothing saving).
-  await listen<string>('engine_down', e => { app.engineDown = e.payload; app.engine = null; });
+  await listen<string>('engine_down', e => {
+    app.engineDown = e.payload;
+    app.engine = null;
+    for (const finish of pendingResults.values()) finish(undefined);
+    pendingResults.clear();
+    earlyResults.clear();
+  });
   await listen<string>('goto', e => { navigate(e.payload as typeof app.tab); refreshClips(); });
   refreshTargets();
   refreshClips();
@@ -80,6 +89,17 @@ export function navigate(tab: typeof app.tab) {
 }
 
 function onEngine(m: EngineMessage) {
+  if (m.event === 'history_frames' || m.event === 'history_thumb' || m.event === 'save_finished' || m.event === 'save_failed') {
+    const id = m.re;
+    if (id !== undefined) {
+      const finish = pendingResults.get(id);
+      if (finish) finish(m);
+      else {
+        earlyResults.set(id, m);
+        if (earlyResults.size > 32) earlyResults.delete(earlyResults.keys().next().value!);
+      }
+    }
+  }
   switch (m.event) {
     case 'hello':
       app.engineDown = null;
@@ -96,8 +116,11 @@ function onEngine(m: EngineMessage) {
       if (!m.data.overlay_notice) toast({ screenshot: 'Screenshot saved', replay: 'Saving Clip', recording_start: 'Recording started', recording_stop: 'Recording saved' }[m.data.action], 'ok', 1800);
       break;
     case 'save_started':
+      // Why this clip is shorter than the configured replay length.
+      if (m.data.note) toast(m.data.note, 'info', 7000);
       break;
     case 'save_finished':
+      if (m.data.existing) { toast('Already saved. It is in your Library.', 'info', 4000); break; }
       app.lastClip = m.data;
       app.libraryVersion++;
       refreshClips();
@@ -108,7 +131,7 @@ function onEngine(m: EngineMessage) {
       engine('history');
       break;
     case 'error':
-      toast(m.data.message, 'error', 7000);
+      toast(m.data.message, m.data.message.startsWith('Deleted ') ? 'ok' : 'error', 7000);
       break;
     case 'marker_added':
       toast(`Marker added at ${m.data.at}`, 'ok', 2500);
@@ -174,16 +197,19 @@ export const toggleSession = () => engine(app.engine?.session_secs != null ? 'st
 export function prepareReview() {
   return requestReview('prepare_review', undefined, false);
 }
-export const releaseReview = () => {
+export function cancelPendingReview() {
   currentReviewGeneration++;
   nextReviewGeneration++;
-  const path = app.review?.path ?? null;
-  app.review = null;
   app.reviewLoading = false;
   app.reviewError = null;
   if (app.nextReview) engine('release_review', { path: app.nextReview.path });
   app.nextReview = null;
   for (const [id] of reviewRequests) reviewRequests.set(id, 'cancelled');
+}
+export const releaseReview = () => {
+  cancelPendingReview();
+  const path = app.review?.path ?? null;
+  app.review = null;
   return engine('release_review', { path });
 };
 export const saveRange = (start: number, end: number) => engine('save_range', { start, end });
@@ -202,7 +228,7 @@ function reviewReply(m: EngineMessage) {
     if (slot === 'next') app.nextReview = m.data;
     else { app.review = m.data; app.reviewLoading = false; app.reviewError = null; }
     if (old) setTimeout(() => engine('release_review', { path: old.path }), 300);
-  } else if (m.event === 'review_failed' && slot === 'current') { app.reviewLoading = false; app.reviewError = m.data.message; }
+  } else if (m.event === 'review_failed' && slot === 'current' && !m.data.superseded) { app.reviewLoading = false; app.reviewError = m.data.message; }
 }
 async function requestReview(cmd: string, args: Record<string, unknown> | undefined, prefetch: boolean) {
   const generation = prefetch ? ++nextReviewGeneration : ++currentReviewGeneration;
@@ -219,8 +245,48 @@ async function requestReview(cmd: string, args: Record<string, unknown> | undefi
   reviewRequests.set(id, cancelled ? 'cancelled' : prefetch ? 'next' : 'current');
   const reply = earlyReplies.get(id); if (reply) { earlyReplies.delete(id); reviewReply(reply); }
 }
-export const historyReview = (session: string, at: number, prefetch = false) => requestReview('history_review', { session, at }, prefetch);
+export const historyReview = (session: string, at: number, prefetch = false) => requestReview('history_review', { session, at, viewer, prefetch }, prefetch);
 export const historySave = (session: string, start: number, end: number) => engine('history_save', { session, start, end });
+type CommandResult = Extract<EngineMessage, { event: 'history_frames' | 'history_thumb' | 'save_finished' | 'save_failed' }>;
+const pendingResults = new Map<number, (result?: CommandResult) => void>();
+const earlyResults = new Map<number, CommandResult>();
+
+async function commandResult(command: string, args: Record<string, unknown>, timeout?: number) {
+  const id = await engine(command, args);
+  if (id === undefined || app.engineDown) return;
+  const early = earlyResults.get(id);
+  if (early) {
+    earlyResults.delete(id);
+    return early;
+  }
+  return new Promise<CommandResult | undefined>(resolve => {
+    const timer = timeout ? setTimeout(() => finish(), timeout) : undefined;
+    function finish(result?: CommandResult) {
+      clearTimeout(timer);
+      pendingResults.delete(id);
+      resolve(result);
+    }
+    pendingResults.set(id, finish);
+  });
+}
+
+export async function historyFrames(session: string, at: number) {
+  const reply = await commandResult('history_frames', { session, at }, 6000);
+  return reply?.event === 'history_frames' ? reply.data.frames : [];
+}
+
+/** A frame of a recording at session time `at`, from the engine (null when there is none or a newer request replaced this one). */
+export async function historyThumb(session: string, at: number, exact: boolean, as = viewer) {
+  const reply = await commandResult('history_thumb', { session, at, exact, viewer: as }, 8000);
+  return reply?.event === 'history_thumb' && reply.data.image && reply.data.t != null ? { t: reply.data.t, image: reply.data.image } : null;
+}
+/** Delete one session's temporary background footage (saved media is never touched). */
+export const deleteRecording = (session: string) => engine('history_delete', { session });
+
+export async function saveTrim(session: string, start: number, end: number) {
+  const reply = await commandResult('history_save', { session, start, end, aligned: true });
+  return reply?.event === 'save_finished';
+}
 export function requestClipInfo(path: string) {
   if (!(path in app.clipInfo)) {
     app.clipInfo[path] = { duration: null };

@@ -1,7 +1,7 @@
 // Non-UI acceptance of an extracted candidate after Review.ps1 -InitializeOnly.
 import fs from 'node:fs';import path from 'node:path';import crypto from 'node:crypto';import {spawn} from 'node:child_process';import readline from 'node:readline';import assert from 'node:assert/strict';
 const dir=path.resolve(process.argv[2]),manifest=JSON.parse(fs.readFileSync(path.join(dir,'manifest.json')));
-assert.equal(manifest.version,'0.6.5-rc.2');
+assert.equal(manifest.version,'0.6.5');
 for(const f of manifest.files){const p=path.join(dir,f.path);assert.equal(fs.statSync(p).size,f.size,f.path);assert.equal(crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex'),f.sha256,f.path);}
 const settings=JSON.parse(fs.readFileSync(path.join(dir,'Data/Settings/settings.json'))),root=path.join(dir,'ReviewCaptures');
 assert.equal(settings.capture_root,root);assert.equal(settings.replay_enabled,false);assert.equal(settings.target.kind,'none');
@@ -19,7 +19,15 @@ try{
  assert.ok(session.events.some(e=>e.kind==='marker'&&e.t===7206));
  const screenshots=history.sessions.flatMap(s=>s.events.filter(e=>e.kind==='screenshot'));assert.ok(screenshots.length>30);assert.ok(screenshots.every(e=>fs.existsSync(e.path)&&e.path.startsWith(root)));
  const started=performance.now(),id=send('history_review',{session:session.id,at:7206});const review=await wait(e=>e.re===id&&['review_ready','review_failed'].includes(e.event));assert.equal(review.event,'review_ready');assert.ok(fs.existsSync(review.data.path));const previewMs=performance.now()-started;
- send('release_review',{path:review.data.path});const save=send('history_save',{session:session.id,start:7203,end:7207});const done=await wait(e=>e.re===save&&['save_finished','save_failed'].includes(e.event));assert.equal(done.event,'save_finished');assert.ok(fs.existsSync(done.data.path));assert.ok(done.data.path.startsWith(root));
+ send('release_review',{path:review.data.path});
+ const timing=send('history_frames',{session:session.id,at:7206});
+ const frames=(await wait(e=>e.re===timing&&e.event==='history_frames')).data.frames;
+ const start=frames.findLast(f=>f.key&&f.start<=7206).start;
+ const end=frames.find(f=>f.end>7207).end;
+ const save=send('history_save',{session:session.id,start,end,aligned:true});
+ const done=await wait(e=>e.re===save&&['save_finished','save_failed'].includes(e.event));
+ assert.equal(done.event,'save_finished',JSON.stringify(done.data));assert.ok(fs.existsSync(done.data.path));assert.ok(done.data.path.startsWith(root));
+ assert.ok(Math.abs(done.data.duration_secs-(end-start))<=.004);
  const result={passed:true,version:manifest.version,programFilesVerified:manifest.files.length,sessions:history.sessions.length,sixHourEvents:session.events.length,screenshotAssociations:screenshots.length,previewMs,savedClip:done.data.path};
  fs.writeFileSync(path.join(dir,'package-verification.json'),JSON.stringify(result,null,2));console.log(JSON.stringify(result,null,2));
 }finally{send('shutdown');await Promise.race([new Promise(r=>worker.once('exit',r)),sleep(5000)]);if(worker.exitCode===null)worker.kill();}

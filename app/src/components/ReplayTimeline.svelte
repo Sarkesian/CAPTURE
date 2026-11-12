@@ -1,176 +1,325 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { convertFileSrc } from '@tauri-apps/api/core';
   import type { TimelineEvent } from '../lib/types';
-  import { clamp, clock, fitView, zoomView, tickStep, eventGroups, type Range } from '../lib/timeline';
-  let { first, last, intervals, events, position, selection = $bindable(null), view = $bindable(), onseek, onevent, onscrub }: {
-    first: number; last: number; intervals: [number, number][]; events: TimelineEvent[]; position: number;
-    selection: Range | null; view: Range; onseek: (t: number, final: boolean) => void;
-    onevent: (e: TimelineEvent) => void; onscrub: () => void;
+  import { clamp, clock, containing, eventGroups, fitView, tickStep, zoomView, type Range } from '../lib/timeline';
+  import { cachedThumb, thumbAt, type Thumb } from '../lib/thumbs';
+  import { viewer } from '../lib/store.svelte';
+
+  type Edge = 'a' | 'b';
+  type DragMode = 'scrub' | 'pan' | Edge;
+  let { locate, clockAt, wallAt, labels = [], first, last, intervals, events, clips = [], position, selection = $bindable(null), view = $bindable(),
+    editable = true, onseek, onevent, ontrim, onstep }: {
+    /** Timeline time to the session and session time there (null where nothing was recorded). */
+    locate: (time: number) => { session: string; t: number } | null;
+    /** Seconds of footage before a timeline time (the clock shown), and its wall-clock time in ms. */
+    clockAt: (time: number) => number; wallAt: (time: number) => number | null;
+    /** Where each gameplay session begins. */
+    labels?: { t: number; text: string }[];
+    first: number; last: number; intervals: [number, number][]; events: TimelineEvent[];
+    /** Clips already saved from this session (shown at their place on the timeline). */
+    clips?: TimelineEvent[];
+    position: number; selection: Range | null; view: Range;
+    editable?: boolean; onseek: (time: number, final: boolean) => void; onevent: (event: TimelineEvent) => void;
+    ontrim: (active: boolean, edge: Edge) => void; onstep: (edge: Edge, direction: number) => void;
   } = $props();
-  let width = $state(800);
+
   let detail: HTMLDivElement;
-  let drag = $state<{ mode: string; x: number; t: number; view: Range; selection: Range | null; pointer: number } | null>(null);
-  let popup = $state<TimelineEvent[]>([]);
-  let hover = $state<TimelineEvent | null>(null);
-  let hoverX = $state(0);
-  let snapped = $state(false);
+  let width = $state(800);
+  let drag = $state<{ mode: DragMode; pointer: number; x: number; viewStart: number; offset: number } | null>(null);
+  let edgeX: number | null = null;
   let edgeFrame = 0;
-  let edgePointer: {x: number; shift: boolean} | null = null;
+  let hover = $state<{ time: number; event?: TimelineEvent } | null>(null);
+  let popup = $state<TimelineEvent[]>([]);
+  let thumb = $state<Thumb | null>(null);
   const span = $derived(Math.max(.001, view.b - view.a));
-  const pct = (t: number) => clamp((t - view.a) / span * 100, 0, 100);
-  const step = $derived(tickStep(span, width));
-  const ticks = $derived.by(() => {
-    const result: number[] = [];
-    for (let t = Math.ceil(view.a / step) * step; t <= view.b && result.length < 80; t += step) result.push(t);
-    return result;
-  });
+  const pct = (time: number) => clamp((time - view.a) / span * 100, 0, 100);
   const groups = $derived(eventGroups(events, view, width));
-  onMount(() => {
-    const observer = new ResizeObserver(entries => width = entries[0].contentRect.width);
-    observer.observe(detail);
-    // Native listener is explicitly non-passive so trackpad zoom never scrolls the page.
-    const wheel = (e: WheelEvent) => {
-      e.preventDefault(); popup = [];
-      if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) pan((e.deltaX || e.deltaY) / width * span);
-      else zoom(Math.exp(clamp(e.deltaY, -100, 100) * .008), timeAt(e.clientX));
-    };
-    detail.addEventListener('wheel', wheel, { passive: false });
-    return () => { stopDrag(); observer.disconnect(); detail.removeEventListener('wheel', wheel); };
+  // Tick marks everywhere; numbers only when the view is inside one stretch of footage (round
+  // footage times there). Zoomed out over several stretches, the session dates orient instead.
+  const ticks = $derived.by(() => {
+    const step = tickStep(span, width);
+    const inside = intervals.find(([a, b]) => view.a >= a - .001 && view.b <= b + .001);
+    const times: { t: number; label: string }[] = [];
+    if (inside) {
+      const base = clockAt(inside[0]);
+      for (let f = Math.ceil((base + view.a - inside[0]) / step) * step; times.length < 80; f += step) {
+        const t = inside[0] + f - base;
+        if (t >= view.b) break;
+        times.push({ t, label: step < 1 ? clock(f, true) : clock(f) });
+      }
+    } else {
+      for (let t = Math.ceil(view.a / step) * step; t < view.b && times.length < 80; t += step) if (containing(intervals, t)) times.push({ t, label: '' });
+    }
+    return times;
   });
+  // Session labels that have room (a label is dropped when it would run into the one before it).
+  const shownLabels = $derived.by(() => {
+    let edge = -Infinity;
+    return labels.filter(l => l.t >= view.a - .001 && l.t < view.b).filter(l => {
+      const x = (l.t - view.a) / span * width;
+      if (x < edge || x > width - 60) return false;
+      edge = x + 110;
+      return true;
+    });
+  });
+  /** Seconds of recording under one pixel: decides how precise hovering needs to be. */
+  const perPixel = $derived(span / Math.max(1, width));
+  const hoverFootage = $derived(!!hover && !!containing(intervals, hover.time));
+  const timeOfDay = (t: number) => { const ms = wallAt(t); return ms === null ? '' : new Date(ms).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit', second: perPixel < 2 ? '2-digit' : undefined }); };
+
+  // The picture under the cursor comes from the engine, for any recorded position. Zoomed out,
+  // the keyframe at that second is exact to the pixel; zoomed in, the very frame is asked for.
+  // A picture of somewhere else is never left on screen: it is cleared as soon as the cursor
+  // is further from it than the precision in use, and a late answer for an old position is dropped.
+  $effect(() => {
+    const at = hover?.time;
+    const from = at === undefined || hover?.event?.kind === 'screenshot' ? null : locate(at);
+    if (at === undefined || !from) { thumb = null; return; }
+    const exact = perPixel < 0.12;
+    const tolerance = exact ? 0.12 : Math.max(1.05, perPixel * 6);
+    // Pictures are kept by session time; `thumb.t` is on the timeline's own clock.
+    const place = (found: Thumb): Thumb => ({ image: found.image, t: at - (from.t - found.t) });
+    const hit = cachedThumb(from.session, from.t, exact);
+    untrack(() => {
+      if (hit) thumb = place(hit);
+      else if (thumb && (at - thumb.t > tolerance || thumb.t - at > 0.12)) thumb = null;
+    });
+    if (hit) return;
+    let current = true;
+    const timer = setTimeout(() => {
+      thumbAt(from.session, from.t, exact, viewer + '-timeline').then(result => { if (current && result) thumb = place(result); });
+    }, 25);
+    return () => { current = false; clearTimeout(timer); };
+  });
+
+  onMount(() => {
+    const observer = new ResizeObserver(() => width = detail.getBoundingClientRect().width);
+    observer.observe(detail);
+    function wheel(event: WheelEvent) {
+      event.preventDefault();
+      if (drag) return;
+      hover = null;
+      popup = [];
+      if (event.shiftKey || Math.abs(event.deltaX) > Math.abs(event.deltaY)) pan((event.deltaX || event.deltaY) / width * span);
+      else zoom(Math.exp(clamp(event.deltaY, -100, 100) * .008), timeAt(event.clientX));
+    }
+    detail.addEventListener('wheel', wheel, { passive: false });
+    return () => {
+      cancelAnimationFrame(edgeFrame);
+      observer.disconnect();
+      detail.removeEventListener('wheel', wheel);
+    };
+  });
+
   function timeAt(x: number) {
     const box = detail.getBoundingClientRect();
-    return view.a + clamp((x - box.left) / box.width, 0, 1) * span;
+    // Always a time inside the session: the cursor, the playhead and the media share one clock.
+    return clamp(view.a + clamp((x - box.left) / Math.max(1, box.width), 0, 1) * span, first, last);
   }
-  function zoom(factor: number, at = position >= view.a && position <= view.b ? position : (view.a + view.b) / 2) {
+  export function zoom(factor: number, at = position >= view.a && position <= view.b ? position : (view.a + view.b) / 2) {
     view = zoomView(view, factor, at, first, last);
   }
-  function pan(delta: number) { view = fitView(view.a + delta, span, first, last); }
-  function snap(t: number, excluded?: number) {
-    const candidates = [position, ...intervals.flat(), ...events.map(e => e.t)].filter(n => n !== excluded);
-    const nearest = candidates.reduce((a, b) => Math.abs(b - t) < Math.abs(a - t) ? b : a, Infinity);
-    snapped = Math.abs(nearest - t) <= span * 8 / width;
-    return snapped ? nearest : t;
+  export function pan(delta: number) {
+    view = fitView(view.a + delta, span, first, last);
   }
-  function start(e: PointerEvent, mode: string) {
-    if (e.button !== 0 && e.button !== 1) return;
-    e.preventDefault(); e.stopPropagation(); popup = []; hover = null;
-    const target = e.currentTarget as HTMLElement;
-    if(target.matches('button,[tabindex]'))target.focus({preventScroll:true});
-    if (e.button === 1 || e.altKey) mode = 'pan';
-    drag = { mode, x: e.clientX, t: timeAt(e.clientX), view: { ...view }, selection: selection && { ...selection }, pointer: e.pointerId };
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    if (mode === 'scrub') { onscrub(); onseek(timeAt(e.clientX), false); }
-  }
-  function move(e: PointerEvent) {
-    if (!drag || drag.pointer !== e.pointerId) return;
-    if (e.buttons === 0) { stopDrag(); return; }
-    const d = drag;
-    if (d.mode === 'pan') view = fitView(d.view.a - (e.clientX - d.x) / width * (d.view.b - d.view.a), span, first, last);
-    else if (d.mode === 'scrub') onseek(timeAt(e.clientX), false);
-    else if (selection && d.selection) {
-      const t = e.shiftKey ? timeAt(e.clientX) : snap(timeAt(e.clientX), d.mode === 'a' ? selection.b : selection.a);
-      if (d.mode === 'a' || d.mode === 'b') {
-        resize(d.mode,t);
-        edgePointer={x:e.clientX,shift:e.shiftKey};
-        if(!edgeFrame)edgeFrame=requestAnimationFrame(followHandle);
-      }
-      else {
-        const duration = d.selection.b - d.selection.a;
-        const a = clamp(d.selection.a + t - d.t, first, last - duration);
-        selection = { a, b: a + duration };
-      }
+  export function fit() { view = { a: first, b: last }; }
+
+  function start(event: PointerEvent, mode: DragMode) {
+    if (drag || (event.button !== 0 && event.button !== 1)) return;
+    if (event.button === 1 || event.altKey) mode = 'pan';
+    const edge = mode === 'a' || mode === 'b' ? mode : null;
+    if (edge && (!editable || !selection)) return;
+    event.preventDefault();
+    (event.currentTarget as HTMLElement).focus({ preventScroll: true });
+    popup = [];
+    const time = timeAt(event.clientX);
+    drag = {
+      mode, pointer: event.pointerId, x: event.clientX, viewStart: view.a,
+      offset: edge && selection ? selection[edge] - time : 0,
+    };
+    // The strip stays mounted if a moving handle reaches the edge of the viewport.
+    detail.setPointerCapture(event.pointerId);
+    if (edge) {
+      ontrim(true, edge);
+      hover = { time: selection![edge] };
+    } else if (mode === 'scrub') {
+      hover = { time };
+      onseek(time, false);
     }
   }
-  function resize(edge:'a'|'b',t:number) {
-    if(!selection)return;
-    selection=edge==='a'?{a:clamp(t,first,selection.b-.1),b:selection.b}:{a:selection.a,b:clamp(t,selection.a+.1,last)};
+
+  function resize(edge: Edge, time: number) {
+    if (!selection) return;
+    const value = edge === 'a' ? clamp(time, first, selection.b - .001) : clamp(time, selection.a + .001, last);
+    selection = { ...selection, [edge]: value };
+    hover = { time: value };
   }
+
   function followHandle() {
-    edgeFrame=0;
-    if(!edgePointer || !drag || (drag.mode!=='a' && drag.mode!=='b'))return;
-    const box=detail.getBoundingClientRect();
-    const distance=edgePointer.x<box.left+12 ? edgePointer.x-(box.left+12) : edgePointer.x>box.right-12 ? edgePointer.x-(box.right-12) : 0;
-    if(!distance)return;
-    const old=view.a;
-    pan(clamp(distance/40,-1,1)*span*.018);
-    if(old===view.a)return;
-    const t=timeAt(edgePointer.x);
-    resize(drag.mode,edgePointer.shift?t:clamp(snap(t),view.a,view.b));
-    edgeFrame=requestAnimationFrame(followHandle);
+    edgeFrame = 0;
+    if (!drag || edgeX === null || (drag.mode !== 'a' && drag.mode !== 'b')) return;
+    const box = detail.getBoundingClientRect();
+    const distance = edgeX < box.left + 12 ? edgeX - box.left - 12 : Math.max(0, edgeX - box.right + 12);
+    if (!distance) return;
+    const previous = view.a;
+    pan(clamp(distance / 40, -1, 1) * span * .018);
+    if (previous === view.a) return;
+    resize(drag.mode, timeAt(edgeX) + drag.offset);
+    edgeFrame = requestAnimationFrame(followHandle);
   }
-  function stopDrag() {
-    drag=null;snapped=false;edgePointer=null;
-    cancelAnimationFrame(edgeFrame);edgeFrame=0;
+
+  function move(event: PointerEvent) {
+    if (!drag) {
+      if (!popup.length && event.pointerType !== 'touch') hover = { time: timeAt(event.clientX) };
+      return;
+    }
+    if (drag.pointer !== event.pointerId) return;
+    if (!event.buttons) { finish(event); return; }
+    const time = timeAt(event.clientX);
+    if (drag.mode === 'pan') {
+      view = fitView(drag.viewStart - (event.clientX - drag.x) / width * span, span, first, last);
+    } else if (drag.mode === 'scrub') {
+      hover = { time };
+      onseek(time, false);
+    } else {
+      resize(drag.mode, time + drag.offset);
+      edgeX = event.clientX;
+      if (!edgeFrame) edgeFrame = requestAnimationFrame(followHandle);
+    }
   }
-  function finish(e: PointerEvent) {
-    if (!drag) return;
-    const mode = drag.mode; stopDrag();
-    if ((e.currentTarget as HTMLElement).hasPointerCapture(e.pointerId)) (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
-    if (mode === 'scrub') onseek(timeAt(e.clientX), true);
+
+  function finish(event: PointerEvent, cancelled = false) {
+    if (!drag || drag.pointer !== event.pointerId) return;
+    const { mode, pointer } = drag;
+    drag = null;
+    hover = null;
+    edgeX = null;
+    cancelAnimationFrame(edgeFrame);
+    edgeFrame = 0;
+    if (detail.hasPointerCapture(pointer)) detail.releasePointerCapture(pointer);
+    if (mode === 'a' || mode === 'b') ontrim(false, mode);
+    else if (mode === 'scrub' && !cancelled) onseek(timeAt(event.clientX), true);
   }
-  function key(e: KeyboardEvent) {
-    if (!['ArrowLeft','ArrowRight','Home','End','+','=','-','0','Escape'].includes(e.key)) return;
-    e.preventDefault(); e.stopPropagation();
-    if (e.key === 'Escape') { popup = []; hover = null; return; }
-    if (e.key === '+' || e.key === '=') zoom(.5);
-    else if (e.key === '-') zoom(2);
-    else if (e.key === '0') view = { a: first, b: last };
-    else if (e.key === 'Home') onseek(first, true);
-    else if (e.key === 'End') onseek(last - .05, true);
-    else if (e.shiftKey) pan((e.key === 'ArrowRight' ? 1 : -1) * span * .2);
-    else onseek(position + (e.key === 'ArrowRight' ? 1 : -1) * (e.altKey ? .1 : 5), true);
+
+  function handleKey(event: KeyboardEvent, edge: Edge) {
+    if (!editable || (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight')) return;
+    event.preventDefault();
+    event.stopPropagation();
+    onstep(edge, event.key === 'ArrowRight' ? 1 : -1);
   }
-  function handleKey(e: KeyboardEvent, edge: 'a' | 'b') {
-    if (!selection || !['ArrowLeft','ArrowRight'].includes(e.key)) return;
-    e.preventDefault(); e.stopPropagation();
-    const delta = (e.key === 'ArrowRight' ? 1 : -1) * (e.shiftKey ? 1 : .1);
-    selection = edge === 'a' ? { a: clamp(selection.a + delta, first, selection.b - .1), b: selection.b }
-      : { a: selection.a, b: clamp(selection.b + delta, selection.a + .1, last) };
-  }
+  function clearHover() { if (!drag) hover = null; }
+  const momentTitle = (event: TimelineEvent) => event.label || (event.kind === 'screenshot' ? 'Screenshot' : 'Marker');
 </script>
 
 <div class="timeline">
-  <div class="detail" bind:this={detail} class:dragging={!!drag} class:snapped role="slider" tabindex="0" aria-label="Recording timeline" aria-valuemin={view.a} aria-valuemax={view.b} aria-valuenow={clamp(position,view.a,view.b)} aria-valuetext={clock(position,true)} onkeydown={key}
-    onpointerdown={e => start(e, 'scrub')} onpointermove={move} onpointerup={finish} onpointercancel={stopDrag} onlostpointercapture={stopDrag}>
-    <div class="ruler">{#each ticks as t}<span style:left="{pct(t)}%">{clock(t, step < 1)}</span>{/each}</div>
-    <div class="footage-lane">
-      {#each intervals as [a,b]}{#if b > view.a && a < view.b}<div class="footage" style:left="{pct(a)}%" style:width="{pct(b)-pct(a)}%"></div>{/if}{/each}
-    </div>
-    {#if selection && selection.b >= view.a && selection.a <= view.b}
-      <div class="clip-range" style:left="{pct(selection.a)}%" style:width="{pct(selection.b)-pct(selection.a)}%" onpointerdown={e => start(e,'selection')} role="presentation"></div>
-      {#if selection.a >= view.a && selection.a <= view.b}<button class="handle start" aria-label="Clip start handle" title="Drag clip start · Arrow keys adjust 0.1s" style:left="{pct(selection.a)}%" onpointerdown={e => start(e,'a')} onkeydown={e => handleKey(e,'a')}></button>{/if}
-      {#if selection.b >= view.a && selection.b <= view.b}<button class="handle end" aria-label="Clip end handle" title="Drag clip end · Arrow keys adjust 0.1s" style:left="{pct(selection.b)}%" onpointerdown={e => start(e,'b')} onkeydown={e => handleKey(e,'b')}></button>{/if}
-    {/if}
-    <div class="event-lane">
-      {#each groups as group}
-        <button class="moment" class:shot={group.events.every(e => e.kind === 'screenshot')} style:left="{clamp(pct(group.t), 1.5, 98.5)}%" aria-label={group.events.length > 1 ? `${group.events.length} moments at ${clock(group.t)}` : `${group.events[0].label || group.events[0].kind} at ${clock(group.t)}`} title={group.events.length > 1 ? `${group.events.length} moments · click to browse` : `${group.events[0].label || group.events[0].kind} · ${clock(group.t)}`}
-          onpointerdown={e => e.stopPropagation()} onpointerenter={() => { hover=group.events.length===1?group.events[0]:null; hoverX=clamp(pct(group.t),18,82); }} onpointerleave={() => hover=null} onfocus={() => { hover=group.events.length===1?group.events[0]:null; hoverX=clamp(pct(group.t),18,82); }} onblur={() => hover=null}
-          onclick={e => { e.stopPropagation(); hover=null; if(group.events.length===1) onevent(group.events[0]); else popup=group.events; }}>
-          {group.events.length>1 ? group.events.length : group.events[0].kind==='screenshot' ? '▣' : '◆'}
-        </button>
+  <div class="seek-strip">
+    <div class="detail" bind:this={detail} role="slider" tabindex="0" aria-label="Recording timeline"
+      aria-valuemin={view.a} aria-valuemax={view.b} aria-valuenow={clamp(position,view.a,view.b)} aria-valuetext={clock(clockAt(position),3)}
+      onpointerdown={event => start(event, 'scrub')} onpointermove={move} onpointerleave={clearHover}
+      onpointerup={event => finish(event)} onpointercancel={event => finish(event, true)} onlostpointercapture={event => finish(event, true)}>
+      <div class="footage-lane">
+        {#each intervals as [a,b]}
+          {#if b > view.a && a < view.b}
+            <div class="footage" style:left="{pct(a)}%" style:width="{pct(b)-pct(a)}%"></div>
+            {#if !selection && position > a}<div class="played" style:left="{pct(a)}%" style:width="{pct(Math.min(b,position))-pct(a)}%"></div>{/if}
+          {/if}
+        {/each}
+        {#if selection}
+          <div class="dim" style:width="{pct(selection.a)}%"></div>
+          <div class="dim" style:left="{pct(selection.b)}%" style:width="{100-pct(selection.b)}%"></div>
+          <div class="clip-range" style:left="{pct(selection.a)}%" style:width="{pct(selection.b)-pct(selection.a)}%"></div>
+        {/if}
+      </div>
+      {#each clips as clip (clip.id)}
+        {#if (clip.end ?? clip.t) > view.a && clip.t < view.b}<div class="saved-clip" style:left="{pct(clip.t)}%" style:width="{pct(clip.end ?? clip.t)-pct(clip.t)}%"></div>{/if}
       {/each}
+      {#each ticks as tick}<span class="tick" style:left="{pct(tick.t)}%">{#if tick.label && pct(tick.t) > 1 && pct(tick.t) < 95}<i>{tick.label}</i>{/if}</span>{/each}
+      {#each shownLabels as label (label.t)}<span class="session-label" style:left="{pct(label.t)}%">{label.text}</span>{/each}
+      {#if position >= view.a && position <= view.b}<div class="playhead" style:left="{pct(position)}%"></div>{/if}
     </div>
-    {#if position >= view.a && position <= view.b}<div class="playhead" style:left="{pct(position)}%"><span></span></div>{/if}
-  </div>
-  {#if hover}<div class="hover-card" style:left="{hoverX}%" role="tooltip">{#if hover.kind==='screenshot' && hover.path}<img src={convertFileSrc(hover.path)} alt="Screenshot preview" onerror={e => e.currentTarget.style.display='none'} />{/if}<strong>{hover.label || hover.kind}</strong><span>{clock(hover.t,true)}{!intervals.some(([a,b])=>hover!.t>=a&&hover!.t<b)?' · Video expired':''}</span></div>{/if}
-  {#if popup.length}<div class="cluster" role="region" aria-label="Grouped moments"><div class="row"><strong class="grow">{popup.length} nearby moments</strong><button class="btn ghost sm" onclick={() => popup=[]}>Close</button></div>{#each popup as ev}<button class="cluster-event" onclick={() => { onevent(ev); popup=[]; }}>{ev.kind==='screenshot'?'▣':'◆'} <span>{ev.label || ev.kind}</span><span class="mono">{clock(ev.t,true)}</span></button>{/each}</div>{/if}
-  <div class="timeline-footer">
-    <span class="view-label">{span < last-first-.01 ? clock(view.a) + " – " + clock(view.b) : "Full recording"}</span>
-    <div class="zoom-controls" aria-label="Timeline zoom and pan">
-      {#if span < last-first-.01}
-        <button class="btn ghost sm icon" aria-label="Pan earlier" title="Pan earlier" onclick={() => pan(-span*.65)}>‹</button>
-        <button class="btn ghost sm icon" aria-label="Pan later" title="Pan later" onclick={() => pan(span*.65)}>›</button>
-        <button class="btn ghost sm" onclick={() => view={a:first,b:last}}>Fit</button>
-      {/if}
-      <button class="btn ghost sm icon" aria-label="Zoom out" title="Zoom out" disabled={span>=last-first-.01} onclick={() => zoom(2)}>−</button>
-      <button class="btn ghost sm icon" aria-label="Zoom in" title="Zoom in · or scroll over the timeline" disabled={span<=2.001} onclick={() => zoom(.5)}>+</button>
-    </div>
+    {#each groups as group}
+      {@const event = group.events[0]}
+      {@const count = group.events.length}
+      <button class="moment" class:shot={group.events.every(e => e.kind === 'screenshot')} class:grouped={count > 1}
+        style:left="{pct(group.t)}%" aria-label={count>1 ? `${count} moments at ${clock(clockAt(group.t))}` : `${momentTitle(event)} at ${clock(clockAt(group.t))}`}
+        onpointerenter={() => hover={time:group.t,event:count===1?event:undefined}} onpointerleave={clearHover}
+        onfocus={() => hover={time:group.t,event:count===1?event:undefined}} onblur={clearHover}
+        onclick={() => { hover=null; if(count===1)onevent(event);else popup=group.events; }}></button>
+    {/each}
+    {#if selection}
+      {#each (['a','b'] as const) as edge}
+        {#if selection[edge] >= view.a-.000001 && selection[edge] <= view.b+.000001}
+          <button class="handle" class:start={edge==='a'} class:end={edge==='b'} class:dragging={drag?.mode===edge}
+            style:left="{pct(selection[edge])}%" disabled={!editable} aria-label={edge==='a'?'Clip start handle':'Clip end handle'}
+            title={`${edge==='a'?'In':'Out'} ${clock(clockAt(selection[edge]),3)} · Arrow keys step ${edge==='a'?'keyframes':'frames'}`}
+            onpointerdown={event => start(event, edge)} onkeydown={event => handleKey(event, edge)}></button>
+        {/if}
+      {/each}
+    {/if}
+    {#if hover && !popup.length}
+      <div class="hover-card" style:left="clamp(106px, {pct(hover.time)}%, calc(100% - 106px))" role="tooltip">
+        {#if hover.event?.kind==='screenshot' && hover.event.path}
+          <img src={convertFileSrc(hover.event.path)} alt="Screenshot preview" />
+        {:else if hoverFootage}<div class="frame">{#if thumb}<img src={thumb.image} alt="Video frame preview" />{/if}</div>{/if}
+        {#if hover.event}<strong>{momentTitle(hover.event)}</strong>{/if}
+        <span class="when"><b>{clock(clockAt(hover.time), perPixel < 0.05 ? 3 : perPixel < 1.5)}</b><small>{hoverFootage ? timeOfDay(hover.time) : 'Not recorded'}</small></span>
+      </div>
+    {/if}
+    {#if popup.length}
+      <div class="cluster" role="region" aria-label="Grouped moments">
+        <div class="row"><strong class="grow">{popup.length} nearby moments</strong><button class="btn ghost sm" onclick={() => popup=[]}>Close</button></div>
+        {#each popup as event (event.id)}
+          <button class="cluster-event" onclick={() => { onevent(event); popup=[]; }}>
+            <span class="grow">{momentTitle(event)}</span><time>{clock(clockAt(event.t),true)}</time>
+          </button>
+        {/each}
+      </div>
+    {/if}
   </div>
 </div>
 
 <style>
-  .timeline{position:relative;min-width:0;flex:none;padding:12px 14px 3px;border:1px solid var(--line);border-radius:10px;background:var(--surface)}
-  .detail{height:90px;position:relative;touch-action:none;cursor:crosshair;user-select:none}.ruler{position:absolute;inset:0 0 auto;height:25px;overflow:hidden}.ruler span{position:absolute;font-size:12px;color:var(--text-2);transform:translateX(-50%);padding-bottom:6px;border-bottom:1px solid var(--line-strong);font-variant-numeric:tabular-nums;white-space:nowrap}.ruler span:first-child{transform:none}.ruler span:last-child{transform:translateX(-100%)}.footage-lane{position:absolute;top:27px;height:38px;left:0;right:0;border-radius:5px;overflow:hidden;background:repeating-linear-gradient(135deg,var(--bg) 0 5px,var(--surface-2) 5px 6px)}.footage{position:absolute;height:100%;background:color-mix(in srgb,var(--accent) 21%,var(--surface-3));border-inline:1px solid var(--line-strong)}.clip-range{position:absolute;top:27px;height:38px;background:var(--accent-soft);border-block:2px solid var(--accent);cursor:grab;display:grid;place-items:center;overflow:hidden}.clip-range span{font-size:11px;color:var(--accent);font-variant-numeric:tabular-nums;white-space:nowrap}.handle{position:absolute;top:24px;height:44px;width:14px;border:0;background:var(--accent);border-radius:4px;padding:0;cursor:ew-resize;z-index:3;transform:translateX(-50%);touch-action:none}.handle::after{content:'';display:block;width:2px;height:16px;background:var(--text-on-accent);margin:auto;border-radius:2px}.snapped .handle{background:var(--accent-hover)}.event-lane{position:absolute;inset:65px 0 0;pointer-events:none}.moment{position:absolute;transform:translateX(-50%);min-width:25px;height:25px;border:1px solid transparent;background:var(--warn-soft);color:var(--warn);border-radius:5px;font-size:11px;font-weight:600;padding:0 4px;cursor:pointer;pointer-events:auto}.moment:hover,.moment:focus-visible{border-color:currentColor;z-index:5}.moment.shot{color:var(--accent);background:var(--accent-soft)}.playhead{position:absolute;top:22px;bottom:32px;width:2px;background:var(--text);pointer-events:none;z-index:2}.playhead span{position:absolute;top:-2px;left:-4px;width:10px;height:8px;clip-path:polygon(0 0,100% 0,100% 50%,50% 100%,0 50%);background:var(--text)}
-  .timeline-footer,.zoom-controls{display:flex;align-items:center;gap:4px}.timeline-footer{justify-content:space-between;min-height:30px}.view-label{font-size:12px;color:var(--text-2);font-variant-numeric:tabular-nums}.hover-card{position:absolute;bottom:120px;width:220px;transform:translateX(-50%);padding:8px;background:var(--surface-2);border:1px solid var(--line-strong);border-radius:8px;box-shadow:var(--shadow-pop);z-index:8;pointer-events:none;display:flex;flex-direction:column;font-size:12px;gap:4px}.hover-card img{width:100%;max-height:124px;object-fit:contain;background:#000;border-radius:4px}.hover-card strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.hover-card span{color:var(--text-2)}.cluster{position:absolute;bottom:45px;right:18px;width:min(420px,calc(100% - 36px));max-height:240px;overflow:auto;background:var(--surface-2);border:1px solid var(--line-strong);border-radius:8px;padding:10px;z-index:9;box-shadow:var(--shadow-pop)}.cluster-event{display:flex;align-items:center;gap:10px;width:100%;padding:10px 6px;background:transparent;border:0;text-align:left;cursor:pointer;border-radius:5px;color:var(--text)}.cluster-event:hover{background:var(--surface-3)}.cluster-event span:first-child{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .timeline { position: relative; flex: none; padding: 0 18px; background: var(--surface); }
+  .seek-strip { position: relative; height: 58px; margin-top: 4px; }
+  .detail { position: absolute; inset: 0; touch-action: none; cursor: crosshair; user-select: none; }
+  .footage-lane { position: absolute; inset: 21px 0 auto; height: 9px; overflow: hidden; border-radius: 3px;
+    background: repeating-linear-gradient(135deg, var(--bg) 0 4px, var(--surface-3) 4px 5px); }
+  .footage, .played, .dim, .clip-range { position: absolute; height: 100%; }
+  .footage { background: color-mix(in srgb, var(--accent) 34%, var(--surface-3)); min-width: 1px; }
+  .played { background: color-mix(in srgb, var(--accent) 80%, var(--surface)); }
+  .dim { background: #080b1299; }
+  .clip-range { background: color-mix(in srgb, var(--accent) 25%, transparent); border-block: 1px solid var(--accent); }
+  .session-label { position: absolute; top: 0; padding-left: 1px; font-size: 10px; line-height: 12px; color: var(--text-2); white-space: nowrap; pointer-events: none; }
+  .tick { position: absolute; top: 33px; height: 4px; width: 1px; background: var(--line-strong); pointer-events: none; }
+  .tick i { position: absolute; top: 6px; left: 0; transform: translateX(-50%); font-style: normal; font-size: 10px; line-height: 1; color: var(--text-2);
+    font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .saved-clip { position: absolute; top: 16px; height: 3px; min-width: 3px; border-radius: 2px; background: var(--ok, #4cc38a); pointer-events: none; }
+  .playhead { position: absolute; top: 15px; height: 21px; width: 2px; background: var(--text); pointer-events: none; z-index: 2; }
+  .playhead::before { content: ''; position: absolute; top: -3px; left: -3px; width: 8px; height: 5px; background: var(--text); clip-path: polygon(0 0,100% 0,50% 100%); }
+  .moment, .handle { position: absolute; border: 0; padding: 0; background: transparent; touch-action: none; }
+  .moment { top: 4px; width: 22px; height: 17px; transform: translateX(-50%); cursor: pointer; color: var(--warn); }
+  .moment::after { content: ''; position: absolute; width: 5px; height: 5px; top: 6px; left: 8px; transform: rotate(45deg); background: currentColor; }
+  .moment.shot { color: var(--accent); }
+  .moment.shot::after { transform: none; border-radius: 1px; }
+  .moment.grouped::after { box-shadow: 3px -3px 0 color-mix(in srgb, currentColor 65%, transparent); }
+  .moment:hover::after, .moment:focus-visible::after { outline: 1px solid currentColor; outline-offset: 2px; }
+  .handle { top: 12px; width: 24px; height: 29px; cursor: ew-resize; z-index: 3; }
+  .handle.start { transform: translateX(-85%); }
+  .handle.end { transform: translateX(-15%); }
+  .handle::after { content: ''; position: absolute; top: 5px; left: calc(15% - 2px); width: 4px; height: 17px; border-radius: 2px; background: var(--accent); }
+  .handle.start::after { left: calc(85% - 2px); }
+  .handle:hover::after, .handle.dragging::after, .handle:focus-visible::after { background: var(--accent-hover); box-shadow: 0 0 0 2px var(--accent-soft); }
+  .hover-card, .cluster { position: absolute; bottom: calc(100% + 5px); z-index: 8; background: var(--surface-2); border: 1px solid var(--line-strong); border-radius: 8px; box-shadow: var(--shadow-pop); }
+  .hover-card { display: grid; gap: 4px; width: max-content; max-width: 212px; padding: 6px 9px; transform: translateX(-50%); pointer-events: none; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .hover-card img { width: 192px; max-height: 108px; object-fit: contain; background: #000; border-radius: 4px; display: block; }
+  .hover-card .frame { width: 192px; aspect-ratio: 16/9; background: #05070a; border-radius: 4px; overflow: hidden; display: grid; place-items: center; }
+  .hover-card .frame img { width: 100%; height: 100%; max-height: none; }
+  .when { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+  .when b { font-weight: 600; } .when small { color: var(--text-2); font-size: 11px; }
+  .hover-card strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cluster { right: 0; width: min(390px,100%); max-height: 240px; overflow: auto; padding: 10px; }
+  .cluster-event { display: flex; align-items: center; gap: 10px; width: 100%; padding: 8px; background: transparent; border: 0; text-align: left; cursor: pointer; border-radius: 5px; color: var(--text); }
+  .cluster-event:hover { background: var(--surface-3); }
+  .cluster-event time { font-variant-numeric: tabular-nums; color: var(--text-2); }
 </style>

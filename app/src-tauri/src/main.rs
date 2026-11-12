@@ -716,6 +716,22 @@ async fn library_game_art(app: AppHandle) -> std::collections::BTreeMap<String, 
     }).collect()
 }
 
+/// Copy a clip, recording or screenshot to a place the player picked. The Library file stays.
+#[tauri::command]
+async fn export_clip(state: State<'_, AppState>, path: String, dest: String) -> Result<(), String> {
+    let from = inside_root(&state, &path)?;
+    if !from.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp4") || e.eq_ignore_ascii_case("png")) {
+        return Err("Only clips, recordings and screenshots can be copied from here.".into());
+    }
+    let to = PathBuf::from(dest);
+    if std::fs::canonicalize(&to).is_ok_and(|t| t == from) {
+        return Err("That is the file itself. Choose another name or folder.".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || std::fs::copy(&from, &to).map(|_| ()).map_err(|e| format!("Could not save the copy: {e}")))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 fn rename_clip(state: State<AppState>, path: String, name: String) -> Result<String, String> {
     let p = recording_path(&state, &path)?;
@@ -1166,6 +1182,7 @@ fn main() {
             clear_temp_cache,
             list_clips,
             library_game_art,
+            export_clip,
             open_path,
             reveal_path,
             open_capture_folder,

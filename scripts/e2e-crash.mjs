@@ -37,7 +37,12 @@ const r = b.send('recover_leftovers');
 const rec = await b.waitFor(m => m.re === r && m.event === 'recovered', 60000);
 check(rec.data.clips.length === 1 && rec.data.failed.length === 0, `recovered: ${JSON.stringify(rec.data)}`);
 b.send('get_state'); await sleep(800);
-check(b.state().leftover_buffer_bytes === 0, 'leftover removed only after the clip was saved');
+// The recovered footage stays in the recording history (it ages out like any other; nothing is
+// deleted behind the player's back), and saving it again points at the clip already made.
+check(b.state().leftover_buffer_bytes === left, 'the recovered footage is still in the history, untouched');
+const again = b.send('recover_leftovers');
+const second = await b.waitFor(m => m.re === again && m.event === 'recovered', 60000);
+check(second.data.clips.length === 1 && second.data.clips[0] === rec.data.clips[0], 'recovering again creates no duplicate clip');
 console.log('RECOVERED=' + (rec.data.clips[0] ?? ''));
 // The marker survives the crash, placed where it was in the recovered clip. The recovered clip
 // ends at the kill, so marker position from the end = (now at kill - marker.t), within ~1.5 s.

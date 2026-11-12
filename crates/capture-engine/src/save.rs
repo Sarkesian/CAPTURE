@@ -49,8 +49,37 @@ pub fn remux(
     track_names: &[String],
     final_path: &Path,
 ) -> Result<(ClipResult, f64), String> {
+    write_clip(segments, lead_in, seg0_start, want_start..clip_end, track_names, final_path, false, true)
+}
+
+/// A playback window for Replay: the same stream copy, written once (no second pass moving the
+/// index to the front, which a local player does not need and which doubles the disk work).
+pub fn remux_preview(
+    segments: &[(PathBuf, f64)],
+    lead_in: Option<&Path>,
+    seg0_start: f64,
+    clip_end: f64,
+    track_names: &[String],
+    final_path: &Path,
+) -> Result<(ClipResult, f64), String> {
+    write_clip(segments, lead_in, seg0_start, seg0_start..clip_end, track_names, final_path, false, false)
+}
+
+pub fn remux_aligned(
+    segments: &[(PathBuf, f64)], lead_in: Option<&Path>, range: std::ops::Range<f64>,
+    track_names: &[String], final_path: &Path,
+) -> Result<(ClipResult, f64), String> {
+    let segment_start = segments.first().ok_or("No recorded footage in this range")?.1;
+    write_clip(segments, lead_in, segment_start, range, track_names, final_path, true, true)
+}
+
+fn write_clip(
+    segments: &[(PathBuf, f64)], lead_in: Option<&Path>, seg0_start: f64,
+    range: std::ops::Range<f64>, track_names: &[String], final_path: &Path, aligned: bool, faststart: bool,
+) -> Result<(ClipResult, f64), String> {
+    let clip_end = range.end;
     let partial = storage::partial_path(final_path);
-    let r = unsafe { remux_inner(segments, lead_in, seg0_start, want_start, clip_end, track_names, &partial) };
+    let r = unsafe { remux_inner(segments, lead_in, seg0_start, range.start, clip_end, track_names, &partial, aligned, faststart) };
     let actual_start = match r {
         Ok(t) => t,
         Err(e) => {
@@ -61,6 +90,10 @@ pub fn remux(
     let verified = verify(&partial, track_names.len() as u32);
     let res = match verified {
         Ok(mut v) => {
+            if aligned && (v.duration_secs - (clip_end - actual_start)).abs() > 0.004 {
+                let _ = std::fs::remove_file(&partial);
+                return Err("This recording could not be saved at the selected duration. Adjust the trim handles and try again.".into());
+            }
             if clip_end < 1e8 && v.duration_secs + 0.15 < clip_end - actual_start {
                 let _ = std::fs::remove_file(&partial);
                 return Err("The clip is incomplete. Original recording retained; try the available range again.".into());
@@ -78,6 +111,43 @@ pub fn remux(
         }
     };
     res
+}
+
+/// Presentation times and durations from one source segment, in the history timebase.
+pub fn frame_timing(path: &Path, segment_start: f64) -> Result<Vec<capture_protocol::FrameTiming>, String> {
+    unsafe {
+        let input = open_input(path)?;
+        let streams = std::slice::from_raw_parts((*input.0).streams, (*input.0).nb_streams as usize);
+        let index = streams.iter().copied().position(|stream| {
+            (*(*stream).codecpar).codec_type == ff::AVMediaType::AVMEDIA_TYPE_VIDEO
+        }).ok_or("Segment has no video track")?;
+        let stream = streams[index];
+        let tb = (*stream).time_base;
+        let rate = ff::av_guess_frame_rate(input.0, stream, null_mut());
+        let fallback_duration = if rate.num > 0 { rate.den as f64 / rate.num as f64 } else { 0.0 };
+        let seconds = tb.num as f64 / tb.den as f64;
+        let mut packet = ff::av_packet_alloc();
+        if packet.is_null() { return Err("Could not read frame timing".into()); }
+        let mut samples = Vec::new();
+        while ff::av_read_frame(input.0, packet) >= 0 {
+            let p = &*packet;
+            if p.stream_index as usize == index && p.pts != ff::AV_NOPTS_VALUE {
+                samples.push((p.pts, p.duration, p.flags & ff::AV_PKT_FLAG_KEY != 0));
+            }
+            ff::av_packet_unref(packet);
+        }
+        ff::av_packet_free(&mut packet);
+        let origin = samples.iter().find(|sample| sample.2).ok_or("Segment has no video keyframe")?.0;
+        samples.sort_by_key(|sample| sample.0);
+        Ok(samples.iter().enumerate().filter_map(|(i, &(pts, duration, key))| {
+            if pts < origin { return None; }
+            let start = segment_start + (pts - origin) as f64 * seconds;
+            let duration = if duration > 0 { duration as f64 * seconds } else {
+                samples.get(i + 1).map_or(fallback_duration, |next| (next.0 - pts) as f64 * seconds)
+            };
+            (duration > 0.0).then_some(capture_protocol::FrameTiming { start, end: start + duration, key })
+        }).collect())
+    }
 }
 
 /// Video keyframe pts (stream tb) in a segment, in order.
@@ -150,7 +220,7 @@ pub fn pick_origin(keys: &[i64], want: i64) -> Option<i64> {
 /// audio, so the audio for the clip's first moments (up to the encoder's latency: ~0.1 s with
 /// NVENC, ~0.5 s with the software encoder) was written into that earlier segment. Only its
 /// audio at or after the clip's first frame is used; its video is never.
-unsafe fn remux_inner(segments: &[(PathBuf, f64)], lead_in: Option<&Path>, seg0_start: f64, want_start: f64, clip_end: f64, names: &[String], out: &Path) -> Result<f64, String> {
+unsafe fn remux_inner(segments: &[(PathBuf, f64)], lead_in: Option<&Path>, seg0_start: f64, want_start: f64, clip_end: f64, names: &[String], out: &Path, aligned: bool, faststart: bool) -> Result<f64, String> {
     let first = segments.first().ok_or("No footage in the buffer yet")?;
     let ic0 = open_input(&first.0)?;
     let n = (*ic0.0).nb_streams as usize;
@@ -203,7 +273,9 @@ unsafe fn remux_inner(segments: &[(PathBuf, f64)], lead_in: Option<&Path>, seg0_
     av::dict_set(&mut (*oc.0).metadata, "comment", "Recorded with CAPTURE");
     check(ff::avio_open(&mut (*oc.0).pb, cpath.as_ptr(), ff::AVIO_FLAG_WRITE), "create clip file")?;
     let mut opts = null_mut();
-    av::dict_set(&mut opts, "movflags", "+faststart");
+    if faststart {
+        av::dict_set(&mut opts, "movflags", "+faststart");
+    }
     let r = ff::avformat_write_header(oc.0, &mut opts);
     ff::av_dict_free(&mut opts);
     check(r, "clip header")?;
@@ -220,6 +292,9 @@ unsafe fn remux_inner(segments: &[(PathBuf, f64)], lead_in: Option<&Path>, seg0_
     let want_pts = p0 + secs_to_tb((want_start - seg0_start).max(0.0));
     let origin_pts = pick_origin(&keys, want_pts).unwrap_or(p0);
     let actual_start = seg0_start + (origin_pts - p0) as f64 * vtb.num as f64 / vtb.den as f64;
+    if aligned && (actual_start - want_start).abs() > 0.000_01 {
+        return Err("The selected start frame is no longer available. Adjust the start handle and try again.".into());
+    }
     let end_pts = p0 + secs_to_tb(clip_end - seg0_start);
     let mut origin: Option<i64> = Some(origin_pts); // in video stream tb
     let mut last_dts = vec![i64::MIN; n];
@@ -257,9 +332,15 @@ unsafe fn remux_inner(segments: &[(PathBuf, f64)], lead_in: Option<&Path>, seg0_
             };
             let o_in = ff::av_rescale_q(o, vtb, (*ist).time_base);
             let rel = ((*pkt).pts - o_in) as f64 * (*ist).time_base.num as f64 / (*ist).time_base.den as f64;
-            if rel < 0.0 || rel > span {
+            let past_end = if aligned { rel >= span - 0.000_001 } else { rel > span };
+            if rel < 0.0 || past_end {
                 ff::av_packet_unref(pkt);
                 continue;
+            }
+            if aligned {
+                let tb = (*ist).time_base;
+                let remaining = ((span - rel) * tb.den as f64 / tb.num as f64).round() as i64;
+                if (*pkt).duration > remaining { (*pkt).duration = remaining; }
             }
             (*pkt).pts -= o_in;
             if (*pkt).dts != ff::AV_NOPTS_VALUE {

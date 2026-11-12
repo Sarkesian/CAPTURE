@@ -15,8 +15,9 @@ foreach($entry in $baselineManifest.files){
     Copy-Item -LiteralPath $source -Destination $dest
 }
 Copy-Item -LiteralPath "$repo\target\release\CAPTURE.exe" -Destination "$out\CAPTURE.exe" -Force
+Copy-Item -LiteralPath "$repo\target\release\capture-worker.exe" -Destination "$out\Runtime\capture-worker.exe" -Force
 Copy-Item -LiteralPath "$PSScriptRoot\Review.ps1" -Destination $out
-Copy-Item -LiteralPath "$repo\docs\LIBRARY_REPLAY_REVIEW.md" -Destination "$out\Resources\REPLAY_REVIEW.md"
+Copy-Item -LiteralPath "$repo\docs\CLIP_EDITOR_REVIEW.md" -Destination "$out\Resources\REPLAY_REVIEW.md"
 $fixtures=Join-Path $repo 'test-output\native-replay-media'
 New-Item -ItemType Directory -Path "$out\ReviewCaptures\Background Recording" | Out-Null
 # Only the five deliberately generated fixtures, never the live regression captures/catalog.
@@ -49,9 +50,8 @@ The six-hour sample has a dense group near 2:00:06 and a final highlight near 5:
 Open a Background card, use Moments to find a marker or screenshot, and click Clip.
 Drag either handle, then click Save Clip. Saves go only to this review folder's Library.
 
-The Runtime files are byte-identical to the installed 0.6.4 release. Only CAPTURE.exe
-contains the new UI. The review build has its own Windows app identity. See Resources\REPLAY_REVIEW.md for the
-implementation report, verified behavior, limitations and source rollback point.
+The review build has its own Windows app identity. The worker includes frame timing and aligned clip saves.
+See Resources\REPLAY_REVIEW.md for the implementation report and tested behavior.
 "@
 [IO.File]::WriteAllText("$out\REVIEW.txt",$readme,[Text.UTF8Encoding]::new($false))
 $files=@(Get-ChildItem -LiteralPath $out -Recurse -File | Where-Object { -not $_.FullName.StartsWith("$out\ReviewCaptures\",[StringComparison]::OrdinalIgnoreCase) } | Sort-Object FullName | ForEach-Object {

@@ -111,11 +111,17 @@ export interface SavedClip {
   bytes: number;
   video_streams: number;
   audio_tracks: string[];
+  /** This footage was already saved: `path` is that earlier file; nothing new was written. */
+  existing?: boolean;
 }
 
 export interface Review { session: string; path: string; start: number; end: number; game: string; past?: boolean; markers?: Marker[] }
+export interface FrameTiming { start: number; end: number; key: boolean }
 export interface TimelineEvent { id: string; kind: string; t: number; end: number | null; label: string; path: string | null; marker: Marker | null }
-export interface HistorySession { id: string; game: string; created_ms: number; ended: boolean; intervals: [number, number][]; events: TimelineEvent[] }
+/** One internal recording of a session (a new one starts when the game relaunches or changes resolution). */
+export interface HistoryPart { id: string; offset: number; end: number; width: number; height: number }
+/** A gameplay session as the player sees it. All times are seconds since `created_ms`; gaps between `intervals` are moments that were not recorded. */
+export interface HistorySession { id: string; game: string; created_ms: number; ended: boolean; intervals: [number, number][]; events: TimelineEvent[]; parts: HistoryPart[]; bytes: number }
 export interface HistoryState { failed_saves: {id:string;session:string;start:number;end:number;error:string}[];sessions: HistorySession[]; bytes: number; preview_bytes: number; retained_secs: number; target_secs: number; reason: string | null }
 
 export interface ClipEntry { path: string; name: string; game: string; bytes: number; modified_ms: number; kind: 'clip' | 'session' | 'screenshot'; has_stems: boolean; has_markers: boolean }
@@ -125,15 +131,17 @@ export type EngineMessage = { v: number; re?: number } & (
   | { event: 'state'; data: EngineState }
   | { event: 'targets'; data: { windows: WindowTarget[]; displays: DisplayTarget[] } }
   | { event: 'capture_triggered'; data: { action: 'screenshot' | 'replay' | 'recording_start' | 'recording_stop'; overlay_notice: boolean } }
-  | { event: 'save_started'; data: { save_id: number; requested_secs: number } }
+  | { event: 'save_started'; data: { save_id: number; requested_secs: number; note?: string | null } }
   | { event: 'save_finished'; data: SavedClip }
   | { event: 'save_failed'; data: { save_id: number; message: string } }
   | { event: 'error'; data: { message: string } }
   | { event: 'hotkey_pressed'; data: { action: HotkeyAction } }
   | { event: 'marker_added'; data: Marker }
   | { event: 'review_ready'; data: Review }
-  | { event: 'review_failed'; data: { message: string } }
+  | { event: 'review_failed'; data: { message: string; superseded?: boolean } }
+  | { event: 'history_thumb'; data: { session: string; at: number; t: number | null; image: string | null; error: string | null } }
   | { event: 'history_ready'; data: HistoryState }
+  | { event: 'history_frames'; data: { frames: FrameTiming[]; error: string | null } }
   | { event: 'clip_info'; data: { path: string; duration_secs: number | null; error: string | null } }
   | { event: 'audio_devices'; data: { inputs: AudioDevice[]; outputs: AudioDevice[]; apps: AudioApp[] } }
   | { event: 'stems_done'; data: { path: string; folder: string | null; files: string[]; error: string | null } }

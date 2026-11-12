@@ -2,10 +2,11 @@ import type { TimelineEvent } from './types';
 
 export type Range = { a: number; b: number };
 export const clamp = (n: number, a: number, b: number) => Math.max(a, Math.min(b, n));
-export function clock(t: number, precise = false): string {
-  const n = Math.max(0, t), tenths = Math.round(n * 10), s = precise ? Math.floor(tenths / 10) : Math.floor(n);
+export function clock(t: number, precise: boolean | 3 = false): string {
+  const scale = precise === 3 ? 1000 : 10;
+  const n = Math.max(0, t), units = Math.round(n * scale), s = precise ? Math.floor(units / scale) : Math.floor(n);
   const text = `${Math.floor(s / 3600)}:${String(Math.floor(s / 60) % 60).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
-  return precise ? `${text}.${tenths % 10}` : text;
+  return precise ? `${text}.${String(units % scale).padStart(precise === 3 ? 3 : 1, '0')}` : text;
 }
 export function parseClock(value: string): number | null {
   const parts = value.trim().split(':');
@@ -43,7 +44,7 @@ export function containing(intervals: [number, number][], t: number) {
   return intervals.find(([a, b]) => t >= a && t < b);
 }
 export function validSelection(intervals: [number, number][], range: Range | null) {
-  return !!range && range.b - range.a >= 0.1 && intervals.some(([a, b]) => range.a >= a - 0.001 && range.b <= b + 0.001);
+  return !!range && range.b - range.a >= 0.001 && intervals.some(([a, b]) => range.a >= a - 0.001 && range.b <= b + 0.001);
 }
 export function selectionAround(intervals: [number, number][], t: number, before: number, after: number): Range | null {
   const interval = containing(intervals, t);

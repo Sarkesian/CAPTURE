@@ -221,7 +221,7 @@
         <button class="btn ghost sm" onclick={() => (view = 'quick')}><Icon name="settings" size={15} />Quick settings</button>
         <button class="btn ghost sm" onclick={openCaptureFolder}><Icon name="folder" size={15} />Open folder</button>
         <span class="faint xs grow ellipsis right">
-          {s.capture_root}{e?.free_bytes != null ? ` · ${fmtBytes(e.free_bytes)} free` : ''} · background recording {fmtBytes(e?.buffer_bytes ?? 0)}
+          {s.capture_root}{e?.free_bytes != null ? ` · ${fmtBytes(e.free_bytes)} free` : ''} · background history {fmtBytes(app.history?.bytes ?? e?.buffer_bytes ?? 0)}
         </span>
       </footer>
     </div>

@@ -78,7 +78,7 @@ pub fn is_session_file(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     (n.starts_with("seg_") && n.ends_with(".ts"))
         || (n.starts_with("review_") && (n.ends_with(".mp4") || n.ends_with(".mp4.partial")))
-        || matches!(n.as_str(), "session.json" | "markers.json" | "markers.json.tmp" | ENDED_FILE)
+        || matches!(n.as_str(), "session.json" | "markers.json" | "markers.json.tmp" | "events.jsonl" | ENDED_FILE)
 }
 
 /// Delete CAPTURE's own files from a buffer session folder, then the folder if that left it

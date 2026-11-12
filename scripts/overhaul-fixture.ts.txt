@@ -1,0 +1,71 @@
+// Browser fixture for scripts/ui-overhaul-check.mjs: the real UI with a mocked engine.
+import { mount } from 'svelte';
+import Panel from '../../src/overlay/HistoryPanel.svelte';
+import App from '../../src/App.svelte';
+import { app, init } from '../../src/lib/store.svelte';
+import '../../src/app.css';
+
+const callbacks = new Map<number, (m: unknown) => void>(), listeners = new Map<string, number>();
+let callback = 0, serial = 0;
+const folder = location.pathname.slice(0, location.pathname.lastIndexOf('/'));
+const calls: any[] = [];
+Object.assign(window, { fixtureCalls: calls, fixtureApp: app });
+const settings = { version: 3, capture_root: 'fixture', replay_secs: 120, history_secs: 7200, buffer_cap_gb: 50, min_free_gb: 10, quality: 'high', markers: { protect_before_secs: 30, protect_after_secs: 15 }, per_game: [], hotkeys: {}, notices: {}, volumes: {} };
+const T0 = 1794340800000;
+const entry = (kind: string, name: string, p: string, game: string) => ({ kind, name, path: folder + '/' + p, game, bytes: 123456, modified_ms: T0, has_stems: false, has_markers: false });
+const media = [entry('clip', '2026-11-10_18-06-59_The Witcher 3_Clip.mp4', 'clip.mp4?saved', 'The Witcher 3'), entry('screenshot', 'Victory.png', 'shot.svg', 'The Witcher 3')];
+const part = (id: string, offset: number, end: number, width = 3840, height = 2160) => ({ id, offset, end, width, height });
+const ev = (id: string, kind: string, t: number, label: string, end: number | null = null, path: string | null = null) => ({ id, kind, t, end, label, path, marker: null });
+// An evening of The Witcher 3 (the game changed resolution once: two internal recordings and
+// a 20-second gap), an earlier session of it, a 2-second flicker, and Hollow Knight being recorded now.
+const live = { id: 'hk-live', game: 'Hollow Knight', created_ms: T0 + 9000_000, ended: false, intervals: [[0, 300]], events: [] as any[], parts: [part('hk-live', 0, 300, 1920, 1080)], bytes: 3e8 };
+const sessions = [
+  { id: 'w-early', game: 'The Witcher 3', created_ms: T0, ended: true, intervals: [[0, 1800]], events: [], parts: [part('w-early', 0, 1800)], bytes: 9e9 },
+  { id: 'flicker', game: 'The Witcher 3', created_ms: T0 + 3000_000, ended: true, intervals: [[0, 2]], events: [], parts: [part('flicker', 0, 2, 1920, 1080)], bytes: 2e6 },
+  { id: 'w-late', game: 'The Witcher 3', created_ms: T0 + 4000_000, ended: true, intervals: [[0, 3500], [3520, 7100]],
+    events: [ev('w-late/marker:1', 'marker', 1200, 'Boss door'), ev('w-late-b/marker:1', 'marker', 5000, 'Ambush'), ev('w-late/shot:1', 'screenshot', 2000, 'Victory.png', null, folder + '/shot.svg'), ev('w-late/clip:1', 'clip', 600, 'Clip.mp4', 720, folder + '/clip.mp4')],
+    parts: [part('w-late', 0, 3500), part('w-late-b', 3520, 7100, 2560, 1440)], bytes: 4e10 },
+  live,
+];
+const emit = (payload: any) => { const handler = listeners.get('engine'); if (handler) callbacks.get(handler)?.({ event: 'engine', payload }); };
+const thumbImage = (session: string, t: number) => 'data:image/svg+xml,' + encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180" data-t="${session}:${t}"><rect width="320" height="180" fill="hsl(${(Math.round(t / 20) + session.length * 47) % 360} 45% 30%)"/><text x="20" y="100" font-size="30" fill="#fff">${session} ${t.toFixed(2)}s</text></svg>`);
+(window as any).__TAURI_INTERNALS__ = {
+  transformCallback(fn: (m: unknown) => void) { callbacks.set(++callback, fn); return callback; },
+  unregisterCallback(id: number) { callbacks.delete(id); },
+  convertFileSrc(p: string) { return p; },
+  async invoke(cmd: string, args: any) {
+    if (cmd === 'bootstrap') return { settings, data_dir: 'fixture', last_state: null, engine_down: null, app: null, path_issues: [], notices: [] };
+    if (cmd === 'plugin:event|listen') { listeners.set(args.event, args.handler); return ++serial; }
+    if (cmd === 'list_clips') return media.filter(c => c.kind === ({ clips: 'clip', sessions: 'session', screenshots: 'screenshot' } as any)[args?.kind ?? 'clips']);
+    if (cmd === 'check_paths') return [];
+    if (cmd === 'library_game_art') return {};
+    if (cmd === 'engine_command') {
+      const id = ++serial, c = args.command;
+      calls.push(c);
+      const reply = (event: string, data: unknown, ms = 30) => setTimeout(() => emit({ v: 1, re: id, event, data }), ms);
+      if (c.cmd === 'history') {
+        // The live session keeps growing between polls.
+        live.intervals[0][1] += 2.5; live.parts[0].end = live.intervals[0][1];
+        reply('history_ready', { sessions: JSON.parse(JSON.stringify(sessions)), bytes: 4.9e10, preview_bytes: 0, retained_secs: 7180, target_secs: 7200, reason: null, failed_saves: [] });
+      }
+      if (c.cmd === 'history_review') { const start = Math.floor(c.args.at / 3) * 3; reply('review_ready', { session: c.args.session, path: folder + '/clip.mp4?at=' + start, start, end: start + 4, game: 'Fixture', past: true, markers: [] }); }
+      if (c.cmd === 'history_thumb') { const t = c.args.exact ? c.args.at : Math.floor(c.args.at); reply('history_thumb', { session: c.args.session, at: c.args.at, t, image: thumbImage(c.args.session, t), error: null }, 60); }
+      if (c.cmd === 'history_frames') {
+        const from = Math.max(0, Math.floor(c.args.at) - 2) * 60;
+        reply('history_frames', { frames: Array.from({ length: 300 }, (_, i) => ({ start: (from + i) / 60, end: (from + i + 1) / 60, key: (from + i) % 60 === 0 })), error: null });
+      }
+      if (c.cmd === 'history_save') { reply('capture_triggered', { action: 'replay', overlay_notice: false }); reply('save_finished', { save_id: 1, path: folder + '/clip.mp4?new', requested_secs: 45, duration_secs: 45, bytes: 1, video_streams: 1, audio_tracks: [] }, 120); }
+      if (c.cmd === 'history_delete') { const i = sessions.findIndex(s => s.id === c.args.session); if (i >= 0) sessions.splice(i, 1); reply('history_ready', { sessions: JSON.parse(JSON.stringify(sessions)), bytes: 1e10, preview_bytes: 0, retained_secs: 5000, target_secs: 7200, reason: null, failed_saves: [] }); }
+      return id;
+    }
+    return null;
+  },
+};
+(window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
+const target = document.getElementById('app')!;
+if (location.hash === '#compact') {
+  await init();
+  (app as any).engine = { target_name: 'Hollow Knight' };
+  mount(Panel, { target, props: { compact: true, onclose() {} } });
+} else { app.tab = 'library'; mount(App, { target }); }
+(window as any).fixtureReady = true;

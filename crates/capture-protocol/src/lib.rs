@@ -46,8 +46,18 @@ pub enum Command {
     /// temporary MP4). Footage used by the review is protected until released.
     PrepareReview,
     History,
-    HistoryReview { session: String, at: f64 },
-    HistorySave { session: String, start: f64, end: f64 },
+    /// Open a playable window of a recording at session time `at`. `viewer` names the asking
+    /// view ("main", "overlay"): a newer request from the same viewer supersedes its older ones.
+    /// `prefetch` marks the window that follows the one being played (never superseding a seek).
+    HistoryReview { session: String, at: f64, #[serde(default)] viewer: String, #[serde(default)] prefetch: bool },
+    HistoryFrames { session: String, at: f64 },
+    /// A small picture of the recording at session time `at` (answered with `HistoryThumb`).
+    /// `exact`: decode to that very frame instead of the keyframe at or before it.
+    HistoryThumb { session: String, at: f64, #[serde(default)] exact: bool, #[serde(default)] viewer: String },
+    /// Delete the temporary background footage of one recording session (saved clips,
+    /// recordings and screenshots are separate files and are never touched).
+    HistoryDelete { session: String },
+    HistorySave { session: String, start: f64, end: f64, #[serde(default)] aligned: bool },
     HistoryMarker { session: String, id: String, label: Option<String>, remove: bool },
     /// Done with a review snapshot. `path` names it (`Review::path`): a window that lets go of
     /// an older snapshot must not delete the one another window is watching. `None` = whichever.
@@ -96,7 +106,8 @@ pub enum Event {
     Targets { windows: Vec<WindowTarget>, displays: Vec<DisplayTarget> },
     /// Accepted input, emitted before any capture processing. Completion updates data only.
     CaptureTriggered { action: CaptureAction, overlay_notice: bool },
-    SaveStarted { save_id: u64, requested_secs: f64 },
+    /// `note` explains a save that is shorter than asked for (e.g. recording began 40 s ago).
+    SaveStarted { save_id: u64, requested_secs: f64, #[serde(default, skip_serializing_if = "Option::is_none")] note: Option<String> },
     SaveFinished(SavedClip),
     SaveFailed { save_id: u64, message: String },
     /// A command could not be executed. `message` is plain language for the user.
@@ -105,8 +116,12 @@ pub enum Event {
     HotkeyPressed { action: HotkeyAction },
     MarkerAdded(Marker),
     ReviewReady(Review),
-    ReviewFailed { message: String },
+    /// `superseded`: a newer request from the same viewer replaced this one (not an error).
+    ReviewFailed { message: String, #[serde(default)] superseded: bool },
+    /// `image` is a JPEG data URL of the frame at session time `t` (the nearest frame to `at`).
+    HistoryThumb { session: String, at: f64, t: Option<f64>, image: Option<String>, error: Option<String> },
     HistoryReady(HistoryState),
+    HistoryFrames { frames: Vec<FrameTiming>, error: Option<String> },
     ClipInfo { path: String, duration_secs: Option<f64>, error: Option<String> },
     AudioDevices { inputs: Vec<AudioDevice>, outputs: Vec<AudioDevice>, apps: Vec<AudioApp> },
     /// Real audio levels since the previous `Levels` message (peak and RMS, linear 0..1).
@@ -180,6 +195,31 @@ pub struct HistorySession {
     pub ended: bool,
     pub intervals: Vec<[f64; 2]>,
     pub events: Vec<TimelineEvent>,
+    /// The internal recordings this session is made of, in order (a new one starts whenever the
+    /// game is relaunched or changes resolution). Times are session seconds.
+    #[serde(default)]
+    pub parts: Vec<HistoryPart>,
+    /// Bytes of temporary footage still kept for this session.
+    #[serde(default)]
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HistoryPart {
+    pub id: String,
+    /// Session time of this part's media time 0.
+    pub offset: f64,
+    /// Session time where this part's recording ended (or has reached).
+    pub end: f64,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FrameTiming {
+    pub start: f64,
+    pub end: f64,
+    pub key: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -663,6 +703,9 @@ pub struct SavedClip {
     pub bytes: u64,
     pub video_streams: u32,
     pub audio_tracks: Vec<String>,
+    /// This exact footage was already saved: `path` is that earlier file and nothing new was written.
+    #[serde(default)]
+    pub existing: bool,
 }
 
 impl Request {

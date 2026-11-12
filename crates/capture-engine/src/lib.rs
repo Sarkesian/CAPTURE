@@ -16,13 +16,14 @@ pub mod mux;
 pub mod overlay;
 pub mod pipeline;
 pub mod probe;
-pub mod ring;
+pub mod review;
 pub mod save;
 pub mod shot;
 pub mod sound;
 pub mod stems;
 pub mod storage;
 pub mod targets;
+pub mod thumb;
 pub mod trace;
 pub mod video;
 pub mod wgc;
@@ -36,7 +37,8 @@ use capture_protocol::*;
 
 use audio::{MixParams, Role, Source, SourceSpec};
 use overlay::{Kind, Notice, Overlay};
-use pipeline::{Live, Pipeline, SaveKind, Settings, SourceKind};
+use history::ClipKind;
+use pipeline::{Live, Pipeline, Settings, SourceKind};
 
 pub type Emit = Arc<dyn Fn(Message) + Send + Sync>;
 
@@ -57,6 +59,8 @@ fn failed(m: impl Into<String>) -> Unresolved {
 pub struct Engine {
     history: Option<Arc<history::Catalog>>,
     history_maintenance: Instant,
+    /// Playback windows and thumbnails for Replay views, off the engine thread.
+    jobs: review::Jobs,
     cfg: Option<EngineConfig>,
     replay_on: bool,
     pipeline: Option<Pipeline>,
@@ -87,10 +91,6 @@ pub struct Engine {
     /// games already told "Overlay ready".
     ready_since: Option<(u32, Instant)>,
     ready_told: std::collections::HashSet<u32>,
-    /// The Replay snapshot of the previous background recording, while one is being watched.
-    past_review: Option<PathBuf>,
-    /// The previous background recording's folder and game (looked up once per folder).
-    past_seen: Option<(PathBuf, String)>,
 }
 
 /// How long a different game must stay in front before Auto mode switches to it: a little
@@ -117,47 +117,146 @@ pub fn fmt_secs(s: f64) -> String {
 }
 
 impl Engine {
-    fn publish_history(&self,re:Option<u64>) {
-        if let Some(h)=&self.history {
-            match h.state(self.cfg.as_ref().map_or(14400,|c|c.history_secs)) {
-                Ok(mut state)=>{
-                    if let Some(cfg)=&self.cfg {if state.bytes+state.preview_bytes>=cfg.buffer_cap_bytes.saturating_sub(10_000_000) {state.reason=Some("Storage budget limits available history; protected or imported recordings may exceed it".into());}}
-                    if !h.import_complete(){state.reason=Some("Recovering earlier recordings…".into());}
-                    self.send(re,Event::HistoryReady(state));
-                },
-                Err(e)=>self.send(re,Event::Error{message:format!("Recording history: {e}")})
+    fn history_target(&self) -> u32 {
+        self.cfg.as_ref().map_or(capture_protocol::default_history_secs(), |c| c.history_secs)
+    }
+
+    fn publish_history(&self, re: Option<u64>) {
+        let Some(h) = &self.history else { return };
+        match h.state(self.history_target()) {
+            Ok(mut state) => {
+                // Say why less than the configured history is kept, in the player's terms; the
+                // normal case (the oldest footage ages out at the configured length) says nothing.
+                let recovering = state.reason.take().filter(|r| r.starts_with("Earlier recordings"));
+                let short = state.retained_secs + 120.0 < state.target_secs as f64;
+                state.reason = if !h.import_complete() {
+                    Some("Recovering earlier recordings…".into())
+                } else if let (true, Some(cfg)) = (short, &self.cfg) {
+                    let low = storage::free_bytes(Path::new(&cfg.capture_root)).is_some_and(|f| f < cfg.min_free_bytes.saturating_add(1 << 30));
+                    if low {
+                        Some(format!("Keeping {} of history: the drive is down to the free space CAPTURE leaves untouched.", fmt_secs(state.retained_secs)))
+                    } else if state.bytes.saturating_add(256 << 20) >= cfg.buffer_cap_bytes {
+                        Some(format!("Keeping {} of history: the storage limit ({:.0} GB) is reached before {}. Raise the limit in Settings to keep more.", fmt_secs(state.retained_secs), cfg.buffer_cap_bytes as f64 / 1e9, fmt_secs(state.target_secs as f64)))
+                    } else {
+                        recovering
+                    }
+                } else {
+                    recovering
+                };
+                self.send(re, Event::HistoryReady(state));
             }
+            Err(e) => self.send(re, Event::Error { message: format!("Recording history: {e}") }),
         }
     }
-    fn history_review(&self,re:Option<u64>,session:String,at:f64) {
-        let Some(h)=self.history.clone() else {return;};let emit=self.emit.clone();
-        std::thread::spawn(move || {let event=match h.preview(&session,at){Ok(v)=>Event::ReviewReady(v),Err(message)=>Event::ReviewFailed{message}};emit(Message::new(re,event));});
+
+    fn history_review(&self, re: Option<u64>, session: String, at: f64, viewer: String, prefetch: bool) {
+        let Some(catalog) = self.history.clone() else {
+            self.send(re, Event::ReviewFailed { message: "Recording history is unavailable".into(), superseded: false });
+            return;
+        };
+        self.jobs.review(review::ReviewJob { re, catalog, session, at, viewer, prefetch });
     }
-    fn history_save(&mut self,re:Option<u64>,session:String,start:f64,end:f64) {
-        let Some(h)=self.history.clone() else {return;};
-        let mut lease=match h.lease(&session,start,end,"save") {Ok(l)=>l,Err(message)=>{self.send(re,Event::SaveFailed{save_id:0,message});return;}};
-        let id=self.next_save_id;self.next_save_id+=1;
-        self.capture_feedback(re,CaptureAction::Replay);
-        self.send(re,Event::SaveStarted{save_id:id,requested_secs:end-start});
-        let emit=self.emit.clone();let root=PathBuf::from(&self.cfg.as_ref().unwrap().capture_root);
-        let stems=self.editor_audio_files();
-        std::thread::spawn(move || {
-            let until=Instant::now()+std::time::Duration::from_secs(8);
-            while Instant::now()<until {
-                if h.media(&session,start,end+3.0).ok().and_then(|s|s.last().map(|s|s.end)).is_some_and(|t|t>=end){break;}
+
+    /// Save `[start, end]` (session time) of a session from Replay.
+    fn history_save(&mut self, re: Option<u64>, session: String, start: f64, end: f64, aligned: bool) {
+        let refuse = |this: &Self, message: String| this.send(re, Event::SaveFailed { save_id: 0, message });
+        let Some(h) = self.history.clone() else { return refuse(self, "Recording history is unavailable".into()) };
+        let (recording, offset) = match h.locate(&session, start) {
+            Ok(v) => v,
+            Err(message) => return refuse(self, message),
+        };
+        let (a, b) = (start - offset, end - offset);
+        // A clip is one continuous piece of footage: say so, rather than failing later with a
+        // message about footage that will never arrive.
+        let one_piece = h.locate(&session, end - 0.001).is_ok_and(|(r, _)| r == recording)
+            && h.media(&recording, a, b).is_ok_and(|m| !m.is_empty() && m.windows(2).all(|w| w[1].start <= w[0].end + 0.1) && m[0].start <= a + 0.1 && m.last().unwrap().end + 2.5 >= b);
+        if !one_piece {
+            return refuse(self, "That selection includes a moment that was not recorded. Choose one continuous part of the timeline.".into());
+        }
+        if let Some(done) = h.existing_clip(&recording, a, b) {
+            return self.already_saved(re, done);
+        }
+        let lease = match h.lease(&recording, a, b, "save") {
+            Ok(l) => l,
+            Err(message) => return refuse(self, message),
+        };
+        let live = self.pipeline.as_ref().map(|p| p.shared.clone()).filter(|sh| sh.session_id == recording);
+        self.start_save(re, lease, ClipKind::Clip, aligned, end - start, None, live, None);
+    }
+
+    /// That exact footage is already a file in the Library: point at it instead of writing a copy.
+    fn already_saved(&self, re: Option<u64>, clip: SavedClip) {
+        let name = Path::new(&clip.path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        self.notice(Kind::Saved, "Already saved".into(), name);
+        self.send(re, Event::SaveFinished(clip));
+    }
+
+    /// Acknowledge a save and finish it on its own thread: wait for the last moments (and the
+    /// audio that trails them) to reach the disk, stream-copy, verify, publish. `live` is the
+    /// running recording the footage belongs to, if it does; `release_pin` a hold to drop once
+    /// the save has its own.
+    #[allow(clippy::too_many_arguments)]
+    fn start_save(&mut self, re: Option<u64>, mut lease: history::Lease, kind: ClipKind, aligned: bool, asked: f64, note: Option<String>, live: Option<Arc<pipeline::Shared>>, release_pin: Option<String>) {
+        let Some(h) = self.history.clone() else { return };
+        let id = self.next_save_id;
+        self.next_save_id += 1;
+        if kind == ClipKind::Clip {
+            self.capture_feedback_with(re, CaptureAction::Replay, note.clone().unwrap_or_default());
+        }
+        self.send(re, Event::SaveStarted { save_id: id, requested_secs: asked, note });
+        let emit = self.emit.clone();
+        let root = PathBuf::from(&self.cfg.as_ref().map(|c| c.capture_root.clone()).unwrap_or_default());
+        let stems = self.editor_audio_files();
+        let overlay = self.overlay.clone().filter(|_| self.cfg.as_ref().is_some_and(|c| c.overlay && c.notices.problems));
+        let hook = self.pipeline.as_ref().map(|p| p.hook.clone());
+        if let Some(sh) = &live {
+            sh.saves_in_progress.fetch_add(1, Ordering::SeqCst);
+        }
+        let spawned = std::thread::Builder::new().name(format!("save-{id}")).spawn(move || {
+            let until = Instant::now() + std::time::Duration::from_secs(8);
+            while Instant::now() < until && !h.ready_through(&lease.session, lease.end) {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            let event=match h.save_clip(&lease,&root,id) {
-                Ok(c)=>{if stems{export_stems_after_save(&emit,&c);}Event::SaveFinished(c)},
-                Err(message)=>{lease.failed(&message);Event::SaveFailed{save_id:id,message}}
+            let result = h.save_clip(&lease, &root, id, aligned, kind);
+            if let Some(pin) = release_pin {
+                h.unpin(&lease.session, &pin);
+            }
+            let event = match result {
+                Ok((clip, first_frame)) => {
+                    if let Some(sh) = live.as_ref().filter(|sh| sh.session_id == lease.session) {
+                        sh.clip_saved(Path::new(&clip.path), first_frame, lease.end);
+                    }
+                    if stems {
+                        export_stems_after_save(&emit, &clip);
+                    }
+                    Event::SaveFinished(clip)
+                }
+                Err(message) => {
+                    lease.failed(&message);
+                    if overlay.is_some() {
+                        let title = if kind == ClipKind::Session { "Session not saved" } else { "Clip not saved" };
+                        route_notice(overlay.as_ref(), hook.as_ref(), Notice { kind: Kind::Failed, title: title.into(), detail: message.clone() });
+                    }
+                    Event::SaveFailed { save_id: id, message }
+                }
             };
-            emit(Message::new(re,event));
+            drop(lease);
+            if let Some(sh) = &live {
+                sh.saves_in_progress.fetch_sub(1, Ordering::SeqCst);
+                sh.cleanup_if_idle();
+            }
+            emit(Message::new(re, event));
         });
+        if spawned.is_err() {
+            self.send(re, Event::SaveFailed { save_id: id, message: "Could not start saving. Try again.".into() });
+        }
     }
+
     pub fn new(emit: Emit) -> Self {
         Self {
             history: None,
-            history_maintenance:Instant::now(),
+            history_maintenance: Instant::now(),
+            jobs: review::Jobs::start(emit.clone()),
             cfg: None,
             replay_on: false,
             pipeline: None,
@@ -179,8 +278,6 @@ impl Engine {
             borderless_tip: Default::default(),
             ready_since: None,
             ready_told: Default::default(),
-            past_review: None,
-            past_seen: None,
         }
     }
 
@@ -258,6 +355,11 @@ impl Engine {
     }
 
     fn capture_feedback(&self, re: Option<u64>, action: CaptureAction) {
+        self.capture_feedback_with(re, action, String::new());
+    }
+
+    /// `detail`: a second line for the notice (e.g. why a replay is shorter than asked for).
+    fn capture_feedback_with(&self, re: Option<u64>, action: CaptureAction, detail: String) {
         let (title, cue, kind) = match action {
             CaptureAction::Screenshot => ("Screenshot saved", sound::Cue::Screenshot, Kind::Saved),
             CaptureAction::Replay => ("Saving Clip", sound::Cue::Replay, Kind::Saved),
@@ -270,7 +372,7 @@ impl Engine {
         self.send(re, Event::CaptureTriggered { action, overlay_notice });
         crate::trace::ev("feedback", crate::clock::now_100ns(), action as i64, 0, 0);
         self.ack_sound(cue);
-        self.notice(kind, title.into(), String::new());
+        self.notice(kind, title.into(), detail);
     }
 
     pub fn handle(&mut self, re: Option<u64>, cmd: Command) -> bool {
@@ -292,26 +394,81 @@ impl Engine {
             Command::SaveReplay => self.save(re, None),
             Command::SaveRange { start, end } => self.save(re, Some((start, end))),
             Command::History => self.publish_history(re),
-            Command::HistoryReview { session, at } => self.history_review(re,session,at),
-            Command::HistorySave { session,start,end } => self.history_save(re,session,start,end),
-            Command::HistoryMarker {session,id,label,remove} => {
-                if let Some(h)=&self.history {
-                    let result=(||->Result<(),String>{
-                        let mut ev=h.events(&session)?.into_iter().find(|e|e.id==id && e.kind=="marker").ok_or("Marker no longer exists")?;
-                        if let Some(p)=self.pipeline.as_ref().filter(|p|p.shared.session_id==session) {
-                            if let Some(m)=&ev.marker {if remove {p.shared.remove_marker(m.id);} else {p.shared.rename_marker(m.id,label.unwrap_or_default());}return Ok(());}
+            Command::HistoryReview { session, at, viewer, prefetch } => self.history_review(re, session, at, viewer, prefetch),
+            Command::HistorySave { session,start,end,aligned } => self.history_save(re,session,start,end,aligned),
+            Command::HistoryFrames { session, at } => {
+                let history = self.history.clone();
+                let emit = self.emit.clone();
+                std::thread::spawn(move || {
+                    let result = history.ok_or_else(|| "Recording history is unavailable".to_string())
+                        .and_then(|catalog| catalog.frame_timing_at(&session, at));
+                    let event = match result {
+                        Ok(frames) => Event::HistoryFrames { frames, error: None },
+                        Err(error) => Event::HistoryFrames { frames: vec![], error: Some(error) },
+                    };
+                    emit(Message::new(re, event));
+                });
+            }
+            Command::HistoryThumb { session, at, exact, viewer } => match self.history.clone() {
+                Some(catalog) => {
+                    self.jobs.thumb(review::ThumbJob { re, catalog, session, at, viewer, exact });
+                    return true;
+                }
+                None => {
+                    self.send(re, Event::HistoryThumb { session, at, t: None, image: None, error: Some("Recording history is unavailable".into()) });
+                    return true;
+                }
+            },
+            Command::HistoryDelete { session } => {
+                if let Some(h) = &self.history {
+                    if let Err(message) = h.delete_session(&session) {
+                        self.send(re, Event::Error { message });
+                    }
+                    self.publish_history(re);
+                }
+            }
+            Command::HistoryMarker { session: _, id, label, remove } => {
+                if let Some(h) = &self.history {
+                    let result = (|| -> Result<(), String> {
+                        // Published ids are `<recording>/<marker id>`.
+                        let (recording, own) = history::Catalog::event_ref(&id).ok_or("Marker no longer exists")?;
+                        let mut ev = h.events(recording)?.into_iter().find(|e| e.id == own && e.kind == "marker").ok_or("Marker no longer exists")?;
+                        if let Some(p) = self.pipeline.as_ref().filter(|p| p.shared.session_id == recording) {
+                            if let Some(m) = &ev.marker {
+                                if remove {
+                                    p.shared.remove_marker(m.id);
+                                } else {
+                                    p.shared.rename_marker(m.id, label.unwrap_or_default());
+                                }
+                                return Ok(());
+                            }
                         }
-                        if remove {ev.kind="removed".into();h.unpin(&session,&id);}else {ev.label=label.unwrap_or_default();if let Some(m)=&mut ev.marker {m.label=ev.label.clone();}}
-                        h.event(&session,&ev)
+                        if remove {
+                            ev.kind = "removed".into();
+                            h.unpin(recording, own);
+                        } else {
+                            ev.label = label.unwrap_or_default();
+                            if let Some(m) = &mut ev.marker {
+                                m.label = ev.label.clone();
+                            }
+                        }
+                        h.event(recording, &ev)
                     })();
-                    if let Err(message)=result {self.send(re,Event::Error{message});}
+                    if let Err(message) = result {
+                        self.send(re, Event::Error { message });
+                    }
                     self.publish_history(re);
                 }
             }
             Command::PrepareReview => {
-                let latest=self.history.as_ref().and_then(|h|h.state(self.cfg.as_ref().map_or(14400,|c|c.history_secs)).ok()).and_then(|s|s.sessions.into_iter().rev().find(|s|!s.intervals.is_empty()));
-                if let Some(s)=latest {let at=(s.intervals.last().unwrap()[1]-25.0).max(s.intervals.last().unwrap()[0]);self.history_review(re,s.id,at);}
-                else {self.send(re,Event::ReviewFailed{message:"Nothing has been recorded yet. Give it a few seconds.".into()});}
+                let latest = self.history.as_ref().and_then(|h| h.state(self.history_target()).ok()).and_then(|s| s.sessions.into_iter().rev().find(|s| !s.intervals.is_empty()));
+                match latest {
+                    Some(s) => {
+                        let last = s.intervals.last().unwrap();
+                        self.history_review(re, s.id, (last[1] - 25.0).max(last[0]), String::new(), false);
+                    }
+                    None => self.send(re, Event::ReviewFailed { message: "Nothing has been recorded yet. Give it a few seconds.".into(), superseded: false }),
+                }
             }
             Command::Meters { client, enabled } => {
                 if enabled {
@@ -425,15 +582,10 @@ impl Engine {
                 });
             }
             Command::ReleaseReview { path } => {
-                if let (Some(h),Some(path))=(&self.history,&path) {h.release_preview(path);}
-                if self.past_review.as_ref().is_some_and(|f| path.is_none() || path.as_deref() == Some(&*f.to_string_lossy())) {
-                    let _ = std::fs::remove_file(self.past_review.take().unwrap());
+                if let (Some(h), Some(path)) = (&self.history, &path) {
+                    h.release_preview(path);
                 }
-                if let Some(p) = &self.pipeline {
-                    if path.is_none() || path == p.shared.review_path() {
-                        p.shared.release_review();
-                    }
-                }
+                return true;
             }
             Command::AddMarker { label } => self.add_marker(re, label),
             Command::RenameMarker { id, label } => {
@@ -453,24 +605,40 @@ impl Engine {
             }
             Command::GetState => {}
             Command::RecoverLeftovers => {
-                let Some(h)=self.history.clone() else {return true;};
-                let Some(cfg)=&self.cfg else {return true;};let root=PathBuf::from(&cfg.capture_root);
-                let current=self.pipeline.as_ref().map(|p|p.shared.session_id.clone());
-                let selections=(||->Result<Vec<history::Lease>,String>{
-                    let state=h.state(cfg.history_secs)?;let mut leases=vec![];
-                    for session in state.sessions.into_iter().filter(|s|Some(&s.id)!=current.as_ref()) {
-                        for [a,b] in session.intervals {leases.push(h.lease(&session.id,a,b,"save")?);}
+                let Some(h) = self.history.clone() else { return true };
+                let Some(cfg) = &self.cfg else { return true };
+                let root = PathBuf::from(&cfg.capture_root);
+                // Explicitly asked for: every finished session's footage becomes clips.
+                let selections = (|| -> Result<Vec<history::Lease>, String> {
+                    let mut leases = vec![];
+                    for session in h.state(cfg.history_secs)?.sessions.into_iter().filter(|s| s.ended) {
+                        for [a, b] in session.intervals {
+                            leases.push(h.lease_at(&session.id, a, b, "save")?);
+                        }
                     }
                     Ok(leases)
                 })();
                 match selections {
-                    Err(message)=>self.send(re,Event::Error{message}),
-                    Ok(leases)=>{
-                        self.capture_feedback(re,CaptureAction::Replay);
-                        let emit=self.emit.clone();std::thread::spawn(move||{
-                            let mut clips=vec![];let mut failed=vec![];
-                            for mut lease in leases {match h.save_clip(&lease,&root,0){Ok(c)=>clips.push(c.path),Err(e)=>{lease.failed(&e);failed.push(e);}}}
-                            emit(Message::new(re,Event::Recovered{clips,failed}));
+                    Err(message) => self.send(re, Event::Error { message }),
+                    Ok(leases) => {
+                        self.capture_feedback(re, CaptureAction::Replay);
+                        let emit = self.emit.clone();
+                        std::thread::spawn(move || {
+                            let (mut clips, mut failed) = (vec![], vec![]);
+                            for mut lease in leases {
+                                if let Some(done) = h.existing_clip(&lease.session, lease.start, lease.end) {
+                                    clips.push(done.path);
+                                    continue;
+                                }
+                                match h.save_clip(&lease, &root, 0, false, ClipKind::Clip) {
+                                    Ok((c, _)) => clips.push(c.path),
+                                    Err(e) => {
+                                        lease.failed(&e);
+                                        failed.push(e);
+                                    }
+                                }
+                            }
+                            emit(Message::new(re, Event::Recovered { clips, failed }));
                         });
                     }
                 }
@@ -624,37 +792,17 @@ impl Engine {
     /// worker shuts down.
     fn stop_session(&mut self, re: Option<u64>) {
         let Some(p) = &self.pipeline else { return };
-        if p.shared.session_start.lock().unwrap().is_none() {
-            return;
-        }
-        let id = self.next_save_id;
-        self.next_save_id += 1;
-        let emit = self.emit.clone();
-        let overlay = self.overlay.clone().filter(|_| self.cfg.as_ref().is_some_and(|c| c.overlay && c.notices.problems));
-        let hook = p.hook.clone();
-        let stems = self.editor_audio_files();
+        let Some((start, end, pin)) = p.end_session() else { return };
+        let sh = p.shared.clone();
+        let Some(h) = self.history.clone() else { return };
         self.capture_feedback(re, CaptureAction::RecordingStop);
-        let requested = p.stop_session(
-            move |r| {
-                // Input was acknowledged already; completion only updates the library.
-                let ev = match r {
-                    Ok((clip, _)) => {
-                        if stems {
-                            export_stems_after_save(&emit, &clip);
-                        }
-                        Event::SaveFinished(clip)
-                    }
-                    Err(message) => {
-                        route_notice(overlay.as_ref(), &hook, Notice { kind: Kind::Failed, title: "Session not saved".into(), detail: message.clone() });
-                        Event::SaveFailed { save_id: id, message }
-                    }
-                };
-                emit(Message::new(None, ev));
-            },
-            id,
-        );
-        if let Some(secs) = requested {
-            self.send(re, Event::SaveStarted { save_id: id, requested_secs: secs });
+        match h.lease(&sh.session_id, start, end, "save") {
+            Ok(lease) => self.start_save(re, lease, ClipKind::Session, false, (end - start).max(1.0), None, Some(sh), Some(pin)),
+            Err(message) => {
+                h.unpin(&sh.session_id, &pin);
+                self.notice(Kind::Failed, "Session not saved".into(), message.clone());
+                self.send(re, Event::SaveFailed { save_id: 0, message });
+            }
         }
     }
 
@@ -687,7 +835,7 @@ impl Engine {
                     emit(Message::new(re, Event::ScreenshotSaved { path: path.to_string_lossy().into_owned() }));
                 }
                 Err(message) => {
-                    if overlay.is_some() { route_notice(overlay.as_ref(), &hook, Notice { kind: Kind::Failed, title: "Screenshot not saved".into(), detail: message.clone() }); }
+                    if overlay.is_some() { route_notice(overlay.as_ref(), Some(&hook), Notice { kind: Kind::Failed, title: "Screenshot not saved".into(), detail: message.clone() }); }
                     emit(Message::new(re, Event::Error { message: format!("Screenshot not saved: {message}") }));
                 }
             }
@@ -727,55 +875,45 @@ impl Engine {
         self.send(re, Event::MarkerAdded(m));
     }
 
+    /// Instant Replay (`range = None`: the last `replay_secs`), or an exact media range of the
+    /// running recording.
     fn save(&mut self, re: Option<u64>, range: Option<(f64, f64)>) {
         if self.pipeline.is_none() {
-            if let Some((start,end))=range {
-                let session=self.history.as_ref().and_then(|h|h.state(14400).ok()).and_then(|s|s.sessions.into_iter().rev().find(|s|!s.intervals.is_empty()));
-                if let Some(session)=session {self.history_save(re,session.id,start,end);return;}
+            if let Some((start, end)) = range {
+                let session = self.history.as_ref().and_then(|h| h.state(self.history_target()).ok()).and_then(|s| s.sessions.into_iter().rev().find(|s| !s.intervals.is_empty()));
+                if let Some(session) = session {
+                    self.history_save(re, session.id, start, end, false);
+                    return;
+                }
             }
         }
-        let Some(p) = &self.pipeline else {
-            let msg = if self.replay_on {
-                "Nothing is being recorded right now, so there is nothing to save."
-            } else {
-                "Instant replay is off. Turn it on to save clips."
-            };
-            self.notice(Kind::Failed, "Clip not saved".into(), msg.into());
-            self.send(re, Event::SaveFailed { save_id: 0, message: msg.into() });
-            return;
+        let refuse = |this: &Self, message: String| {
+            this.notice(Kind::Failed, "Clip not saved".into(), message.clone());
+            this.send(re, Event::SaveFailed { save_id: 0, message });
         };
-        let id = self.next_save_id;
-        self.next_save_id += 1;
-        let emit = self.emit.clone();
-        let problems = self.cfg.as_ref().is_some_and(|c| c.overlay && c.notices.problems);
-        let overlay = self.overlay.clone();
-        let hook = p.hook.clone();
-        let stems = self.editor_audio_files();
-        let requested = p.request_save(
-            range,
-            SaveKind::Clip,
-            || self.capture_feedback(re,CaptureAction::Replay),
-            move |r| {
-                // Input was acknowledged already; completion only updates the library.
-                let ev = match r {
-                    Ok((clip, _)) => {
-                        if stems {
-                            export_stems_after_save(&emit, &clip);
-                        }
-                        Event::SaveFinished(clip)
-                    }
-                    Err(message) => {
-                        if problems {
-                            route_notice(overlay.as_ref(), &hook, Notice { kind: Kind::Failed, title: "Clip not saved".into(), detail: message.clone() });
-                        }
-                        Event::SaveFailed { save_id: id, message }
-                    }
-                };
-                emit(Message::new(None, ev));
-            },
-            id,
-        );
-        self.send(re, Event::SaveStarted { save_id: id, requested_secs: requested });
+        let (Some(p), Some(h)) = (&self.pipeline, self.history.clone()) else {
+            let msg = if self.replay_on { "Nothing is being recorded right now, so there is nothing to save." } else { "Instant replay is off. Turn it on to save clips." };
+            return refuse(self, msg.into());
+        };
+        let sh = p.shared.clone();
+        let asked = range.map_or(sh.live.lock().unwrap().replay_secs as f64, |(a, b)| (b - a).max(1.0));
+        let pick = match range {
+            Some((a, b)) => Ok(history::ReplayPick { session: sh.session_id.clone(), start: a.max(0.0), end: b.min(sh.save_end()), note: None }),
+            None => h.replay_pick(&sh.session_id, sh.save_end(), asked),
+        };
+        let pick = match pick {
+            Ok(p) => p,
+            Err(message) => return refuse(self, message),
+        };
+        // A game that has closed keeps its last moments saveable; pressing the key again must
+        // not write the same file again.
+        if let Some(done) = h.existing_clip(&pick.session, pick.start, pick.end) {
+            return self.already_saved(re, done);
+        }
+        match h.lease(&pick.session, pick.start, pick.end, "save") {
+            Ok(lease) => self.start_save(re, lease, ClipKind::Clip, false, asked, pick.note, Some(sh), None),
+            Err(message) => refuse(self, message),
+        }
     }
 
     /// Periodic housekeeping (every ~0.5 s):
@@ -786,8 +924,10 @@ impl Engine {
         self.hand_over_notice();
         if self.history_maintenance.elapsed().as_secs()>=2 {
             self.history_maintenance=Instant::now();
-            if let (Some(h),Some(c))=(&self.history,&self.cfg) {
-                if let Err(e)=h.refresh_files().and_then(|_|h.retain(c.history_secs,c.buffer_cap_bytes,c.min_free_bytes).map(|_|())) {eprintln!("history maintenance: {e}");}
+            if let (Some(h), Some(c)) = (&self.history, &self.cfg) {
+                if let Err(e) = h.refresh_files().and_then(|_| h.retain(c.history_secs, c.buffer_cap_bytes, c.min_free_bytes).map(|_| ())) {
+                    eprintln!("history maintenance: {e}");
+                }
             }
         }
         if self.pipeline.as_ref().is_some_and(|p|p.capture.resolution_changed.load(Ordering::Relaxed)) {
@@ -1008,7 +1148,10 @@ impl Engine {
         let hotkey = self.hotkey.as_ref().map(|h| h.state_for(HotkeyAction::SaveReplay)).unwrap_or_default();
         let root = self.cfg.as_ref().map(|c| PathBuf::from(&c.capture_root));
         let free_bytes = root.as_deref().and_then(storage::free_bytes);
-        let leftover_buffer_bytes = root.as_deref().map(|r| self.leftover_bytes(r)).unwrap_or(0);
+        // From the catalog's cached state: no folder is walked to publish the engine state.
+        let history = self.history.as_ref().and_then(|h| h.state(self.history_target()).ok());
+        let leftover_buffer_bytes = history.as_ref().map_or(0, |s| s.sessions.iter().filter(|x| x.ended).map(|x| x.bytes).sum());
+        let past_game = history.as_ref().and_then(|s| s.sessions.iter().rev().find(|x| !x.intervals.is_empty()).map(|x| x.game.clone()));
         let mut st = EngineState {
             history_buffered_secs:0.0,
             frames_encoded:0,frames_without_source:0,frames_dropped:0,frames_repeated:0,source_frames_unselected:0,
@@ -1035,7 +1178,7 @@ impl Engine {
             in_game,
             game_fullscreen,
             saved: vec![],
-            past_game: if self.pipeline.is_none() { self.past_recording().map(|(_, game)| game) } else { None },
+            past_game: if self.pipeline.is_none() { past_game } else { None },
         };
         if self.mic_monitor.as_ref().is_some_and(|m| m.started.elapsed().as_secs() > 300) {
             self.mic_monitor = None;
@@ -1057,11 +1200,14 @@ impl Engine {
             self.fps_sample = (Instant::now(), frames);
         }
         let sh = &p.shared;
-        let (buffered, bytes, has_segments) = {
-            let ring = sh.ring.lock().unwrap();
-            let live = *sh.live.lock().unwrap();
-            (ring.available_secs(sh.save_end()).min(live.replay_secs as f64), ring.total_bytes(), !ring.segments().is_empty())
+        let has_segments = sh.first_frame.lock().unwrap().is_some();
+        let replay_secs = sh.live.lock().unwrap().replay_secs as f64;
+        // What Save Replay would save right now (it reaches back over a resolution change).
+        let buffered = match (&self.history, has_segments) {
+            (Some(h), true) => h.replay_pick(&sh.session_id, sh.save_end(), replay_secs).map_or(0.0, |p| p.end - p.start),
+            _ => 0.0,
         };
+        let bytes = sh.written_bytes.load(Ordering::Relaxed);
         let attention = sh.attention.lock().unwrap().clone()
             .or_else(|| p.capture.latest.lock().unwrap().error.clone());
         st.markers = sh.markers_now();
@@ -1076,7 +1222,7 @@ impl Engine {
         st.encoder = Some(p.encoder.clone());
         st.buffered_secs = (buffered * 10.0).round() / 10.0;
         st.buffer_bytes = bytes;
-        st.history_buffered_secs=sh.ring.lock().unwrap().segments().iter().filter_map(|s|s.end.map(|e|(e-s.start).max(0.0))).sum();
+        st.history_buffered_secs = sh.written_ms.load(Ordering::Relaxed) as f64 / 1000.0;
         st.capture_fps = (self.capture_fps * 10.0).round() / 10.0;
         st.frames_captured = frames;
         st.frames_encoded=sh.frames_encoded.load(Ordering::Relaxed);
@@ -1113,57 +1259,12 @@ impl Engine {
         st
     }
 
-    fn current_session(&self) -> Option<PathBuf> {
-        self.pipeline.as_ref().map(|p| p.shared.session_dir.clone())
-    }
-
-    fn leftover_dirs(&self, root: &Path) -> Vec<PathBuf> {
-        let current = self.current_session();
-        let buffer_root = self.cfg.as_ref().and_then(|c| c.buffer_root.clone());
-        std::fs::read_dir(storage::buffer_dir_for(root, buffer_root.as_deref()))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|e| storage::is_session_dir_name(&e.file_name().to_string_lossy()))
-            .map(|e| e.path())
-            .filter(|p| p.is_dir() && Some(p) != current.as_ref())
-            .collect()
-    }
-
-    /// The newest background recording still on disk while nothing is being recorded: its
-    /// folder and game.
-    fn past_recording(&mut self) -> Option<(PathBuf, String)> {
-        if self.pipeline.is_some() {
-            return None;
-        }
-        let root = PathBuf::from(&self.cfg.as_ref()?.capture_root);
-        let mut dirs = self.leftover_dirs(&root);
-        dirs.sort();
-        let dir = dirs.pop()?;
-        if self.past_seen.as_ref().is_none_or(|(d, _)| *d != dir) {
-            let game = std::fs::read(dir.join("session.json"))
-                .ok()
-                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-                .and_then(|m| m["game"].as_str().map(String::from))
-                .unwrap_or_else(|| "your last game".into());
-            self.past_seen = Some((dir, game));
-        }
-        self.past_seen.clone()
-    }
-
-    /// A new game is being recorded: the recordings kept from earlier games (those that ended
-    /// normally) go. What a crash left behind stays until the player saves or deletes it.
-    fn leftover_bytes(&self, root: &Path) -> u64 {
-        self.leftover_dirs(root).iter().map(|d| storage::dir_size(d)).sum()
-    }
-
-    /// Deletes only `Background Recording\<old session>` folders — never clips, never the live session.
+    /// Deletes the temporary footage of every finished session — never clips, recordings or
+    /// screenshots, and never what is being recorded right now.
     fn clear_leftovers(&mut self) -> u64 {
-        // Explicit cleanup uses the same leases as automatic cleanup; legacy media is kept.
-        let Some(h)=&self.history else{return 0;};
-        let before=h.state(0).map(|s|s.bytes).unwrap_or(0);
-        let _=h.retain(0,0,0);
-        before.saturating_sub(h.state(0).map(|s|s.bytes).unwrap_or(before))
+        let Some(h) = &self.history else { return 0 };
+        let sessions = h.state(self.history_target()).map(|s| s.sessions).unwrap_or_default();
+        sessions.iter().filter(|s| s.ended).map(|s| h.delete_session(&s.id).unwrap_or(0)).sum()
     }
 
     pub fn shutdown(&mut self) {
@@ -1348,11 +1449,13 @@ fn resolve(cfg: &EngineConfig) -> Result<Settings, Unresolved> {
 
 /// Show `n` inside the game when CAPTURE's hook is drawing there, otherwise in the notice
 /// window (one or the other, never both).
-fn route_notice(overlay: Option<&Arc<Overlay>>, hook: &Arc<Mutex<Option<inject::GameHook>>>, n: Notice) {
-    if let Some(h) = hook.lock().unwrap().as_ref().filter(|h| h.usable()) {
-        let (w, hh, px) = overlay::render_bitmap(&n, 200);
-        h.show(w, hh, 200, &px, overlay::SHOW_MS, 300);
-        return;
+fn route_notice(overlay: Option<&Arc<Overlay>>, hook: Option<&Arc<Mutex<Option<inject::GameHook>>>>, n: Notice) {
+    if let Some(hook) = hook {
+        if let Some(h) = hook.lock().unwrap().as_ref().filter(|h| h.usable()) {
+            let (w, hh, px) = overlay::render_bitmap(&n, 200);
+            h.show(w, hh, 200, &px, overlay::SHOW_MS, 300);
+            return;
+        }
     }
     if let Some(o) = overlay {
         o.show(n);

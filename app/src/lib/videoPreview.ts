@@ -26,7 +26,7 @@ function changed(video: HTMLVideoElement, event: string, signal: AbortSignal, ac
   });
 }
 
-async function decode(url: string, signal?: AbortSignal): Promise<string> {
+async function decode(url: string, signal?: AbortSignal, at?: number): Promise<string> {
   const video = document.createElement('video');
   const canvas = document.createElement('canvas');
   const sample = document.createElement('canvas');
@@ -50,7 +50,8 @@ async function decode(url: string, signal?: AbortSignal): Promise<string> {
     const test = sample.getContext('2d', { willReadFrequently: true })!;
     const duration = video.duration;
     if (!Number.isFinite(duration) || duration <= 0) throw new Error('Video duration is unavailable');
-    const positions = [.1, .25, .5, .75, .9].map(f => Math.min(duration*f, Math.max(0, duration-.01)));
+    const positions = at === undefined ? [.1, .25, .5, .75, .9].map(f => duration * f) : [at];
+    for (let i = 0; i < positions.length; i++) positions[i] = Math.max(0.001, Math.min(positions[i], duration - .001));
     for (const time of [...new Set(positions)]) {
       if (abort.signal.aborted) throw new Error('Preview cancelled');
       if (Math.abs(time-video.currentTime) > .001) {
@@ -72,7 +73,7 @@ async function decode(url: string, signal?: AbortSignal): Promise<string> {
       const data = test.getImageData(0, 0, 32, 18).data;
       let visible = 0;
       for (let i=0; i<data.length; i+=4) if (Math.max(data[i], data[i+1], data[i+2]) > 24) visible++;
-      if (visible > 32*18*.025) {
+      if (at !== undefined || visible > 32*18*.025) {
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
         return canvas.toDataURL('image/webp', .78);
       }
@@ -93,7 +94,7 @@ function pump() {
   while (active < 2 && queue.length) { active++; queue.shift()!(); }
 }
 
-export function videoPreview(key: string, url: string, signal?: AbortSignal): Promise<string> {
+export function videoPreview(key: string, url: string, signal?: AbortSignal, at?: number): Promise<string> {
   const hit = cache.get(key);
   if (hit) {
     cache.delete(key); cache.set(key, hit);
@@ -104,7 +105,7 @@ export function videoPreview(key: string, url: string, signal?: AbortSignal): Pr
   const promise = new Promise<string>((resolve, reject) => {
     queue.push(() => {
       if (signal?.aborted) { active--; reject(new Error('Preview cancelled')); pump(); return; }
-      decode(url, signal).then(image => {
+      decode(url, signal, at).then(image => {
         const cost = image.length * 2;
         cache.set(key, { image, bytes: cost }); bytes += cost;
         while (cache.size > LIMIT || bytes > BYTE_LIMIT) {

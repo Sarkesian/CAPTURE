@@ -291,7 +291,7 @@
         </div>
       </div>
       <div class="field">
-        <label class="lbl" for="cap"><div>History and playback storage budget</div><div class="hint">Now using {fmtBytes((app.history?.bytes ?? e?.buffer_bytes ?? 0)+(app.history?.preview_bytes ?? 0))}. Protected jobs and imported recordings are kept safely even when over budget.</div></label>
+        <label class="lbl" for="cap"><div>History and playback storage budget</div><div class="hint">Now using {fmtBytes(app.history?.bytes ?? e?.buffer_bytes ?? 0)}. The oldest footage is removed first; footage a clip is being saved from is never removed.</div></label>
         <div class="row"><input class="input num" id="cap" type="number" min="1" max="2000" step="1" value={s.buffer_cap_gb} onchange={ev => updateSettings({ buffer_cap_gb: num(ev) })} /><span class="faint small">GB</span>
           <select class="select" aria-label="History storage preset" value="" onchange={ev=>{if(ev.currentTarget.value)updateSettings({buffer_cap_gb:Number(ev.currentTarget.value)});}}><option value="">Presets…</option>{#each [20,50,100,200] as gb}<option value={gb}>{gb} GB</option>{/each}</select>
         </div>
@@ -301,11 +301,10 @@
         <div class="row"><input class="input num" id="free" type="number" min="1" max="2000" step="1" value={s.min_free_gb} onchange={ev => updateSettings({ min_free_gb: num(ev) })} /><span class="faint small">GB</span></div>
       </div>
       <div class="field">
-        <div class="lbl"><div>Earlier background recordings</div><div class="hint">Browse and save them in Replay. Cleanup respects active saves and playback. Imported recordings and permanent files are preserved.</div></div>
+        <div class="lbl"><div>Earlier background recordings</div><div class="hint">{app.history?.reason ?? 'Temporary footage of finished sessions. Open them in the Library to clip what you want to keep; clips and screenshots are never deleted here.'}</div></div>
         <div class="row">
           <span class="small muted">{fmtBytes(e?.leftover_buffer_bytes ?? 0)}</span>
-          <button class="btn sm" disabled={!e || e.leftover_buffer_bytes === 0} onclick={() => engine('recover_leftovers')}>Save as clip</button>
-          <button class="btn sm ghost danger" disabled={!e || e.leftover_buffer_bytes === 0} onclick={clearTempCache}>Delete</button>
+          <button class="btn sm ghost danger" disabled={!e || e.leftover_buffer_bytes === 0} onclick={clearTempCache}>Delete footage</button>
         </div>
       </div>
     </section>

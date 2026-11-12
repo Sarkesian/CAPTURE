@@ -17,6 +17,7 @@ Build with `scripts\package-portable.ps1` (payload + zip) and `scripts\build-ins
 | `docs/PHASE0_CAPABILITY_REPORT.md` | What was measured on this machine |
 | `docs/ADR-0001-capture-architecture.md` | Native WGC + WASAPI + LGPL libav, chosen over libobs |
 | `docs/DISTRIBUTION.md` | Portable/installer architecture, data locations, updates, uninstall, compatibility |
+| `docs/CAPTURE_OVERHAUL_REPORT.md` | **0.7.0 recording/replay/library overhaul: root causes, changes, verification, limits** |
 | `docs/STATUS.md` | **Current status: every requirement, tested evidence, gaps** |
 | `docs/spec/CAPTURE_Overlay_Addendum.md` | Overlay & replay spec |
 | `docs/OVERLAY_REPORT.md` | Overlay milestone report |

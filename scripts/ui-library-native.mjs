@@ -35,12 +35,16 @@ try{
  await ui.click('.moment[aria-label*="102 moments"]');await ui.click('.cluster-event:nth-of-type(2)');
  await wait(()=>ui.js('document.querySelector(".time").textContent.includes("2:00:06") && document.querySelector(".stage video")?.readyState>=2 && !document.querySelector(".busy")'),'marker playback');check(true,'native marker seek at 2:00:06');
  await ui.click('.transport-end .primary');
+ await wait(()=>ui.js('!document.querySelector(".transport-end .primary").disabled'),'initial native trim alignment');
  const end=await ui.rect('.handle.end'),x=end.x+end.w/2,y=end.y+end.h/2;
  await ui.mouse('mousePressed',x,y,1);await ui.mouse('mouseMoved',x-100,y,1);await ui.mouse('mouseReleased',x-100,y,0);await sleep(100);
- check(await ui.js('document.querySelector(".transport-end .primary").textContent.trim()==="Save Clip" && !document.querySelector(".transport-end .primary").disabled'),'native trim changes length and offers Save Clip');await ui.shot('clip-selection');
+ await wait(()=>ui.js('document.querySelector(".transport-end .primary").textContent.trim()==="Save Clip" && !document.querySelector(".transport-end .primary").disabled'),'native trim alignment');check(true,'native trim changes length and offers Save Clip');await ui.shot('clip-selection');
+ const clips=path.join(media,'The Witcher 3','Clips');
+ const existing=new Set(fs.readdirSync(clips,{throwIfNoEntry:false}));
  const started=performance.now();await ui.click('.transport-end .primary');
- const clips=path.join(media,'The Witcher 3','Clips');const clip=await wait(()=>fs.readdirSync(clips,{throwIfNoEntry:false})?.find(p=>p.endsWith('.mp4')),'MP4 in configured save folder');
+ const clip=await wait(()=>fs.readdirSync(clips,{throwIfNoEntry:false})?.find(p=>p.endsWith('.mp4')&&!existing.has(p)),'MP4 in configured save folder');
  check(fs.statSync(path.join(clips,clip)).size>100000,'real MP4 written into configured capture folder');console.log(`File visible after ${Math.round(performance.now()-started)} ms`);
+ await wait(()=>ui.js('!document.querySelector(".handle")'),'returns to watch mode after save');
  await ui.click('.back');const play=`.tile[aria-label=${JSON.stringify('Play '+clip)}]`;await wait(()=>ui.js(`!!document.querySelector(${JSON.stringify(play)})`),'Library updates');await ui.click(play);
  await wait(()=>ui.js('document.querySelector(".saved-stage video")?.currentTime>.3'),'MP4 playback');check(true,'saved MP4 plays in Library viewer');
  await stop();ui=await start();check(await ui.js(`!!document.querySelector(${JSON.stringify(play)})`)||await wait(()=>ui.js(`!!document.querySelector(${JSON.stringify(play)})`),'saved clip after restart'),'saved clip persists after restart');

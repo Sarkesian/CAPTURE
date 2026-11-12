@@ -1,4 +1,5 @@
-//! One running replay session: capture → CFR encode → segment ring, plus replay saves.
+//! One running recording: capture → CFR encode → segments on disk, indexed by the history
+//! catalog (which also owns retention, saving and playback).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -6,15 +7,14 @@ use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use capture_protocol::{EncoderInfo, Marker, MarkerConfig, MarkerFootage, Quality, Review, SavedClip};
+use capture_protocol::{EncoderInfo, Marker, MarkerConfig, MarkerFootage, Quality};
 
 use crate::audio::{AudioPipeline, MixParams, Source};
 use crate::av::Packet;
 use crate::gpu::Gpu;
 use crate::mux::{SegmentWriter, StreamDesc};
-use crate::ring::{Ring, Segment};
 use crate::video::{self, VideoEncoder};
-use crate::{clock, save, storage, wgc};
+use crate::{clock, storage, wgc};
 
 pub const SEGMENT_SECS: f64 = 2.0;
 
@@ -57,7 +57,13 @@ pub struct Shared {
     pub source_frames_unselected: AtomicU64,
     pub history: Arc<crate::history::Catalog>,
     pub session_id: String,
-    pub ring: Mutex<Ring>,
+    /// The segment being written (sequence number, file, media time of its first frame).
+    open_segment: Mutex<Option<(u64, PathBuf, f64)>>,
+    /// Media time of this recording's first frame on disk, once there is one.
+    pub first_frame: Mutex<Option<f64>>,
+    /// Footage written by this recording so far (closed segments): bytes and seconds.
+    pub written_bytes: AtomicU64,
+    pub written_ms: AtomicU64,
     pub session_dir: PathBuf,
     pub root: PathBuf,
     pub game_name: String,
@@ -74,11 +80,9 @@ pub struct Shared {
     pub mux_done: AtomicBool,
     pub saves_in_progress: AtomicU32,
     pub track_names: Vec<String>,
-    /// Markers of this session. Lock order: `ring` before `markers`.
+    /// Markers of this recording.
     pub markers: Mutex<Vec<Marker>>,
     pub next_marker: AtomicU64,
-    /// Segments + file held by the current review snapshot.
-    review: Mutex<Option<(Vec<u64>, PathBuf)>>,
     /// Clips and screenshots saved from this recording (the latest 200), for the Replay timeline.
     pub saved: Mutex<Vec<capture_protocol::SavedMark>>,
     /// Start of the full-session recording in progress (timeline secs).
@@ -93,26 +97,32 @@ pub struct Shared {
     pub session_must_stop: AtomicBool,
 }
 
-/// Pin id reserved for full-session recording (never released by the marker budget).
-/// Pin id of the next full-session recording (each session its own, so finishing one session's
-/// save can never release a newer session's footage).
-static NEXT_SESSION_PIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(crate::ring::SESSION_PIN_BASE);
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum SaveKind {
-    Clip,
-    Session,
-}
-
-/// Pins may hold at most this share of the buffer cap; older marker protection is released
-/// first (and the marker says so) rather than letting markers grow the buffer without bound.
-const PIN_BUDGET_SHARE: f64 = 0.5;
+/// Pin id of the next full recording (each its own, so finishing one recording's save can
+/// never release a newer one's footage).
+static NEXT_SESSION_PIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Shared {
-    fn close_segment(&self,end:f64,bytes:u64) {
-        let mut ring=self.ring.lock().unwrap();
-        ring.close_last(end,bytes);
-        if let Some(s)=ring.segments().last() {if let Err(e)=self.history.segment(&self.session_id,s.seq,&s.path,s.start,s.end,s.bytes) {self.set_attention(Some(format!("History index: {e}")));}}
+    fn open_segment(&self, seq: u64, path: PathBuf, start: f64) {
+        if let Err(e) = self.history.segment(&self.session_id, seq, &path, start, None, 0) {
+            self.set_attention(Some(format!("History index: {e}")));
+        }
+        self.first_frame.lock().unwrap().get_or_insert(start);
+        *self.open_segment.lock().unwrap() = Some((seq, path, start));
+    }
+
+    fn close_segment(&self, end: f64, bytes: u64) {
+        let Some((seq, path, start)) = self.open_segment.lock().unwrap().take() else { return };
+        let end = end.max(start);
+        if let Err(e) = self.history.segment(&self.session_id, seq, &path, start, Some(end), bytes) {
+            self.set_attention(Some(format!("History index: {e}")));
+        }
+        self.written_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.written_ms.fetch_add(((end - start) * 1000.0) as u64, Ordering::Relaxed);
+    }
+
+    /// Seconds of this recording that a replay could reach back over right now.
+    pub fn recorded_secs(&self) -> f64 {
+        self.first_frame.lock().unwrap().map_or(0.0, |first| (self.save_end() - first).max(0.0))
     }
     pub fn now(&self) -> f64 {
         clock::secs_since(self.t0)
@@ -133,8 +143,6 @@ impl Shared {
             let cap = self.live.lock().unwrap().cap_bytes;
             if cap == 0 {
                 note = Some("Not protected: the temporary buffer limit is 0.".into());
-            } else {
-                self.ring.lock().unwrap().pin(id, t - cfg.protect_before_secs as f64, t + cfg.protect_after_secs as f64);
             }
         }
         let m = Marker {
@@ -148,7 +156,9 @@ impl Shared {
         };
         self.markers.lock().unwrap().push(m.clone());
         self.journal_marker(&m);
-        if cfg.protect { let _ = self.history.pin(&self.session_id,&format!("marker:{id}"),t-cfg.protect_before_secs as f64,t+cfg.protect_after_secs as f64); }
+        if cfg.protect && m.footage == MarkerFootage::Protected {
+            let _ = self.history.pin(&self.session_id, &format!("marker:{id}"), t - cfg.protect_before_secs as f64, t + cfg.protect_after_secs as f64);
+        }
         self.persist_markers();
         m
     }
@@ -163,7 +173,6 @@ impl Shared {
     pub fn remove_marker(&self, id: u64) -> bool {
         self.history.unpin(&self.session_id,&format!("marker:{id}"));
         let _ = self.history.event(&self.session_id,&capture_protocol::TimelineEvent {id:format!("marker:{id}"),kind:"removed".into(),t:0.0,end:None,label:String::new(),path:None,marker:None});
-        self.ring.lock().unwrap().unpin(id);
         let mut ms = self.markers.lock().unwrap();
         let n = ms.len();
         ms.retain(|m| m.id != id);
@@ -173,15 +182,23 @@ impl Shared {
         removed
     }
 
-    /// Markers with their *current* footage status computed from the ring.
+    /// Markers with their *current* footage status, from the catalog: footage that retention
+    /// has removed is `Expired`; protection the marker budget released says so.
     pub fn markers_now(&self) -> Vec<Marker> {
-        let ring = self.ring.lock().unwrap();
-        let pinned = ring.pinned_ids();
         let mut ms = self.markers.lock().unwrap().clone();
+        if ms.is_empty() {
+            return ms;
+        }
+        let (oldest, pinned) = self.history.marker_facts(&self.session_id);
+        let now = self.now();
         for m in &mut ms {
-            m.footage = if !ring.covers(m.t) && m.t < self.now() - 1.0 {
+            let protected = pinned.iter().any(|p| p == &format!("marker:{}", m.id));
+            if m.footage == MarkerFootage::Protected && !protected && m.note.is_none() {
+                m.note = Some("Protection released: markers reached their share of the temporary buffer limit. Save it as a clip to keep it.".into());
+            }
+            m.footage = if oldest.is_none_or(|first| m.t < first) && m.t < now - 3.0 {
                 MarkerFootage::Expired
-            } else if pinned.contains(&m.id) {
+            } else if protected {
                 MarkerFootage::Protected
             } else {
                 MarkerFootage::Buffered
@@ -190,49 +207,26 @@ impl Shared {
         ms
     }
 
-    /// Release the oldest pins while pinned footage exceeds its share of the buffer cap.
-    fn enforce_pin_budget(&self, cap: u64) {
-        let budget = (cap as f64 * PIN_BUDGET_SHARE) as u64;
-        let mut ring = self.ring.lock().unwrap();
-        let mut released = Vec::new();
-        while ring.marker_pinned_bytes() > budget {
-            let Some(id) = ring.oldest_marker_pin() else { break };
-            ring.unpin(id);
-            self.history.unpin(&self.session_id,&format!("marker:{id}"));
-            released.push(id);
-        }
-        drop(ring);
-        if !released.is_empty() {
-            for m in self.markers.lock().unwrap().iter_mut().filter(|m| released.contains(&m.id)) {
-                m.note = Some("Protection released: markers reached their share of the temporary buffer limit. Save it as a clip to keep it.".into());
-            }
-            self.persist_markers();
-        }
-    }
-
-    /// Drop the current review snapshot: unprotect its segments and delete its file (if a
-    /// player still has it open, it goes with the session folder later).
-    /// Remember something saved from this recording.
+    /// Remember something saved from this recording (its timeline event is the catalog's job).
     pub fn note_saved(&self, kind: capture_protocol::SavedKind, t: f64, end: Option<f64>, path: &std::path::Path) {
         let mut list = self.saved.lock().unwrap();
         if list.len() >= 200 {
             list.remove(0);
         }
         list.push(capture_protocol::SavedMark { kind, t, end, name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default() });
-        if matches!(kind,capture_protocol::SavedKind::Clip) {
-            if let Err(e)=self.history.event(&self.session_id,&capture_protocol::TimelineEvent{id:format!("clip:{}",path.display()),kind:"clip".into(),t,end,label:path.file_name().unwrap_or_default().to_string_lossy().into_owned(),path:Some(path.to_string_lossy().into_owned()),marker:None}) {self.set_attention(Some(format!("Clip saved, but its timeline event could not be preserved: {e}")));}
+    }
+
+    /// A clip of `[start, end]` was saved from this recording: note it, and which markers it holds.
+    pub fn clip_saved(&self, clip: &std::path::Path, start: f64, end: f64) {
+        self.note_saved(capture_protocol::SavedKind::Clip, start, Some(end), clip);
+        let mut changed = false;
+        for m in self.markers.lock().unwrap().iter_mut().filter(|m| m.t >= start && m.t <= end) {
+            m.saved_in.push(clip.to_string_lossy().into_owned());
+            self.journal_marker(m);
+            changed = true;
         }
-    }
-
-    /// The file of the current review snapshot.
-    pub fn review_path(&self) -> Option<String> {
-        self.review.lock().unwrap().as_ref().map(|(_, f)| f.to_string_lossy().into_owned())
-    }
-
-    pub fn release_review(&self) {
-        if let Some((seqs, path)) = self.review.lock().unwrap().take() {
-            self.ring.lock().unwrap().unprotect(&seqs);
-            let _ = std::fs::remove_file(path);
+        if changed {
+            self.persist_markers();
         }
     }
 
@@ -283,6 +277,7 @@ impl Pipeline {
             SourceKind::Window(h) => wgc::Source::Window(h),
             SourceKind::Monitor(h) => wgc::Source::Monitor(h),
         };
+        let started_unix_ms = crate::history::millis();
         // Compatibility path: an HDR display never blocks recording. Windows converts the HDR
         // picture to 8-bit SDR for this capture; HDR is not preserved, and the session says so.
         let hdr_display = wgc::display_is_hdr(&gpu, &source);
@@ -327,7 +322,7 @@ impl Pipeline {
         let track_names = audio.as_ref().map(|a| a.track_names().to_vec()).unwrap_or_default();
         let manifest = serde_json::json!({
             "capture_session": 1,
-            "started_unix_ms":crate::history::millis(),
+            "started_unix_ms": started_unix_ms,
             "game": s.game_name,
             "exe": s.exe,
             "video": { "encoder": info.name, "width": info.width, "height": info.height, "fps": info.fps, "quality":s.quality,"capture_format":if hdr_display==Some(true) {"BGRA8 SDR (converted by Windows from an HDR display; HDR not preserved)"} else {"BGRA8 SDR"},"source_display_hdr":hdr_display,"encoded_chroma":"4:2:0","color":"BT.709 limited","rgb_bit_exact":false },
@@ -345,7 +340,10 @@ impl Pipeline {
             source_frames_unselected:AtomicU64::new(0),
             history,
             session_id,
-            ring: Mutex::new(Ring::default()),
+            open_segment: Mutex::new(None),
+            first_frame: Mutex::new(None),
+            written_bytes: AtomicU64::new(0),
+            written_ms: AtomicU64::new(0),
             session_dir,
             root: s.root.clone(),
             game_name: s.game_name.clone(),
@@ -366,7 +364,6 @@ impl Pipeline {
             track_names,
             markers: Mutex::new(Vec::new()),
             next_marker: AtomicU64::new(1),
-            review: Mutex::new(None),
             saved: Mutex::new(Vec::new()),
             session_start: Mutex::new(None),
             ended_at: Mutex::new(None),
@@ -432,42 +429,7 @@ impl Pipeline {
         *self.shared.live.lock().unwrap() = live;
     }
 
-    /// Start an asynchronous replay save ending now. `done` receives the verified clip or a
-    /// plain-language failure.
-    /// Start an asynchronous save. `range = None`: replay ending now with the configured
-    /// length. `Some((start, end))`: exactly that timeline range (from the review timeline).
-    /// `done` receives the verified clip and the requested length, or a plain-language failure.
-    pub fn request_save(
-        &self,
-        range: Option<(f64, f64)>,
-        kind: SaveKind,
-        accepted: impl FnOnce(),
-        done: impl FnOnce(Result<(SavedClip, f64), String>) + Send + 'static,
-        save_id: u64,
-    ) -> f64 {
-        let shared = self.shared.clone();
-        let (t_end, secs) = match range {
-            Some((a, b)) => (b.min(shared.save_end()), (b - a).max(1.0)),
-            None => (shared.save_end(), shared.live.lock().unwrap().replay_secs as f64),
-        };
-        let lease=shared.history.lease(&shared.session_id,t_end-secs,t_end,"save");
-        let mut lease=match lease {Ok(l)=>l,Err(e)=>{done(Err(e));return secs;}};
-        accepted();
-        shared.saves_in_progress.fetch_add(1, Ordering::SeqCst);
-        std::thread::Builder::new()
-            .name(format!("save-{save_id}"))
-            .spawn(move || {
-                let r = do_save(&shared, t_end, secs, save_id, kind);
-                if let Err(e)=&r {lease.failed(e);}
-                shared.saves_in_progress.fetch_sub(1, Ordering::SeqCst);
-                shared.cleanup_if_idle();
-                done(r.map(|c| (c, secs)));
-            })
-            .unwrap();
-        secs
-    }
-
-    /// Begin a full-session recording from now. Returns false if one is already running.
+    /// Begin a full recording from now. Returns false if one is already running.
     pub fn start_session(&self) -> bool {
         let mut s = self.shared.session_start.lock().unwrap();
         if s.is_some() {
@@ -478,47 +440,18 @@ impl Pipeline {
         self.shared.session_must_stop.store(false, Ordering::SeqCst);
         let pin = NEXT_SESSION_PIN.fetch_add(1, Ordering::SeqCst);
         self.shared.session_pin.store(pin, Ordering::SeqCst);
-        self.shared.ring.lock().unwrap().pin(pin, t, f64::INFINITY);
-        let _=self.shared.history.pin(&self.shared.session_id,&format!("session:{pin}"),t,1e99);
+        // Everything from here on is kept until the recording has been saved.
+        let _ = self.shared.history.pin(&self.shared.session_id, &format!("session:{pin}"), t, 1e99);
         true
     }
 
-    /// Finish the session: saves [start, now] to `<Game>\Sessions\`. The pin is released once
-    /// the save has protected its own segments.
-    pub fn stop_session(&self, done: impl FnOnce(Result<(SavedClip, f64), String>) + Send + 'static, save_id: u64) -> Option<f64> {
+    /// End the full recording: its media range `[start, end]` and the pin holding its footage
+    /// (released by the caller once the save has its own hold on it).
+    pub fn end_session(&self) -> Option<(f64, f64, String)> {
         let start = self.shared.session_start.lock().unwrap().take()?;
         let pin = self.shared.session_pin.load(Ordering::SeqCst);
-        let end = self.shared.save_end();
-        let shared = self.shared.clone();
-        let secs = self.request_save(
-            Some((start, end)),
-            SaveKind::Session,
-            || {},
-            move |r| {
-                shared.ring.lock().unwrap().unpin(pin);
-                shared.history.unpin(&shared.session_id,&format!("session:{pin}"));
-                done(r)
-            },
-            save_id,
-        );
-        Some(secs)
+        Some((start, self.shared.save_end(), format!("session:{pin}")))
     }
-
-    /// Build a playable snapshot of all closed buffer segments (stream copy, no re-encode) on a
-    /// background thread. Its segments stay protected until `release_review` or the next review.
-    pub fn prepare_review(&self, done: impl FnOnce(Result<Review, String>) + Send + 'static) {
-        let shared = self.shared.clone();
-        std::thread::Builder::new()
-            .name("review".into())
-            .spawn(move || done(build_review(&shared)))
-            .unwrap();
-    }
-}
-
-fn build_review(shared: &Shared) -> Result<Review,String> {
-    let media=shared.history.media(&shared.session_id,0.0,shared.save_end())?;
-    let at=media.last().map(|s|(s.end-25.0).max(media[0].start)).ok_or("Nothing has been recorded yet")?;
-    shared.history.preview(&shared.session_id,at)
 }
 
 fn in_game_overlay_enabled() -> bool {
@@ -540,9 +473,6 @@ impl Drop for Pipeline {
         }
         self.shared.dropped.store(true, Ordering::SeqCst);
         self.shared.history.end(&self.shared.session_id);
-        // A review snapshot nobody released (window closed meanwhile) would keep its segments
-        // protected forever and the session folder would linger as "leftover" footage.
-        self.shared.release_review();
         self.shared.cleanup_if_idle();
     }
 }
@@ -730,11 +660,10 @@ fn run_mux(shared: Arc<Shared>, rx: Receiver<Packet>, streams: Vec<StreamDesc>) 
                 shared.close_segment(p.secs(), bytes);
             }
             let live = *shared.live.lock().unwrap();
-
-
-            shared.enforce_pin_budget(live.cap_bytes);
-            if let Err(e)=shared.history.retain(live.history_secs,live.cap_bytes,live.min_free_bytes) {shared.set_attention(Some(format!("History cleanup: {e}")));}
-            shared.ring.lock().unwrap().forget_missing();
+            // Retention runs here too, so a busy engine thread can never let the disk fill up.
+            if let Err(e) = shared.history.retain(live.history_secs, live.cap_bytes, live.min_free_bytes) {
+                shared.set_attention(Some(format!("History cleanup: {e}")));
+            }
             let free = storage::free_bytes(&shared.session_dir).unwrap_or(u64::MAX);
             if free < live.min_free_bytes {
                 if shared.session_start.lock().unwrap().is_some() {
@@ -767,8 +696,7 @@ fn run_mux(shared: Arc<Shared>, rx: Receiver<Packet>, streams: Vec<StreamDesc>) 
                         let _ = w.write(q);
                     }
                     writer = Some(w);
-                    shared.ring.lock().unwrap().push(Segment { seq, path, start: seg_start, end: None, bytes: 0, protect: 0 });
-                    if let Some(s)=shared.ring.lock().unwrap().segments().last() {if let Err(e)=shared.history.segment(&shared.session_id,s.seq,&s.path,s.start,None,0) {shared.set_attention(Some(format!("History index: {e}")));}}
+                    shared.open_segment(seq, path, seg_start);
                     if write_failed && r.is_ok() {
                         write_failed = false;
                         shared.set_attention(None);
@@ -818,100 +746,6 @@ fn run_mux(shared: Arc<Shared>, rx: Receiver<Packet>, streams: Vec<StreamDesc>) 
     }
     shared.mux_done.store(true, Ordering::SeqCst);
     shared.history.end(&shared.session_id);
-}
-
-/// Note which markers a saved clip contains, and write `<clip>.markers.json` next to it (only
-/// when it contains markers) with times relative to the clip start, for editors and FrameCut.
-fn record_markers_in_clip(shared: &Shared, clip: &std::path::Path, start: f64, end: f64) {
-    let mut inside = Vec::new();
-    for m in shared.markers.lock().unwrap().iter_mut().filter(|m| m.t >= start && m.t <= end) {
-        m.saved_in.push(clip.to_string_lossy().into_owned());
-        shared.journal_marker(m);
-        inside.push(serde_json::json!({ "t": ((m.t - start) * 100.0).round() / 100.0, "label": m.label, "at": m.at }));
-    }
-    if inside.is_empty() {
-        return;
-    }
-    shared.persist_markers();
-    let doc = serde_json::json!({ "capture_markers": 1, "clip": clip.file_name().map(|n| n.to_string_lossy().into_owned()), "markers": inside });
-    let mut side = clip.as_os_str().to_owned();
-    side.push(".markers.json");
-    let _ = std::fs::write(std::path::PathBuf::from(side), serde_json::to_vec_pretty(&doc).unwrap());
-}
-
-fn do_save(shared: &Shared, t_end: f64, secs: f64, save_id: u64, kind: SaveKind) -> Result<SavedClip, String> {
-    let sel = {
-        let mut ring = shared.ring.lock().unwrap();
-        let sel = ring.select(t_end, secs).ok_or("Nothing has been buffered yet. Wait a moment and try again.")?;
-        let selected:Vec<_>=ring.segments().iter().filter(|s|sel.seqs.contains(&s.seq)).collect();
-        for pair in selected.windows(2) {
-            if pair[0].end.is_some_and(|e|e+0.1<pair[1].start) && pair[1].start>t_end-secs && pair[1].start<t_end {
-                return Err("This range crosses a recording gap. Choose an available section in Replay.".into());
-            }
-        }
-        ring.protect(&sel.seqs);
-        // The segment before the first one holds the audio of the clip's first moments
-        // (see `save::remux`): keep it until the save is done.
-        let lead = ring
-            .segments()
-            .iter()
-            .take_while(|s| s.seq < sel.seqs[0])
-            .last()
-            .filter(|s| s.end.is_some())
-            .map(|s| (s.seq, s.path.clone()));
-        if let Some((seq, _)) = &lead {
-            ring.protect(&[*seq]);
-        }
-        (sel, lead)
-    };
-    let (sel, lead) = sel;
-    // Wait until the segment holding `t_end` (and late audio after it) is closed on disk.
-    let deadline = Instant::now() + Duration::from_secs_f64(SEGMENT_SECS * 3.0 + 2.0);
-    while Instant::now() < deadline && !shared.mux_done.load(Ordering::SeqCst) && !shared.ring.lock().unwrap().is_complete_through(t_end) {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let (all, segs) = {
-        let mut ring = shared.ring.lock().unwrap();
-        // Only closed tail segments: an open one is still being written and would end in a
-        // partial packet.
-        let closed: Vec<u64> = ring.segments().iter().filter(|s| s.end.is_some()).map(|s| s.seq).collect();
-        let tail: Vec<u64> = ring
-            .tail_after(t_end, SEGMENT_SECS + 1.0)
-            .into_iter()
-            .filter(|s| !sel.seqs.contains(s) && closed.contains(s))
-            .collect();
-        ring.protect(&tail);
-        let mut all: Vec<u64> = sel.seqs.iter().chain(tail.iter()).copied().collect();
-        let mut segs = ring.paths_for(&all);
-        all.extend(lead.as_ref().map(|l| l.0));
-        segs.sort_by_key(|s| s.0);
-        (all, segs.into_iter().map(|(_, p, st)| (p, st)).collect::<Vec<_>>())
-    };
-    let result = (|| {
-        let (dir, label) = match kind {
-            SaveKind::Clip => (storage::clips_dir(&shared.root, &shared.game_name), "Clip"),
-            SaveKind::Session => (storage::sessions_dir(&shared.root, &shared.game_name), "Session"),
-        };
-        std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create the folder {}: {e}", dir.display()))?;
-        let needed:u64=segs.iter().filter_map(|(p,_)|std::fs::metadata(p).ok().map(|m|m.len())).sum();
-        if storage::free_bytes(&dir).is_some_and(|f|f<needed+32*1024*1024){return Err("Not enough space to finalize the clip. Original footage is protected for retry.".into());}
-        let name = storage::clip_file_name(&storage::local_stamp(), &shared.game_name, label);
-        let path = storage::reserve_unique_path(&dir, &name).map_err(|e| format!("Cannot create the clip file: {e}"))?;
-        let (clip, actual_start) = save::remux(&segs, lead.as_ref().map(|l| l.1.as_path()), sel.start, sel.end - secs, sel.end, &shared.track_names, &path)?;
-        record_markers_in_clip(shared, &clip.path, actual_start, sel.end);
-        shared.note_saved(capture_protocol::SavedKind::Clip, actual_start, Some(sel.end), &clip.path);
-        Ok(SavedClip {
-            save_id,
-            path: clip.path.to_string_lossy().into_owned(),
-            requested_secs: secs,
-            duration_secs: clip.duration_secs,
-            bytes: clip.bytes,
-            video_streams: clip.video_streams,
-            audio_tracks: clip.audio_tracks,
-        })
-    })();
-    shared.ring.lock().unwrap().unprotect(&all);
-    result
 }
 
 #[cfg(test)]

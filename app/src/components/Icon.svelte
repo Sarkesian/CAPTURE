@@ -24,6 +24,8 @@
     'skip-back': 'M18 6v12l-8.5-6z M6 6v12',
     'skip-fwd': 'M6 6v12l8.5-6z M18 6v12',
     back: 'M15 18l-6-6 6-6',
+    rewind: 'M12 7l-6 5 6 5z M19 7l-6 5 6 5z',
+    forward: 'M12 7l6 5-6 5z M5 7l6 5-6 5z',
     chevron: 'M6 9l6 6 6-6',
     more: 'M6 12h.01 M12 12h.01 M18 12h.01',
     check: 'M5 12.5l4.5 4.5L19 7',

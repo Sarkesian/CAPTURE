@@ -3,8 +3,9 @@
 ## Indexed background history
 
 - **Instant Replay length** controls the hotkey clip only. **Background history** targets four hours of recorded gameplay across sessions, selectable up to six hours, within your existing storage budget. Updating does not increase that budget.
-- Replay groups recordings by game, shows available intervals and gaps, and supports zoom, marker/screenshot navigation, and range selection. Save clip automatically creates a normal permanent MP4; there is no separate export.
-- Capturing a clip immediately says **Saving Clip** and plays the existing feedback. Completion updates Library silently. A failure is shown; protected source footage can be retried from Replay.
+- Each game has one **Background Recording** in the Library. Opening it shows everything recorded for that game on one timeline: every stretch end to end, with a break wherever nothing was recorded. Hover to see the frame at that moment, click to go there, scroll to zoom, press **Clip**, drag the two handles and **Save Clip**. That creates a normal permanent MP4; there is no separate export.
+- **Save Replay** saves the last minutes of the session even if the game changed resolution or restarted a moment ago. When less than the configured length exists, the notice says so. Saving the same footage twice does not create a second file.
+- Capturing a clip immediately says **Saving Clip** and plays the existing feedback. Completion updates Library silently. A failure is shown; protected source footage can be retried from the recording's timeline.
 - Original encoded video is shared by history and immediate clips. Saving does not re-encode it. Previews use short byte-bounded playback windows rather than whole-history copies.
 - Balanced, High and Maximum are lossy H.264 settings. **Archival 4:4:4** uses NVIDIA lossless coding after RGB conversion, requires compatible hardware/players, and can use much more storage. It is not bit-exact RGB or an end-to-end zero-loss mode. Audio remains AAC.
 - Native resolution changes start another recording epoch instead of scaling the new gameplay into an older canvas. Manual full recordings continue into another file across that boundary. FPS and encoder quality are never automatically reduced. Odd window sizes lose their last pixel row or column (4:2:0 H.264 needs even dimensions).
@@ -20,7 +21,8 @@
    **Not a game**. You can also use *An app* or *Whole display*.
 3. A small corner notice says **Recording <game>**. It never appears in your recordings.
 4. Home now shows the game, how much replay is ready, live audio meters and **Save replay**. The sidebar
-   has **Home**, **Replay** (watch and clip recent gameplay without stopping), **Library** and **Settings**.
+   has **Home**, **Library** (background recordings, clips and screenshots; watch and clip recent gameplay
+   without stopping) and **Settings**.
 
 ## While playing (default keys; change any of them in Settings, numpad keys work too)
 | Key | Does |
@@ -70,9 +72,12 @@ Settings → Audio → **Create separate audio files for editors** to get them a
 each WAV track takes about 12× the space of the same track inside the MP4).
 
 ## Library
-Clips · Sessions · Screenshots with search, a game filter and sorting (newest, oldest, largest, name).
-Click a thumbnail to play. Hover for **Show in folder** and the **…** menu: Copy path, Editor audio
-files, Rename, and Delete (to the Recycle Bin, after confirmation).
+One grid: a **Background Recording** card per game (temporary: the most recent gameplay, kept
+automatically up to your history length and storage limit), then your saved clips, recordings and
+screenshots, with search, a game filter and a type filter. Click a card to open it. The **…** menu on
+saved media: Show in folder, Save a copy, Open externally, Copy path, Editor audio files, Rename, and
+Delete (to the Recycle Bin, after confirmation). On a background recording: **Delete footage**, which
+removes only that game's temporary footage; clips and screenshots you saved are kept.
 
 ## Good to know
 - If CAPTURE or Windows stops unexpectedly, the next start offers to **save the last footage as a clip**.
