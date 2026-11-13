@@ -29,10 +29,6 @@ impl Monitor {
         Self { stop, buf, device: device.unwrap_or_else(|| "default".into()), started: Instant::now(), join: Some(join) }
     }
 
-    pub fn device(&self) -> &str {
-        &self.device
-    }
-
     pub fn take_level(&self) -> capture_protocol::Level {
         let (peak, rms) = self.buf.lock().unwrap().take_level();
         capture_protocol::Level { name: "Microphone".into(), peak, rms }

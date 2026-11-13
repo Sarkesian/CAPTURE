@@ -72,37 +72,39 @@ pub struct ClipEntry {
     pub has_markers: bool,
 }
 
-pub fn kind_dir(kind: &str) -> Option<(&'static str, &'static str, &'static str)> {
-    match kind {
-        "clips" => Some(("Clips", "mp4", "clip")),
-        "sessions" => Some(("Sessions", "mp4", "session")),
-        "screenshots" => Some(("Screenshots", "png", "screenshot")),
-        _ => None,
-    }
-}
+const KINDS: [(&str, &str, &str, &str); 3] = [("clips", "Clips", "mp4", "clip"), ("sessions", "Sessions", "mp4", "session"), ("screenshots", "Screenshots", "png", "screenshot")];
 
-pub fn list(root: &Path, kind: &str, limit: usize) -> Vec<ClipEntry> {
+/// The newest `limit` files of one kind ("clips" | "sessions" | "screenshots"), or of every
+/// kind (`None`) in a single walk of the capture folder.
+pub fn list(root: &Path, kind: Option<&str>, limit: usize) -> Vec<ClipEntry> {
     let mut out = Vec::new();
-    let Some((dir, ext, k)) = kind_dir(kind) else { return out };
     let Ok(games) = std::fs::read_dir(root) else { return out };
     for g in games.flatten().filter(|e| e.path().is_dir()) {
         let game = g.file_name().to_string_lossy().into_owned();
-        for f in std::fs::read_dir(g.path().join(dir)).into_iter().flatten().flatten() {
-            let p = f.path();
-            if !p.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext)) {
-                continue; // skips in-progress *.partial files and sidecars
+        for (_, dir, ext, k) in KINDS.iter().filter(|k| kind.is_none_or(|want| want == k.0)) {
+            // One listing of the folder answers "has markers" and "has editor audio" for every
+            // file in it, instead of two more lookups per file.
+            let entries: Vec<_> = std::fs::read_dir(g.path().join(dir)).into_iter().flatten().flatten().collect();
+            let names: std::collections::HashSet<String> = entries.iter().map(|f| f.file_name().to_string_lossy().to_lowercase()).collect();
+            for f in &entries {
+                let p = f.path();
+                if !p.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext)) {
+                    continue; // skips in-progress *.partial files and sidecars
+                }
+                let Ok(m) = f.metadata() else { continue };
+                let name = f.file_name().to_string_lossy().into_owned();
+                let stem = p.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+                out.push(ClipEntry {
+                    has_stems: names.contains(&format!("{stem}_audio")) && stems_dir(&p).is_dir(),
+                    has_markers: names.contains(&format!("{}.markers.json", name.to_lowercase())),
+                    path: p.to_string_lossy().into_owned(),
+                    name,
+                    game: game.clone(),
+                    bytes: m.len(),
+                    modified_ms: m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64).unwrap_or(0),
+                    kind: (*k).into(),
+                });
             }
-            let Ok(m) = f.metadata() else { continue };
-            out.push(ClipEntry {
-                has_stems: stems_dir(&p).is_dir(),
-                has_markers: sidecar(&p).is_file(),
-                path: p.to_string_lossy().into_owned(),
-                name: p.file_name().unwrap().to_string_lossy().into_owned(),
-                game: game.clone(),
-                bytes: m.len(),
-                modified_ms: m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64).unwrap_or(0),
-                kind: k.into(),
-            });
         }
     }
     out.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
@@ -188,6 +190,20 @@ mod tests {
         let t = rename(&t, "BOSS FIGHT").unwrap();
         assert!(std::fs::read_dir(&dir).unwrap().flatten().any(|e| e.file_name() == "BOSS FIGHT.mp4"));
         assert!(t.is_file());
+        // One walk lists every kind, with its sidecars.
+        let root = dir.join("root");
+        std::fs::create_dir_all(root.join("Game/Clips/a_Audio")).unwrap();
+        std::fs::create_dir_all(root.join("Game/Screenshots")).unwrap();
+        std::fs::write(root.join("Game/Clips/a.mp4"), b"1").unwrap();
+        std::fs::write(root.join("Game/Clips/a.mp4.markers.json"), b"{}").unwrap();
+        std::fs::write(root.join("Game/Clips/b.mp4.partial"), b"1").unwrap();
+        std::fs::write(root.join("Game/Screenshots/s.png"), b"1").unwrap();
+        let all = list(&root, None, 10);
+        assert_eq!(all.len(), 2);
+        let clip = all.iter().find(|c| c.kind == "clip").unwrap();
+        assert!(clip.has_stems && clip.has_markers && clip.name == "a.mp4");
+        assert_eq!(list(&root, Some("screenshots"), 10).len(), 1);
+        assert!(list(&root, Some("sessions"), 10).is_empty());
         // The no-replace move itself refuses an existing target.
         assert!(move_no_replace(&t, &dir.join("taken.mp4")).is_err());
         assert_eq!(std::fs::read(dir.join("taken.mp4")).unwrap(), b"1");

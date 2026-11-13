@@ -29,6 +29,8 @@ pub struct AppSettings {
     pub replay_enabled: bool,
     pub replay_secs: u32,
     pub history_secs: u32,
+    /// Off: only the Instant Replay window is kept, and it goes when the game closes.
+    pub background_history: bool,
     pub target: TargetPref,
     pub quality: Quality,
     pub fps: u32,
@@ -84,6 +86,7 @@ impl Default for AppSettings {
             replay_enabled: false,
             replay_secs: 120,
             history_secs: 4 * 3600,
+            background_history: true,
             target: TargetPref::Auto,
             quality: Quality::High,
             fps: 60,
@@ -146,6 +149,7 @@ impl AppSettings {
             buffer_root: self.buffer_root.clone().filter(|b| !b.trim().is_empty()),
             replay_secs: self.replay_secs,
             history_secs: self.history_secs,
+            background_history: self.background_history,
             target: match &self.target {
                 TargetPref::None => CaptureTarget::None,
                 TargetPref::Auto => CaptureTarget::Auto { games: self.games.clone(), ignore: self.ignored.clone() },
@@ -374,6 +378,14 @@ mod tests {
         let old:AppSettings=serde_json::from_str(r#"{"version":2,"replay_secs":120,"buffer_cap_gb":7.5,"min_free_gb":4.0}"#).unwrap();
         let next=old.sanitized();assert_eq!(next.replay_secs,120);assert_eq!(next.buffer_cap_gb,7.5);assert_eq!(next.min_free_gb,4.0);assert_eq!(next.history_secs,14400);
         let cfg=next.engine_config();assert_eq!(cfg.history_secs,14400);assert_eq!(cfg.replay_secs,120);assert_eq!(cfg.buffer_cap_bytes,7_500_000_000);
+    }
+
+    #[test]
+    fn background_history_is_on_unless_turned_off_and_off_keeps_only_the_replay_window() {
+        let s: AppSettings = serde_json::from_str(r#"{"replay_secs":300}"#).unwrap();
+        assert!(s.background_history && s.engine_config().kept_secs() == 14400);
+        let off = AppSettings { background_history: false, ..s };
+        assert_eq!(off.engine_config().kept_secs(), 330);
     }
 
     #[test]

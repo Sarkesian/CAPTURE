@@ -65,7 +65,7 @@
     </section>
   {/each}
 
-  {#if app.history?.sessions.length || (e?.leftover_buffer_bytes ?? 0) > 0}
+  {#if s.background_history && (app.history?.sessions.length || (e?.leftover_buffer_bytes ?? 0) > 0)}
     <section class="banner">
       <Icon name="replay" size={18} />
       <div class="grow"><b>Background history</b> · {app.history?.sessions.length ? `${fmtDuration(app.history.retained_secs)} of recent gameplay is kept` : 'Earlier gameplay is available'}. Open a session, find the moment and clip it.</div>
@@ -153,7 +153,7 @@
     <button class="link plain" onclick={openCaptureFolder} title="Open the capture folder"><span class="faint">Saving to</span> <span class="mono">{s.capture_root}</span></button>
     {#if e?.free_bytes != null}<span class="sep"></span><span><span class="faint">Free</span> {fmtBytes(e.free_bytes)}</span>{/if}
     <span class="sep"></span>
-    <span title={app.history?.reason ?? ''}><span class="faint">Background history</span> {fmtDuration(app.history?.retained_secs ?? 0)} · {fmtBytes(app.history?.bytes ?? 0)} of {s.buffer_cap_gb} GB</span>
+    <span title={app.history?.reason ?? ''}><span class="faint">{s.background_history ? 'Background history' : 'Replay footage'}</span> {fmtDuration(app.history?.retained_secs ?? 0)} · {fmtBytes(app.history?.bytes ?? 0)} of {s.buffer_cap_gb} GB</span>
     <span class="grow"></span>
     <button class="btn ghost sm" onclick={() => onnavigate('settings')}><Icon name="settings" size={16} />Recording settings</button>
   </footer>

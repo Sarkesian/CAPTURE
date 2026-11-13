@@ -13,7 +13,6 @@ export const app = $state({
   lastClip: null as SavedClip | null,
   clips: [] as ClipEntry[],
   toasts: [] as Toast[],
-  dataDir: '',
   /** This copy of CAPTURE: version, portable or installed, its folders. */
   info: null as AppInfo | null,
   /** Saved folders that are not reachable on this PC right now (setting kept). */
@@ -58,7 +57,6 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T |
 export async function init() {
   const b = await invoke<{ settings: Settings; data_dir: string; last_state: EngineState | null; engine_down: string | null; app: AppInfo; path_issues: PathIssue[]; notices: string[] }>('bootstrap');
   app.settings = b.settings;
-  app.dataDir = b.data_dir;
   app.engine = b.last_state;
   app.engineDown = b.engine_down;
   app.info = b.app;
@@ -70,9 +68,15 @@ export async function init() {
   await listen<string>('engine_down', e => {
     app.engineDown = e.payload;
     app.engine = null;
+    heldState = undefined;
     for (const finish of pendingResults.values()) finish(undefined);
     pendingResults.clear();
     earlyResults.clear();
+  });
+  // The window is going to the tray: it comes back as an ordinary window, with nothing playing.
+  await listen('tray', () => {
+    pauseMedia();
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
   });
   await listen<string>('goto', e => { navigate(e.payload as typeof app.tab); refreshClips(); });
   refreshTargets();
@@ -86,6 +90,33 @@ export function navigate(tab: typeof app.tab) {
     app.libraryNavigation++;
   }
   app.tab = tab === 'replay' ? 'library' : tab;
+}
+
+// A window nobody can see (in the tray, minimised, or the overlay while it is closed) does no
+// work for the engine's routine reports: the newest state and history are kept and shown when
+// the window comes back, and its lists are refreshed then instead of after every save.
+let heldState: EngineState | undefined;
+let heldHistory: HistoryState | undefined;
+let staleLibrary = false;
+/** Nothing keeps playing in a window that cannot be seen (minimised, in the tray, quitting). */
+function pauseMedia() {
+  for (const v of document.querySelectorAll('video')) v.pause();
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { pauseMedia(); return; }
+  if (heldState) { app.engine = heldState; heldState = undefined; }
+  if (heldHistory) { app.history = heldHistory; heldHistory = undefined; }
+  const library = staleLibrary;
+  staleLibrary = false;
+  if (library) { app.libraryVersion++; refreshClips(); }
+  // Whatever happened meanwhile (another window's save, footage ageing out) shows at once.
+  if (app.settings && !app.engineDown) engine('history');
+});
+/** Recorded footage changed (and, with `library`, the saved files too): refresh what shows it. */
+function filesChanged(library: boolean) {
+  if (document.hidden) { staleLibrary ||= library; return; }
+  if (library) { app.libraryVersion++; refreshClips(); }
+  engine('history');
 }
 
 function onEngine(m: EngineMessage) {
@@ -105,8 +136,10 @@ function onEngine(m: EngineMessage) {
       app.engineDown = null;
       break;
     case 'state':
-      app.engine = m.data;
       app.engineDown = null;
+      if (document.hidden) { heldState = m.data; break; }
+      heldState = undefined;
+      app.engine = m.data;
       break;
     case 'targets':
       app.windows = m.data.windows.sort((a, b) => a.app_name.localeCompare(b.app_name));
@@ -122,20 +155,18 @@ function onEngine(m: EngineMessage) {
     case 'save_finished':
       if (m.data.existing) { toast('Already saved. It is in your Library.', 'info', 4000); break; }
       app.lastClip = m.data;
-      app.libraryVersion++;
-      refreshClips();
-      engine('history');
+      filesChanged(true);
       break;
     case 'save_failed':
       toast(`Not saved: ${m.data.message}`, 'error', 9000);
-      engine('history');
+      filesChanged(false);
       break;
     case 'error':
       toast(m.data.message, m.data.message.startsWith('Deleted ') ? 'ok' : 'error', 7000);
       break;
     case 'marker_added':
       toast(`Marker added at ${m.data.at}`, 'ok', 2500);
-      engine('history');
+      filesChanged(false);
       break;
     case 'review_ready':
       reviewReply(m);
@@ -144,6 +175,8 @@ function onEngine(m: EngineMessage) {
       reviewReply(m);
       break;
     case 'history_ready':
+      if (document.hidden) { heldHistory = m.data; break; }
+      heldHistory = undefined;
       app.history = m.data;
       break;
     case 'audio_devices':
@@ -162,8 +195,7 @@ function onEngine(m: EngineMessage) {
       app.libraryVersion++;
       break;
     case 'screenshot_saved':
-      app.libraryVersion++;
-      engine('history');
+      filesChanged(true);
       break;
     case 'mic_test':
       app.micTest = m.data;
@@ -194,9 +226,6 @@ export function engine(cmd: string, args?: Record<string, unknown>) {
 }
 export const addMarker = () => engine('add_marker', {});
 export const toggleSession = () => engine(app.engine?.session_secs != null ? 'stop_session' : 'start_session');
-export function prepareReview() {
-  return requestReview('prepare_review', undefined, false);
-}
 export function cancelPendingReview() {
   currentReviewGeneration++;
   nextReviewGeneration++;
@@ -219,7 +248,6 @@ export const releaseReview = () => {
   app.review = null;
   return engine('release_review', { path });
 };
-export const saveRange = (start: number, end: number) => engine('save_range', { start, end });
 const reviewRequests = new Map<number, 'current' | 'next' | 'cancelled'>();
 let currentReviewGeneration = 0;
 let nextReviewGeneration = 0;
@@ -254,7 +282,6 @@ async function requestReview(cmd: string, args: Record<string, unknown> | undefi
   const reply = earlyReplies.get(id); if (reply) { earlyReplies.delete(id); reviewReply(reply); }
 }
 export const historyReview = (session: string, at: number, prefetch = false) => requestReview('history_review', { session, at, viewer, prefetch }, prefetch);
-export const historySave = (session: string, start: number, end: number) => engine('history_save', { session, start, end });
 type CommandResult = Extract<EngineMessage, { event: 'history_frames' | 'history_thumb' | 'save_finished' | 'save_failed' }>;
 const pendingResults = new Map<number, (result?: CommandResult) => void>();
 const earlyResults = new Map<number, CommandResult>();
@@ -322,7 +349,7 @@ export async function copyPath(path: string) {
   toast('Path copied', 'ok', 2000);
 }
 export async function refreshClips() {
-  app.clips = (await call<ClipEntry[]>('list_clips')) ?? [];
+  app.clips = (await call<ClipEntry[]>('list_clips', { kind: 'clips' })) ?? [];
 }
 
 export function fmtDuration(s: number): string {

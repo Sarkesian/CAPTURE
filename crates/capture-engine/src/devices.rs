@@ -78,13 +78,6 @@ pub fn default_id(flow: EDataFlow) -> Option<String> {
     }
 }
 
-pub fn default_name(flow: EDataFlow) -> Option<String> {
-    unsafe {
-        let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
-        en.GetDefaultAudioEndpoint(flow, eConsole).ok().map(|d| name_of(&d))
-    }
-}
-
 /// (pid, parent pid, exe name) for every process.
 fn processes() -> Vec<(u32, u32, String)> {
     let mut out = Vec::new();

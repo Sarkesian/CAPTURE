@@ -15,6 +15,7 @@ export interface Settings {
   replay_enabled: boolean;
   replay_secs: number;
   history_secs: number;
+  background_history: boolean;
   target: TargetPref;
   quality: Quality;
   fps: number;

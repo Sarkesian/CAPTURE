@@ -61,6 +61,8 @@ pub struct Engine {
     history_maintenance: Instant,
     /// Playback windows and thumbnails for Replay views, off the engine thread.
     jobs: review::Jobs,
+    /// Clip lengths for the Library, read two at a time (see `clip_info_pool`).
+    clip_info: std::sync::mpsc::Sender<(Option<u64>, String)>,
     cfg: Option<EngineConfig>,
     replay_on: bool,
     pipeline: Option<Pipeline>,
@@ -118,7 +120,8 @@ pub fn fmt_secs(s: f64) -> String {
 
 impl Engine {
     fn history_target(&self) -> u32 {
-        self.cfg.as_ref().map_or(capture_protocol::default_history_secs(), |c| c.history_secs)
+        // The running game's own replay length applies when it has one.
+        self.pipeline.as_ref().map(|p| p.shared.live.lock().unwrap().history_secs).or(self.cfg.as_ref().map(|c| c.kept_secs())).unwrap_or_else(capture_protocol::default_history_secs)
     }
 
     fn publish_history(&self, re: Option<u64>) {
@@ -257,6 +260,7 @@ impl Engine {
             history: None,
             history_maintenance: Instant::now(),
             jobs: review::Jobs::start(emit.clone()),
+            clip_info: clip_info_pool(emit.clone()),
             cfg: None,
             replay_on: false,
             pipeline: None,
@@ -393,8 +397,16 @@ impl Engine {
             Command::StopSession => self.stop_session(re),
             Command::SaveReplay => self.save(re, None),
             Command::SaveRange { start, end } => self.save(re, Some((start, end))),
-            Command::History => self.publish_history(re),
-            Command::HistoryReview { session, at, viewer, prefetch } => self.history_review(re, session, at, viewer, prefetch),
+            // Replay views only read (polling, scrubbing): nothing about the engine changed, so
+            // no state report follows them.
+            Command::History => {
+                self.publish_history(re);
+                return true;
+            }
+            Command::HistoryReview { session, at, viewer, prefetch } => {
+                self.history_review(re, session, at, viewer, prefetch);
+                return true;
+            }
             Command::HistorySave { session,start,end,aligned } => self.history_save(re,session,start,end,aligned),
             Command::HistoryFrames { session, at } => {
                 let history = self.history.clone();
@@ -408,6 +420,7 @@ impl Engine {
                     };
                     emit(Message::new(re, event));
                 });
+                return true;
             }
             Command::HistoryThumb { session, at, exact, viewer } => match self.history.clone() {
                 Some(catalog) => {
@@ -572,14 +585,8 @@ impl Engine {
                 });
             }
             Command::ClipInfo { path } => {
-                let emit = self.emit.clone();
-                std::thread::spawn(move || {
-                    let ev = match probe::duration_secs(Path::new(&path)) {
-                        Ok(d) => Event::ClipInfo { path, duration_secs: Some(d), error: None },
-                        Err(e) => Event::ClipInfo { path, duration_secs: None, error: Some(e) },
-                    };
-                    emit(Message::new(re, ev));
-                });
+                let _ = self.clip_info.send((re, path));
+                return true; // nothing about the engine changed
             }
             Command::ReleaseReview { path } => {
                 if let (Some(h), Some(path)) = (&self.history, &path) {
@@ -588,11 +595,6 @@ impl Engine {
                 return true;
             }
             Command::AddMarker { label } => self.add_marker(re, label),
-            Command::RenameMarker { id, label } => {
-                if !self.pipeline.as_ref().is_some_and(|p| p.shared.rename_marker(id, label)) {
-                    self.send(re, Event::Error { message: "That marker no longer exists.".into() });
-                }
-            }
             Command::RemoveMarker { id } => {
                 if !self.pipeline.as_ref().is_some_and(|p| p.shared.remove_marker(id)) {
                     self.send(re, Event::Error { message: "That marker no longer exists.".into() });
@@ -611,7 +613,7 @@ impl Engine {
                 // Explicitly asked for: every finished session's footage becomes clips.
                 let selections = (|| -> Result<Vec<history::Lease>, String> {
                     let mut leases = vec![];
-                    for session in h.state(cfg.history_secs)?.sessions.into_iter().filter(|s| s.ended) {
+                    for session in h.state(cfg.kept_secs())?.sessions.into_iter().filter(|s| s.ended) {
                         for [a, b] in session.intervals {
                             leases.push(h.lease_at(&session.id, a, b, "save")?);
                         }
@@ -924,11 +926,21 @@ impl Engine {
         self.hand_over_notice();
         if self.history_maintenance.elapsed().as_secs()>=2 {
             self.history_maintenance=Instant::now();
+            let keep = self.history_target();
             if let (Some(h), Some(c)) = (&self.history, &self.cfg) {
-                if let Err(e) = h.refresh_files().and_then(|_| h.retain(c.history_secs, c.buffer_cap_bytes, c.min_free_bytes).map(|_| ())) {
+                if let Err(e) = h.refresh_files().and_then(|_| h.retain(keep, c.buffer_cap_bytes, c.min_free_bytes).map(|_| ())) {
                     eprintln!("history maintenance: {e}");
                 }
+                if !c.background_history {
+                    h.drop_finished();
+                }
             }
+        }
+        // Background history off: a closed game's footage is not kept around.
+        if self.cfg.as_ref().is_some_and(|c| !c.background_history) && self.pipeline.as_ref().is_some_and(|p| p.target_gone()) {
+            self.stop_session(None);
+            let name = self.pipeline.take().map(|p| p.shared.game_name.clone()).unwrap_or_default();
+            self.start_error = Some(waiting(format!("{name} closed.")));
         }
         if self.pipeline.as_ref().is_some_and(|p|p.capture.resolution_changed.load(Ordering::Relaxed)) {
             let recording=self.pipeline.as_ref().is_some_and(|p|p.shared.session_start.lock().unwrap().is_some());
@@ -1293,6 +1305,26 @@ impl Engine {
     }
 }
 
+/// A page of Library cards asks for the length of dozens of clips at once. Two readers work
+/// through them in the order asked, instead of one thread per clip all hitting the disk together.
+fn clip_info_pool(emit: Emit) -> std::sync::mpsc::Sender<(Option<u64>, String)> {
+    let (tx, rx) = std::sync::mpsc::channel::<(Option<u64>, String)>();
+    let rx = Arc::new(Mutex::new(rx));
+    for _ in 0..2 {
+        let (rx, emit) = (rx.clone(), emit.clone());
+        let _ = std::thread::Builder::new().name("clip-info".into()).spawn(move || loop {
+            let job = rx.lock().unwrap().recv();
+            let Ok((re, path)) = job else { break };
+            let ev = match std::panic::catch_unwind(|| probe::duration_secs(Path::new(&path))).unwrap_or_else(|_| Err("Clip could not be read".into())) {
+                Ok(d) => Event::ClipInfo { path, duration_secs: Some(d), error: None },
+                Err(e) => Event::ClipInfo { path, duration_secs: None, error: Some(e) },
+            };
+            emit(Message::new(re, ev));
+        });
+    }
+    tx
+}
+
 /// "Create separate audio files for editors": after a verified save, write the per-track WAVs
 /// on a background thread (never delays the save or the next one). Only for clips that have
 /// separate tracks; a clip with just Preview Mix gains nothing from a WAV copy.
@@ -1330,7 +1362,7 @@ pub fn bindings(cfg: &EngineConfig) -> hotkey::Bindings {
 /// The footage files of a kept session folder, in order, with the session time of the first
 /// picture and the audio track names.
 fn live_of(cfg: &EngineConfig) -> Live {
-    Live { replay_secs: cfg.replay_secs.clamp(5, 3600), history_secs:cfg.history_secs.clamp(60,21600), cap_bytes: cfg.buffer_cap_bytes, min_free_bytes: cfg.min_free_bytes }
+    Live { replay_secs: cfg.replay_secs.clamp(5, 3600), history_secs: cfg.kept_secs(), cap_bytes: cfg.buffer_cap_bytes, min_free_bytes: cfg.min_free_bytes }
 }
 
 fn base_settings(cfg: &EngineConfig) -> Result<PathBuf, Unresolved> {

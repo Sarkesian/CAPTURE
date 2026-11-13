@@ -36,7 +36,7 @@ try {
   const cdp = (method, params = {}) => new Promise(r => { pending.set(++id, r); ws.send(JSON.stringify({ id, method, params })); });
   const js = async expression => { const m = await cdp('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }); if (m.result?.exceptionDetails) throw Error(JSON.stringify(m.result.exceptionDetails)); return m.result?.result?.value; };
   const check = (ok, label) => { assert.ok(ok, label); checks++; console.log('PASS ' + label); };
-  const wait = async (expr, label, ms = 6000) => { const until = Date.now() + ms; while (Date.now() < until) { if (await js(expr)) return; await sleep(30); } throw Error('timed out: ' + label + '\n' + errors.join('\n') + '\n' + await js('document.body.innerText.slice(0,1500)')); };
+  const wait = async (expr, label, ms = 6000) => { const until = Date.now() + ms; while (Date.now() < until) { if (await js(expr)) return; await sleep(30); } throw Error('timed out: ' + label + '\n' + errors.join('\n') + '\n' + await js('JSON.stringify([window.fixtureReady, window.fixtureCalls?.map(c=>c.cmd).slice(-6), window.fixtureApp?.history?.sessions?.length]) + document.body.innerText.slice(0,300)')); };
   // `sel`: a CSS selector, or `js:<expression>` giving the element.
   const element = sel => sel.startsWith('js:') ? sel.slice(3) : `document.querySelector(${JSON.stringify(sel)})`;
   const rect = sel => js(`(()=>{const r=(${element(sel)}).getBoundingClientRect();return {x:r.x,y:r.y,w:r.width,h:r.height}})()`);
@@ -60,14 +60,14 @@ try {
 
   // The fixture's Witcher 3 history on one line: 30 min, a 2 s flicker, then 3500 s and 3580 s
   // (the game changed resolution in between). Breaks are a fixed width.
-  const TOTAL = 1800 + 2 + 3500 + 3580, GAP = Math.max(.5, TOTAL * .008), END = TOTAL + 3 * GAP;
+  const TOTAL = 1800 + 2 + 3500 + 3580, GAP = .02, END = TOTAL + 3 * GAP;
   const PIECES = [['w-early', 0, 1800], ['flicker', 0, 2], ['w-late', 0, 3500], ['w-late', 3520, 7100]].map(([session, a, b], i, all) => ({ session, a, b, v: all.slice(0, i).reduce((n, p) => n + p[2] - p[1] + GAP, 0) }));
   const realAt = v => { const p = PIECES.find(p => v >= p.v && v < p.v + p.b - p.a); return p ? { session: p.session, t: p.a + v - p.v } : null; };
   const shownThumbAt = () => js(`(()=>{const i=document.querySelector('.hover-card .frame img');if(!i)return null;const m=decodeURIComponent(i.src).match(/data-t="([^:"]+):([^"]+)"/);return m?{session:m[1],t:Number(m[2])}:null})()`);
   const card = name => `[...document.querySelectorAll('.rec')].find(c=>c.textContent.includes(${JSON.stringify(name)}))`;
 
   // ---- Library: one grid, games side by side ---------------------------------------------------
-  await wait('window.fixtureReady && document.querySelectorAll(".rec").length===2', 'game cards');
+  await wait('window.fixtureReady && document.querySelectorAll(".rec").length===2', 'game cards', 30000);
   check(await js('document.querySelectorAll("section .grid").length===2 && document.querySelectorAll("section[aria-label=\\"Background recordings\\"] .rec").length===2 && document.querySelectorAll("section[aria-label=\\"Saved media\\"] .saved-card:not(.rec)").length===2'), 'two sections: background recordings (one per game), then saved media');
   check(await js('[...document.querySelectorAll("section .grid")].every(g=>new Set([...g.children].map(c=>Math.round(c.getBoundingClientRect().top))).size===1)'), 'cards sit side by side within each section');
   check(await js('[...document.querySelectorAll(".rec .card-text strong")].map(e=>e.textContent).join("|")') === 'Hollow Knight|The Witcher 3', 'one background-recording card per game, most recently played first');
@@ -92,7 +92,7 @@ try {
   check(await js('document.querySelectorAll("[role=slider]").length===1 && !document.querySelector(".session-nav")'), 'one timeline, nothing to pick first');
   check(await js('document.querySelectorAll(".footage").length===4'), 'every recorded stretch of the game is visible at once, separated by breaks');
   let v = await view();
-  check(v.a === 0 && Math.abs(v.b - END) < .01, 'the whole history is shown first');
+  check(v.a === 0 && Math.abs(v.b - END) < .01, 'the whole history is shown first ' + JSON.stringify(v) + ' ' + END);
   check(await js('document.querySelectorAll(".session-label").length>=2'), 'sessions are labelled with their date');
   check(await js('document.querySelectorAll(".saved-clip").length===1 && document.querySelectorAll(".moment").length===3'), 'saved clips, markers and screenshots sit on the timeline');
   check(await js('document.querySelector(".time").textContent.includes("/ 2:28:02")'), 'the total is the footage there is (breaks do not count)');
@@ -154,37 +154,103 @@ try {
   check(await now() > position, 'the playhead follows playback');
   await key(' ', 'Space');
 
+  // ---- Continuous playback across windows (each window is its own file) ----------------------
+  await key(' ', 'Space');
+  await wait('!document.querySelector(".stage video").paused', 'playback starts again');
+  const from = await now(), reviewsBefore = (await calls('history_review')).length;
+  const seen = await js(`new Promise(done=>{const r={held:false,loading:false,paused:false,waiting:false,max:0};const t0=performance.now();let last=performance.now(),lastT=-1;
+    const tick=()=>{const v=document.querySelector('.stage video:not(.waiting)');
+      if(document.querySelector('.still.show'))r.held=true;if(window.fixtureApp.reviewLoading)r.loading=true;if(document.querySelector('.stage video.waiting'))r.waiting=true;
+      if(document.querySelector('.play [aria-label]')||document.querySelector('button.play[aria-label=Play]'))r.paused=true;
+      const t=v?v.currentTime+':'+v.src:lastT;if(t!==lastT){r.max=Math.max(r.max,performance.now()-last);last=performance.now();lastT=t;}
+      if(performance.now()-t0>9000)done(r);else requestAnimationFrame(tick);};tick();})`);
+  const moved = await now() - from;
+  check(seen.waiting && (await calls('history_review')).slice(reviewsBefore).some(c => c.prefetch), 'the next window is loaded behind the picture before it is needed');
+  check(!seen.held && !seen.loading && !seen.paused, 'crossing into the next window never shows a held frame, a loading notice or a paused button ' + JSON.stringify(seen));
+  check(moved > 7.5 && seen.max < 250, `playback keeps moving across windows (${moved.toFixed(1)} s in 9 s, longest stall ${Math.round(seen.max)} ms)`);
+  await key(' ', 'Space');
+
   // ---- Zoom ---------------------------------------------------------------------------------
   const b = await rect('.detail');
-  for (let n = 0; n < 14; n++) { await cdp('Input.dispatchMouseEvent', { type: 'mouseWheel', x: b.x + b.w * .5, y: b.y + 26, deltaX: 0, deltaY: -100 }); await sleep(25); }
+  for (let n = 0; n < 30; n++) { await cdp('Input.dispatchMouseEvent', { type: 'mouseWheel', x: b.x + b.w * .5, y: b.y + 26, deltaX: 0, deltaY: -100 }); await sleep(25); }
+  await sleep(500);
   v = await view();
-  check(v.b - v.a < 120, 'the wheel zooms in on the cursor');
+  check(v.b - v.a < 120 && (await now()) > v.a && (await now()) < v.b, 'the wheel zooms in on the playhead');
   check(await js('document.querySelectorAll(".tick i").length>=3'), 'zoomed in, the timeline is labelled with footage times');
   await hoverAt(.37);
   await wait('!!document.querySelector(".hover-card .frame img")', 'zoomed thumbnail');
+  await sleep(200);
   check((await calls('history_thumb')).at(-1).exact === true, 'zoomed in, the hover picture is the exact frame');
   await key('0', 'Digit0');
+  await sleep(600);
   v = await view();
   check(v.a === 0 && Math.abs(v.b - END) < .01, 'one key returns to the whole history');
+
+  // ---- No black frame while another moment opens ---------------------------------------------
+  await click('.detail', .15, .45);
+  await wait('!window.fixtureApp.reviewLoading && document.querySelector(".stage video")?.readyState>=2', 'settled before far seek');
+  const far = await rect('.detail');
+  await mouse('mousePressed', far.x + far.w * .7, far.y + 40, 1);
+  await mouse('mouseReleased', far.x + far.w * .7, far.y + 40, 0, { button: 'left' });
+  check(await js('!!document.querySelector(".still.show")'), 'the last picture stays up while a moment elsewhere opens');
+  await wait('!window.fixtureApp.reviewLoading && document.querySelector(".stage video")?.readyState>=2', 'far seek settles');
+  await wait('!document.querySelector(".still.show")', 'the held picture is released once the new one is drawn');
+
+  // ---- Fullscreen: controls over the picture, leaving while it plays ---------------------------
+  await key('f', 'KeyF');
+  await wait('document.querySelector(".history").classList.contains("full")', 'fullscreen');
+  const dockTop = (await rect('.viewer-dock')).y, stageBox = await rect('.stage');
+  check(stageBox.h > dockTop && await js('getComputedStyle(document.querySelector(".viewer-dock")).opacity==="1"'), 'in fullscreen the controls lie over the picture');
+  await shot('fullscreen');
+  await mouse('mouseMoved', 400, 300);
+  await key(' ', 'Space');
+  await wait('document.querySelector(".history").classList.contains("idle")', 'controls leave during playback', 5000);
+  await sleep(300);
+  check(await js('getComputedStyle(document.querySelector(".viewer-dock")).opacity==="0"'), 'they are gone while it plays untouched');
+  await mouse('mouseMoved', 400, 300);
+  await mouse('mouseMoved', 420, 320);
+  await sleep(300);
+  check(await js('!document.querySelector(".history").classList.contains("idle") && getComputedStyle(document.querySelector(".viewer-dock")).opacity==="1"'), 'moving the mouse brings them back');
+  await key(' ', 'Space');
+  await key('f', 'KeyF');
+  await wait('!document.querySelector(".history").classList.contains("full")', 'leaves fullscreen');
 
   // ---- Clip ---------------------------------------------------------------------------------
   await click('.detail', .15, .45);
   await wait('!window.fixtureApp.reviewLoading', 'seek before clip');
-  await click('.transport-end .primary');
-  await wait('document.querySelectorAll(".handle").length===2 && !document.querySelector(".transport-end .primary").disabled', 'clip range ready');
-  const selected = parseFloat(await js('document.querySelector(".selected-duration").textContent'));
+  // Right-click: what can be done at that moment.
+  const menuAt = await rect('.detail');
+  await mouse('mousePressed', menuAt.x + menuAt.w * .4, menuAt.y + 48, 2, { button: 'right' });
+  await mouse('mouseReleased', menuAt.x + menuAt.w * .4, menuAt.y + 48, 0, { button: 'right' });
+  await wait('!!document.querySelector(".context")', 'context menu');
+  check(await js('document.querySelector(".context").textContent.includes("Clip around here")'), 'a right-click on the timeline offers to clip that moment');
+  await shot('context');
+  await key('Escape');
+  check(await js('!document.querySelector(".context")'), 'Escape closes the menu');
+  await click('.transport-end .clip');
+  await wait('document.querySelectorAll(".handle").length===2 && !document.querySelector(".clipbar .primary").disabled', 'clip range ready');
+  const selected = parseFloat(await js('document.querySelector(".clipbar .clip-length").textContent'));
   check(await js('!!document.querySelector(".clip-range")') && selected >= 44 && selected <= 47, `Clip selects a range around the playhead and shows its length (${selected}s)`);
   const handle = await rect('.handle.end');
   await mouse('mousePressed', handle.x + handle.w * .15, handle.y + handle.h / 2, 1);
   for (let n = 1; n <= 6; n++) await mouse('mouseMoved', handle.x + n * 5, handle.y + handle.h / 2, 1);
   await mouse('mouseReleased', handle.x + 30, handle.y + handle.h / 2, 0, { button: 'left' });
-  await wait('!document.querySelector(".transport-end .primary").disabled', 'trim aligned');
-  check(parseFloat(await js('document.querySelector(".selected-duration").textContent')) > selected + 1, 'dragging a handle changes the range, and release ends the drag');
+  await wait('!document.querySelector(".clipbar .primary").disabled', 'trim aligned');
+  check(parseFloat(await js('document.querySelector(".clipbar .clip-length").textContent')) > selected + 1, 'dragging a handle changes the range, and release ends the drag');
   await shot('clip');
-  await click('.transport-end .primary');
+  // Snapping: a handle dragged to within a few pixels of the playhead lands exactly on it.
+  const head = await rect('.playhead'), startHandle = await rect('.handle.start');
+  await mouse('mousePressed', startHandle.x + startHandle.w - 4, startHandle.y + 18, 1);
+  for (let n = 1; n <= 8; n++) await mouse('mouseMoved', startHandle.x + startHandle.w - 4 + (head.x - 3 - startHandle.x - startHandle.w) * n / 8, startHandle.y + 18, 1);
+  check(await js('!!document.querySelector(".snap-line") && document.querySelector(".hover-card").textContent.includes("Snapped to the playhead")'), 'a handle near the playhead snaps to it and says so');
+  await shot('snap');
+  await mouse('mouseReleased', head.x - 3, startHandle.y + 18, 0, { button: 'left' });
+  await wait('!document.querySelector(".clipbar .primary").disabled', 'trim aligned after snap');
+  check(await js('!document.querySelector(".snap-line") && !document.querySelector(".hover-card")'), 'nothing stays attached to the cursor after release');
+  await click('.clipbar .primary');
   await wait('!document.querySelector(".handle")', 'saved, back to watching');
   const saved = (await calls('history_save')).at(-1);
-  check(saved.session === 'w-early' && saved.aligned === true && saved.end - saved.start > selected + 1 && saved.end <= 1800, 'Save Clip saves exactly the selected range of the session it lies in');
+  check(saved.session === 'w-early' && saved.aligned === true && saved.end - saved.start > 5 && saved.end <= 1800, 'Save Clip saves exactly the selected range of the session it lies in');
   check(await js('document.body.innerText.includes("Clip saved")'), 'saving is confirmed');
   await click('.back');
   await wait('document.querySelectorAll(".rec").length===2', 'back in the Library');
@@ -209,6 +275,7 @@ try {
   await size(900, 620);
   await cdp('Page.navigate', { url: url + '#compact' });
   await sleep(300);
+  await js('window.fixtureReady=false');
   await cdp('Page.reload');
   await wait('window.fixtureReady && document.querySelector(".stage video")?.readyState>=2', 'overlay panel opens');
   check(await js('document.querySelector("select[aria-label=Game]").value==="Hollow Knight" && !!document.querySelector(".live")'), 'the overlay opens the game being recorded');

@@ -36,7 +36,7 @@ const thumbImage = (session: string, t: number) => 'data:image/svg+xml,' + encod
   async invoke(cmd: string, args: any) {
     if (cmd === 'bootstrap') return { settings, data_dir: 'fixture', last_state: null, engine_down: null, app: null, path_issues: [], notices: [] };
     if (cmd === 'plugin:event|listen') { listeners.set(args.event, args.handler); return ++serial; }
-    if (cmd === 'list_clips') return media.filter(c => c.kind === ({ clips: 'clip', sessions: 'session', screenshots: 'screenshot' } as any)[args?.kind ?? 'clips']);
+    if (cmd === 'list_clips') return media.filter(c => !args?.kind || c.kind === ({ clips: 'clip', sessions: 'session', screenshots: 'screenshot' } as any)[args.kind]);
     if (cmd === 'check_paths') return [];
     if (cmd === 'library_game_art') return {};
     if (cmd === 'engine_command') {

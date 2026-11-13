@@ -120,10 +120,6 @@ impl Shared {
         self.written_ms.fetch_add(((end - start) * 1000.0) as u64, Ordering::Relaxed);
     }
 
-    /// Seconds of this recording that a replay could reach back over right now.
-    pub fn recorded_secs(&self) -> f64 {
-        self.first_frame.lock().unwrap().map_or(0.0, |first| (self.save_end() - first).max(0.0))
-    }
     pub fn now(&self) -> f64 {
         clock::secs_since(self.t0)
     }

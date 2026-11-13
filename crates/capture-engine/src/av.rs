@@ -92,11 +92,3 @@ pub struct AVD3D11VADeviceContext {
     pub lock_ctx: *mut std::ffi::c_void,
 }
 
-/// Mirror of `AVD3D11VAFramesContext`.
-#[repr(C)]
-pub struct AVD3D11VAFramesContext {
-    pub texture: *mut std::ffi::c_void,
-    pub bind_flags: u32,
-    pub misc_flags: u32,
-    pub texture_infos: *mut std::ffi::c_void,
-}

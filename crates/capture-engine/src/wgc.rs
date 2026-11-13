@@ -271,6 +271,11 @@ impl Capture {
                     let frame = &lease.0;
                     let content = frame.ContentSize()?;
                     let tex: ID3D11Texture2D = unsafe { frame.Surface()?.cast::<IDirect3DDxgiInterfaceAccess>()?.GetInterface()? };
+                    // Measured before taking the lock the encoder clock also needs: asking Windows
+                    // where the window is must not hold it.
+                    let mut desc = D3D11_TEXTURE2D_DESC::default();
+                    unsafe { tex.GetDesc(&mut desc) };
+                    let crop = window.and_then(client_crop);
                     let mut l = latest.lock().unwrap();
                     if crate::trace::enabled() {
                         let shown = frame.SystemRelativeTime().map(|t| t.Duration).unwrap_or(0);
@@ -295,9 +300,6 @@ impl Capture {
                     }
                     // Minimize/mode switches can have empty content or a surface smaller
                     // than ContentSize. Keep the complete picture rather than copying garbage.
-                    let mut desc = D3D11_TEXTURE2D_DESC::default();
-                    unsafe { tex.GetDesc(&mut desc) };
-                    let crop = window.and_then(client_crop);
                     if window.is_some() && crop.is_none() { return Ok(()) }
                     let Some(rect) = frame_rect(content, (desc.Width, desc.Height), crop) else { return Ok(()) };
                     let (cx, cy) = (rect.left as u32, rect.top as u32);
@@ -346,7 +348,11 @@ impl Capture {
                     };
                     if b.right > b.left && b.bottom > b.top {
                         unsafe {
-                            context.ClearRenderTargetView(&l.rtv, &[0.0, 0.0, 0.0, 1.0]);
+                            // Black around a picture smaller than the recording; a full-size
+                            // copy (the usual case) overwrites every pixel anyway.
+                            if (b.right - b.left, b.bottom - b.top) != (width, height) {
+                                context.ClearRenderTargetView(&l.rtv, &[0.0, 0.0, 0.0, 1.0]);
+                            }
                             context.CopySubresourceRegion(&l.texture, 0, 0, 0, 0, &tex, 0, Some(&b));
                         }
                         l.error = None;
@@ -421,13 +427,6 @@ fn make_latest(gpu: &Gpu, width: u32, height: u32) -> Result<Latest, String> {
     let rtv = rtv.unwrap();
     unsafe { gpu.context.ClearRenderTargetView(&rtv, &[0.0, 0.0, 0.0, 1.0]) };
     Ok(Latest { frame_qpc:0,texture, rtv, has_frame: false, last_size: SizeInt32 { Width: width as i32, Height: height as i32 }, scaler: None, error: None })
-}
-
-#[cfg(test)]
-pub(crate) fn synthetic_latest(gpu:&Gpu,width:u32,height:u32,pixels:&[u8])->Latest {
-    let mut latest=make_latest(gpu,width,height).unwrap();
-    unsafe {gpu.context.UpdateSubresource(&latest.texture,0,None,pixels.as_ptr().cast(),width*4,0);}
-    latest.has_frame=true;latest
 }
 
 #[cfg(test)]

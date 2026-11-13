@@ -61,6 +61,11 @@
   </div>
 
   <div class="field">
+    <div class="lbl"><div>Background history</div><div class="hint">{s.background_history ? 'Keeps hours of gameplay as temporary recordings you can clip from later. Uses more disk space.' : 'Off: only your last few minutes are kept for the replay key, and removed when the game closes.'}</div></div>
+    <Toggle checked={s.background_history} label="Background history" onchange={v => updateSettings({ background_history: v })} />
+  </div>
+
+  <div class="field">
     <div class="lbl">
       <div>Start with Windows</div>
       <div class="hint">{app.info?.installed ? 'Starts in the tray when you sign in.' : 'Starts this portable copy in the tray when you sign in. Turn it off before you delete the folder.'}</div>

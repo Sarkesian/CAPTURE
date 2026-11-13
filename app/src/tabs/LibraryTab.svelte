@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, tick, untrack } from 'svelte';
   import { convertFileSrc, invoke } from '@tauri-apps/api/core';
+  import { listen } from '@tauri-apps/api/event';
   import { save as saveDialog } from '@tauri-apps/plugin-dialog';
   import { app, engine, openPath, revealPath, copyPath, openCaptureFolder, deleteClip, deleteRecording, requestClipInfo, toast, fmtDuration, fmtBytes } from '../lib/store.svelte';
   import type { ClipEntry, HistorySession } from '../lib/types';
@@ -9,6 +10,7 @@
   import VideoPreview from '../components/VideoPreview.svelte';
   import HistoryPanel from '../overlay/HistoryPanel.svelte';
   import SessionThumb from '../components/SessionThumb.svelte';
+  import SavedViewer from '../components/SavedViewer.svelte';
 
   let { active = $bindable(false) }: { active?: boolean } = $props();
   let host: HTMLElement;
@@ -25,7 +27,9 @@
   let origin: HTMLElement | null = null;
   let req = 0;
   const filters = [{value:'all',label:'All'},{value:'recordings',label:'Recordings'},{value:'clips',label:'Clips'},{value:'screenshots',label:'Screenshots'}] as const;
-  const sessions = $derived(app.history?.sessions ?? []);
+  // Background history off: only the game being played has footage (its replay window).
+  const historyOn = $derived(app.settings?.background_history ?? true);
+  const sessions = $derived((app.history?.sessions ?? []).filter(s => historyOn || !s.ended));
   const recovering = $derived(app.history?.reason?.startsWith('Recovering earlier recordings') ?? false);
   const games = $derived([...new Set([...sessions.map(s=>s.game),...items.map(c=>c.game)])].sort((a,b)=>a.localeCompare(b)));
   const matches = (g: string, name = '') => (!game || g === game) && (g+' '+name).toLowerCase().includes(query.trim().toLowerCase());
@@ -62,8 +66,9 @@
   async function load() {
     const mine=++req;
     try {
-      const list=(await Promise.all(['clips','sessions','screenshots'].map(kind=>invoke<ClipEntry[]>('list_clips',{kind})))).flat();
-      if(mine===req)items=list.sort((a,b)=>b.modified_ms-a.modified_ms);
+      // Every kind in one walk of the capture folder, newest first.
+      const list=await invoke<ClipEntry[]>('list_clips');
+      if(mine===req)items=list;
     }catch(e){if(mine===req)toast(String(e),'error');}
     if(mine===req)loaded=true;
   }
@@ -75,10 +80,15 @@
   async function back() {
     viewing=null;await tick();const scroller=host.closest('main');if(scroller)scroller.scrollTop=scroll;origin?.focus({preventScroll:true});
   }
+  // Previous / next saved item in the viewer, in the order the Library shows them.
+  const at = $derived(viewing?.kind==='saved' ? shown.findIndex(c=>c.path===(viewing as {item:ClipEntry}).item.path) : -1);
+  const prev = $derived(at>0 ? shown[at-1] : null);
+  const next = $derived(at>=0 ? shown[at+1] ?? null : null);
+  function step(to:ClipEntry|null){if(to)viewing={kind:'saved',item:to};}
   onMount(()=>{
     engine('history');
     invoke<Record<string,string>>('library_game_art').then(a=>gameArt=a).catch(()=>{});
-    const timer=setInterval(()=>{if(viewing?.kind!=='recording')engine('history');},2500);
+    const timer=setInterval(()=>{if(!document.hidden&&viewing?.kind!=='recording')engine('history');},2500);
     const close=(e:PointerEvent)=>{if(!(e.target as HTMLElement)?.closest('.menu,.more')){menu=null;confirmDelete=null;}};
     const escape=(e:KeyboardEvent)=>{if(e.key!=='Escape'||e.defaultPrevented||document.fullscreenElement)return;if(menu||renaming){menu=null;confirmDelete=null;renaming=null;}else if(viewing)back();};
     window.addEventListener('pointerdown',close);window.addEventListener('keydown',escape);
@@ -87,6 +97,9 @@
   $effect(()=>{app.libraryNavigation;untrack(()=>{viewing=null;menu=null;game='';query='';count=60;});});
   $effect(()=>{app.libraryVersion;untrack(load);});
   $effect(()=>{active=!!viewing;return ()=>{active=false;};});
+  // While something is open, the window's own close button closes the viewer instead of CAPTURE.
+  $effect(()=>{const on=!!viewing;invoke('set_viewing',{on}).catch(()=>{});return ()=>{if(on)invoke('set_viewing',{on:false}).catch(()=>{});};});
+  onMount(()=>{const un=listen('close_viewer',async()=>{if(document.fullscreenElement)await document.exitFullscreen().catch(()=>{});if(viewing)back();});return ()=>{un.then(f=>f());};});
   async function rename(c:ClipEntry,name:string){renaming=null;if(!name.trim()||name===title(c))return;try{await invoke('rename_clip',{path:c.path,name});await load();}catch(e){toast(String(e),'error');}}
   async function remove(c:ClipEntry){menu=null;confirmDelete=null;await deleteClip(c.path);await load();}
   async function stems(c:ClipEntry){app.stemsBusy[c.path]=true;await engine('export_stems',{path:c.path});}
@@ -114,18 +127,15 @@
       <header class="viewer-header">
         <button class="btn ghost back" onclick={back}><Icon name="back" size={17}/>Library</button>
         <div class="viewer-title"><h1>{viewing.kind==='recording'?viewing.game:viewing.item.game}</h1><p>{viewing.kind==='recording'?'Background recording · temporary until you clip it':mediaLabel(viewing.item.kind)+' · '+date(viewing.item.modified_ms)}</p></div>
-        {#if viewing.kind==='saved'}<button class="btn ghost icon" title="Show in folder" aria-label="Show in folder" onclick={()=>viewing?.kind==='saved'&&revealPath(viewing.item.path)}><Icon name="folder" size={18}/></button>{/if}
+        <div class="viewer-actions">
+          {#if viewing.kind==='saved'}<button class="btn ghost icon" title="Show in folder" aria-label="Show in folder" onclick={()=>viewing?.kind==='saved'&&revealPath(viewing.item.path)}><Icon name="folder" size={18}/></button>{/if}
+          <button class="btn close-viewer" title="Close the viewer and return to the Library (Esc). CAPTURE keeps running." onclick={back}><Icon name="x" size={16}/>Close viewer</button>
+        </div>
       </header>
       {#if viewing.kind==='recording'}
         <HistoryPanel gameName={viewing.game} onclose={back}/>
       {:else}
-        <div class="saved-stage">
-          {#if viewing.item.kind==='screenshot'}<img src={convertFileSrc(viewing.item.path)} alt={title(viewing.item)}/>
-          {:else}
-            <!-- svelte-ignore a11y_media_has_caption -->
-            <video src={convertFileSrc(viewing.item.path)} controls preload="metadata" autoplay aria-label={title(viewing.item)}></video>
-          {/if}
-        </div>
+        <SavedViewer item={viewing.item} {prev} {next} onstep={step}/>
       {/if}
     </div>
   {:else}
@@ -137,7 +147,7 @@
     </div>
     {#if showBackground && background.length}
       <section aria-label="Background recordings">
-        <div class="section-head"><h2>Background recordings</h2><span class="temp">Temporary</span><span class="section-note">{app.history?.reason ?? 'Your most recent gameplay, kept automatically. Open one and clip what you want to keep.'}</span></div>
+        <div class="section-head"><h2>{historyOn?'Background recordings':'Now recording'}</h2><span class="temp">Temporary</span><span class="section-note">{historyOn?(app.history?.reason ?? 'Your most recent gameplay, kept automatically. Open one and clip what you want to keep.'):'The last few minutes of the game you are playing. Removed when the game closes.'}</span></div>
         <div class="grid">
           {#each background as g (g.name)}
             {@const image = cover(g.name)}
@@ -212,7 +222,7 @@
   .library{display:flex;flex-direction:column;gap:22px;min-width:0}.heading,.toolbar,.viewer-header{display:flex;align-items:center;gap:12px}.heading{justify-content:space-between}.heading h1{font-size:30px;letter-spacing:-.025em;line-height:1.2}.heading p,.viewer-title p{color:var(--text-2);margin-top:3px;font-size:13px}.toolbar{justify-content:space-between;flex-wrap:wrap;padding-bottom:14px;border-bottom:1px solid var(--line)}.filters{display:flex;gap:8px;min-width:0}.filters select{max-width:190px}.search{display:flex;align-items:center;position:relative;color:var(--text-2)}.search :global(svg){position:absolute;left:10px;pointer-events:none}.search input{padding-left:34px;width:175px}.temp{font-size:11px;font-weight:600;border-radius:4px;padding:2px 7px}.temp{color:var(--accent);background:var(--accent-soft)}
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(188px,1fr));gap:12px}.saved-card{min-width:0;border:1px solid var(--line);border-radius:9px;background:var(--surface);color:var(--text);text-align:left;position:relative}.saved-card:hover{border-color:var(--accent)}.cover{position:relative;aspect-ratio:16/9;display:block;background:var(--surface-2);border-radius:8px}.cover>img,.tile>img{width:100%;height:100%;object-fit:cover;position:absolute;inset:0;border-radius:inherit}.fallback{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;gap:12px;padding:12px;color:#e3edf9;border-radius:inherit;background:radial-gradient(ellipse at 85% 10%,hsl(var(--cover-hue) 55% 35%),transparent 67%),linear-gradient(125deg,hsl(var(--cover-hue) 40% 23%),#111927 75%)}.fallback b{font-size:clamp(13px,1.3vw,20px);overflow:hidden;text-overflow:ellipsis}.tag,.duration{position:absolute;top:7px;display:flex;align-items:center;gap:5px;padding:3px 6px;border-radius:4px;background:#10151de8;color:#f0f5fc;font-size:10px;pointer-events:none;white-space:nowrap}.tag{left:7px}.duration{right:7px;font-variant-numeric:tabular-nums}.card-text{position:absolute;inset:auto 0 0;display:flex;flex-direction:column;gap:2px;padding:21px 10px 9px;min-width:0;color:#f0f5fc;background:linear-gradient(transparent,#0c111ae8 45%,#0c111a);border-radius:0 0 8px 8px;opacity:0;pointer-events:none;transition:opacity 110ms ease}.saved-card .tag,.saved-card .duration{opacity:0}.saved-card:is(:hover,:focus-within,.open) :is(.tag,.duration){opacity:1}.saved-card .duration{right:40px}.card-text strong{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.card-text small{font-size:11px;color:#c4ceda;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.card-text input{height:26px;width:100%;pointer-events:auto}
   .tile{position:absolute;inset:0;border:0;padding:0;border-radius:inherit;background:transparent;cursor:pointer;overflow:hidden}.tile-play{position:absolute;inset:0;display:grid;place-items:center;background:#0005;color:white;opacity:0}.tile:hover .tile-play,.tile:focus-visible .tile-play{opacity:1}.more{position:absolute;right:6px;top:6px;display:grid;place-items:center;width:28px;height:28px;border:0;border-radius:5px;background:#10151de8;color:white;cursor:pointer;opacity:0}.saved-card:hover .more,.saved-card:focus-within .more,.saved-card.open .more{opacity:1}.menu{position:absolute;z-index:10;right:6px;top:39px;min-width:180px;display:flex;flex-direction:column;padding:4px;background:var(--surface-3);border:1px solid var(--line-strong);border-radius:7px;box-shadow:var(--shadow-pop)}.menu button{border:0;padding:7px 9px;border-radius:4px;background:none;color:var(--text);text-align:left;cursor:pointer}.menu button:hover{background:var(--surface-2)}.menu .danger{color:var(--danger)}.more-items{margin-top:12px}
-  .empty{display:grid;justify-items:center;gap:12px;padding:54px 16px;color:var(--text-2);text-align:center}.empty h2{font-size:18px;color:var(--text)}.viewer{display:flex;flex-direction:column;gap:0;min-height:450px;height:100vh}.viewer-header{display:grid;grid-template-columns:1fr minmax(0,2fr) 1fr;min-height:48px;padding:0 12px;border-bottom:1px solid var(--line);background:var(--chrome)}.viewer-header>button:first-child{justify-self:start}.viewer-header>button:last-child:not(:first-child){justify-self:end}.viewer-title{min-width:0;text-align:center}.viewer-title h1{font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.viewer-title p{margin:0;font-size:12px}.saved-stage{flex:1;min-height:0;display:grid;place-items:center;background:#080a0e;overflow:hidden}.saved-stage video,.saved-stage img{width:100%;height:100%;min-height:0;object-fit:contain}
+  .empty{display:grid;justify-items:center;gap:12px;padding:54px 16px;color:var(--text-2);text-align:center}.empty h2{font-size:18px;color:var(--text)}.viewer{display:flex;flex-direction:column;gap:0;min-height:450px;height:100vh}.viewer-header{display:grid;grid-template-columns:1fr minmax(0,2fr) 1fr;min-height:48px;padding:0 12px;border-bottom:1px solid var(--line);background:var(--chrome)}.viewer-header>button:first-child{justify-self:start}.viewer-actions{justify-self:end;display:flex;align-items:center;gap:6px}.close-viewer{gap:6px;white-space:nowrap}.viewer-title{min-width:0;text-align:center}.viewer-title h1{font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.viewer-title p{margin:0;font-size:12px}
   .saved-card:is(:hover,:focus-within,.open) .card-text{opacity:1}.saved-card .card-text{z-index:2}.rec .tag{opacity:1}.rec .tag.now{color:#fff;background:var(--danger)}.rec .dot{width:6px;height:6px;border-radius:50%;background:#fff}
   .rec .cover>img{z-index:0}.rec .tile{z-index:1}.saved-card .tag,.saved-card .duration,.saved-card .more,.saved-card .menu{z-index:2}.menu{z-index:10!important}
   .rec{border-color:color-mix(in srgb,var(--accent) 45%,var(--line))}.rec .tag{color:#a9d0ff}.section-head{display:flex;align-items:center;gap:12px;margin-bottom:10px}.section-head h2{font-size:16px;font-weight:650}.section-note{margin-left:auto;color:var(--text-2);font-size:12px;text-align:right;min-width:0}

@@ -22,7 +22,10 @@ pub fn duration_secs(clip: &Path) -> Result<f64, String> {
         let mut ic = null_mut();
         check(ff::avformat_open_input(&mut ic, av::cstr(&clip.to_string_lossy()).as_ptr(), null(), null_mut()), "open clip")?;
         let ic = Fmt(ic);
-        check(ff::avformat_find_stream_info(ic.0, null_mut()), "read clip")?;
+        // An MP4's header states its length; only a file without one is read further.
+        if (*ic.0).duration <= 0 {
+            check(ff::avformat_find_stream_info(ic.0, null_mut()), "read clip")?;
+        }
         Ok((*ic.0).duration as f64 / ff::AV_TIME_BASE as f64)
     }
 }

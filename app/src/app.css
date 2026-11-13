@@ -171,7 +171,6 @@ input[type="checkbox"] { accent-color: var(--accent); width: 16px; height: 16px;
 .wrap { flex-wrap: wrap; }
 .grow { flex: 1; min-width: 0; }
 .stack { display: flex; flex-direction: column; gap: var(--s3); }
-.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 kbd {
   display: inline-block; padding: 1px 6px; border-radius: var(--r-sm);
   border: 1px solid var(--line-strong); background: var(--surface-2);
@@ -181,7 +180,6 @@ kbd {
 /* Panels: one quiet surface style; hierarchy comes from type and space, not borders. */
 .panel { background: var(--surface); border-radius: var(--r-lg); padding: var(--s5); }
 .panel-title { font-size: var(--fs-sm); font-weight: 600; color: var(--text-2); margin-bottom: var(--s3); }
-.section-title { font-size: var(--fs-lg); font-weight: 600; }
 
 /* Inline status banners */
 .banner { display: flex; align-items: center; gap: var(--s3); padding: var(--s3) var(--s4); border-radius: var(--r-md); background: var(--surface); }

@@ -3,10 +3,18 @@
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
 pub fn now_100ns() -> u64 {
-    let (mut c, mut f) = (0i64, 0i64);
+    // The counter's frequency is fixed when Windows starts: asked for once.
+    static FREQUENCY: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    let f = *FREQUENCY.get_or_init(|| {
+        let mut f = 0i64;
+        unsafe {
+            let _ = QueryPerformanceFrequency(&mut f);
+        }
+        f.max(1)
+    });
+    let mut c = 0i64;
     unsafe {
         let _ = QueryPerformanceCounter(&mut c);
-        let _ = QueryPerformanceFrequency(&mut f);
     }
     (c as i128 * 10_000_000 / f as i128) as u64
 }

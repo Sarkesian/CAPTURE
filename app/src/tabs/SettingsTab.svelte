@@ -129,23 +129,28 @@
         <Segmented label="Frame rate" value={s.fps} options={[{ value: 30, label: '30 fps' }, { value: 60, label: '60 fps' }, { value: 120, label: '120 fps' }]} onchange={v => updateSettings({ fps: v })} />
       </div>
       <div class="field">
-        <div class="lbl"><div>Instant Replay length</div><div class="hint">How much recent gameplay the hotkey saves. Background history is kept separately.</div></div>
+        <div class="lbl"><div>Instant Replay length</div><div class="hint">How much recent gameplay the hotkey saves.{s.background_history ? ' Background history is kept separately.' : ' This is all that is recorded.'}</div></div>
         <select class="select" aria-label="Replay length" value={String(s.replay_secs)} onchange={ev => updateSettings({ replay_secs: Number((ev.target as HTMLSelectElement).value) })}>
           {#each lengths as d (d)}<option value={String(d)}>{fmtDuration(d)}</option>{/each}
           {#if !lengths.includes(s.replay_secs)}<option value={String(s.replay_secs)}>{fmtDuration(s.replay_secs)}</option>{/if}
         </select>
       </div>
       <div class="field">
-        <div class="lbl"><div>Background history</div><div class="hint">Total recorded gameplay across games, within your existing storage budget. Recording quality is never reduced to fit.</div></div>
-        <select class="select" aria-label="Background history duration" value={s.history_secs} onchange={ev=>updateSettings({history_secs:Number(ev.currentTarget.value)})}>
-          {#each [3600,7200,14400,21600] as d}<option value={d}>{d/3600} hours</option>{/each}
-        </select>
+        <div class="lbl"><div>Background history</div><div class="hint">{s.background_history ? 'Keeps hours of gameplay across games as temporary background recordings you can clip from later.' : `Off: only the last ${fmtDuration(s.replay_secs)} of the game you are playing is kept, and it is removed when the game closes.`} Turning this off deletes the background recordings kept so far; saved clips are not touched.</div></div>
+        <div class="row">
+          {#if s.background_history}
+            <select class="select" aria-label="Background history duration" value={s.history_secs} onchange={ev=>updateSettings({history_secs:Number(ev.currentTarget.value)})}>
+              {#each [3600,7200,14400,21600] as d}<option value={d}>{d/3600} hours</option>{/each}
+            </select>
+          {/if}
+          <Toggle checked={s.background_history} label="Background history" onchange={v => updateSettings({ background_history: v })} />
+        </div>
       </div>
       <div class="field">
         <div class="lbl"><div>Show the mouse cursor</div></div>
         <Toggle checked={s.capture_cursor} label="Show the mouse cursor" onchange={v => updateSettings({ capture_cursor: v })} />
       </div>
-      <p class="foot">{#if estimate != null}Estimated {fmtBytes(estimate)} for {s.history_secs/3600} hours ({bitrate!=null?'measured current recording rate':'current resolution/FPS ceiling estimate'}). Budget: {s.buffer_cap_gb} GB. Content changes affect actual usage.{:else}Storage depends on source resolution, FPS and content. Archival storage cannot be predicted from a quality label.{/if}</p>
+      <p class="foot">{#if !s.background_history}Only the replay window is on disk while you play, so storage use stays small.{:else if estimate != null}Estimated {fmtBytes(estimate)} for {s.history_secs/3600} hours ({bitrate!=null?'measured current recording rate':'current resolution/FPS ceiling estimate'}). Budget: {s.buffer_cap_gb} GB. Content changes affect actual usage.{:else}Storage depends on source resolution, FPS and content. Archival storage cannot be predicted from a quality label.{/if}</p>
       <p class="foot">Original H.264 packets are kept for history and saved clips. Capture is 8-bit SDR; RGB conversion prevents an end-to-end zero-loss claim. The recording format remains H.264 SDR for broad compatibility.</p>
       {#if e}
         <p class="foot">Source arrivals {e.frames_captured} · video packets {e.frames_encoded} · missed recording ticks {e.frames_dropped} · ticks without a picture {e.frames_without_source} · repeated source samples {e.frames_repeated} · source arrivals not selected {e.source_frames_unselected}. Game frames never delivered by Windows cannot be counted here.</p>

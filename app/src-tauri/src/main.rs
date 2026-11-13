@@ -29,6 +29,9 @@ struct Tray {
     status: MenuItem<tauri::Wry>,
     toggle: MenuItem<tauri::Wry>,
     save: MenuItem<tauri::Wry>,
+    /// What the tray shows now (status line, replay on, save hotkey, active icon), so a state
+    /// report that changes none of it costs nothing.
+    shown: Option<(String, bool, String, bool)>,
 }
 
 struct AppState {
@@ -138,7 +141,7 @@ fn merged(current: &AppSettings, patch: &serde_json::Value) -> Result<AppSetting
     serde_json::from_value::<AppSettings>(v).map(AppSettings::sanitized).map_err(|e| format!("Invalid setting: {e}"))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn bootstrap(window: tauri::WebviewWindow, state: State<AppState>) -> Bootstrap {
     let s = state.settings.lock().unwrap().clone();
     // One-time notices belong to the main window, not the hidden overlay.
@@ -155,7 +158,7 @@ fn bootstrap(window: tauri::WebviewWindow, state: State<AppState>) -> Bootstrap 
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn check_paths(state: State<AppState>) -> Vec<PathIssue> {
     path_issues(&state.settings.lock().unwrap())
 }
@@ -429,7 +432,7 @@ fn show_main(app: AppHandle, tab: Option<String>) {
 }
 
 /// Move a clip to the Recycle Bin (recoverable). Only files inside the capture folder.
-#[tauri::command]
+#[tauri::command(async)]
 fn delete_clip(state: State<AppState>, path: String) -> Result<(), String> {
     use windows::core::PCWSTR;
     use windows::Win32::UI::Shell::*;
@@ -449,9 +452,7 @@ fn delete_clip(state: State<AppState>, path: String) -> Result<(), String> {
     if r != 0 || op.fAnyOperationsAborted.as_bool() {
         return Err(format!("Could not move the clip to the Recycle Bin (code {r})."));
     }
-    let mut side = p.as_os_str().to_owned();
-    side.push(".markers.json");
-    let _ = std::fs::remove_file(side);
+    let _ = std::fs::remove_file(library::sidecar(&p));
     Ok(())
 }
 
@@ -701,10 +702,11 @@ fn clear_temp_cache(state: State<AppState>) -> Result<u64, String> {
     state.worker.send(Command::ClearTempCache)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_clips(state: State<AppState>, kind: Option<String>) -> Vec<library::ClipEntry> {
     let root = PathBuf::from(&state.settings.lock().unwrap().capture_root);
-    library::list(&root, kind.as_deref().unwrap_or("clips"), 1000)
+    // Up to 1000 of one kind, or of each kind when all are asked for at once.
+    library::list(&root, kind.as_deref(), if kind.is_some() { 1000 } else { 3000 })
 }
 
 #[tauri::command]
@@ -732,7 +734,7 @@ async fn export_clip(state: State<'_, AppState>, path: String, dest: String) -> 
         .map_err(|e| e.to_string())?
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn rename_clip(state: State<AppState>, path: String, name: String) -> Result<String, String> {
     let p = recording_path(&state, &path)?;
     library::rename(&p, &name).map(|t| t.to_string_lossy().into_owned())
@@ -774,7 +776,7 @@ fn reveal_path(state: State<AppState>, path: String) -> Result<(), String> {
     std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", p.display())).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn open_capture_folder(state: State<AppState>) -> Result<(), String> {
     let root = PathBuf::from(&state.settings.lock().unwrap().capture_root);
     std::fs::create_dir_all(&root).map_err(|e| format!("Cannot create {}: {e}", root.display()))?;
@@ -797,7 +799,8 @@ fn quit(app: &AppHandle) {
         return;
     }
     if let Some(w) = app.get_webview_window("main") {
-        let _ = w.hide();
+        // Not just hidden: a clip left playing would be heard until the last save is written.
+        to_tray(&w);
     }
     let (app, worker) = (app.clone(), state.worker.clone());
     std::thread::spawn(move || {
@@ -841,6 +844,26 @@ fn set_page_visible(w: &tauri::WebviewWindow, visible: bool) {
     });
 }
 
+/// A clip, screenshot or recording is open in the Library's viewer. The window's close button
+/// then closes the viewer, not CAPTURE; the caption says so, since the button itself is Windows'.
+static VIEWING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[tauri::command]
+fn set_viewing(app: AppHandle, on: bool) {
+    VIEWING.store(on, Ordering::SeqCst);
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.set_title(if on { "CAPTURE · Viewer · ✕ returns to the Library" } else { "CAPTURE" });
+    }
+}
+
+/// Put the main window away (tray, or quitting). The page is told first, so it stops whatever
+/// is playing and leaves fullscreen: the window comes back as an ordinary window, in silence.
+fn to_tray(w: &tauri::WebviewWindow) {
+    let _ = w.emit_to("main", "tray", ());
+    let _ = w.hide();
+    set_page_visible(w, false);
+}
+
 fn show_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.unminimize();
@@ -861,8 +884,10 @@ fn fmt_secs(s: f64) -> String {
 
 fn refresh_tray(app: &AppHandle) {
     let state = app.state::<AppState>();
-    let replay_on = state.settings.lock().unwrap().replay_enabled;
-    let hotkey = state.settings.lock().unwrap().save_hotkey.clone();
+    let (replay_on, hotkey) = {
+        let s = state.settings.lock().unwrap();
+        (s.replay_enabled, s.save_hotkey.clone())
+    };
     let st = state.last_state.lock().unwrap().clone();
     let down = state.engine_down.lock().unwrap().clone();
     let (line, active) = match (&down, &st) {
@@ -879,20 +904,30 @@ fn refresh_tray(app: &AppHandle) {
         },
         (None, None) => ("Starting…".to_string(), false),
     };
-    let tray = state.tray.lock().unwrap();
-    if let Some(t) = tray.as_ref() {
-        let short: String = line.chars().take(120).collect();
-        let _ = t.status.set_text(&short);
-        let _ = t.icon.set_tooltip(Some(format!("CAPTURE — {}", short.chars().take(100).collect::<String>())));
+    let mut tray = state.tray.lock().unwrap();
+    let Some(t) = tray.as_mut() else { return };
+    let short: String = line.chars().take(120).collect();
+    let was = t.shown.take();
+    let changed = |f: fn(&(String, bool, String, bool), &(String, bool, String, bool)) -> bool, now: &(String, bool, String, bool)| was.as_ref().is_none_or(|w| f(w, now));
+    let now = (short, replay_on, hotkey, active);
+    if changed(|a, b| a.0 != b.0, &now) {
+        let _ = t.status.set_text(&now.0);
+        let _ = t.icon.set_tooltip(Some(format!("CAPTURE — {}", now.0.chars().take(100).collect::<String>())));
+    }
+    if changed(|a, b| a.1 != b.1, &now) {
         let _ = t.toggle.set_text(if replay_on { "Turn instant replay off" } else { "Turn instant replay on" });
-        let _ = t.save.set_text(if hotkey.is_empty() { "Save replay".to_string() } else { format!("Save replay ({hotkey})") });
         let _ = t.save.set_enabled(replay_on);
+    }
+    if changed(|a, b| a.2 != b.2, &now) {
+        let _ = t.save.set_text(if now.2.is_empty() { "Save replay".to_string() } else { format!("Save replay ({})", now.2) });
+    }
+    if changed(|a, b| a.3 != b.3, &now) {
         let png: &[u8] = if active { include_bytes!("../icons/tray-active.png") } else { include_bytes!("../icons/tray-idle.png") };
         if let Ok(img) = Image::from_bytes(png) {
             let _ = t.icon.set_icon(Some(img));
         }
     }
-    drop(tray);
+    t.shown = Some(now);
 }
 
 fn on_message(app: &AppHandle, m: Message) {
@@ -970,7 +1005,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<Tray> {
             }
         })
         .build(app)?;
-    Ok(Tray { icon, status, toggle, save })
+    Ok(Tray { icon, status, toggle, save, shown: None })
 }
 
 
@@ -1192,6 +1227,7 @@ fn main() {
             toggle_overlay,
             hide_overlay,
             show_main,
+            set_viewing,
             delete_clip,
             rename_clip,
             set_start_with_windows,
@@ -1260,7 +1296,7 @@ fn main() {
                         set_page_visible(&w2, visible);
                         // Minimize to tray (optional): a minimised window is 0x0.
                         if size.width == 0 && size.height == 0 && handle.state::<AppState>().settings.lock().unwrap().minimize_to_tray {
-                            let _ = w2.hide();
+                            to_tray(&w2);
                         }
                     }
                     if let WindowEvent::Focused(true) = e {
@@ -1269,11 +1305,11 @@ fn main() {
                     if let WindowEvent::CloseRequested { api, .. } = e {
                         api.prevent_close();
                         let state = handle.state::<AppState>();
-                        if state.settings.lock().unwrap().close_to_tray {
-                            if let Some(w) = handle.get_webview_window("main") {
-                                let _ = w.hide();
-                                set_page_visible(&w, false);
-                            }
+                        // On screen with the viewer open: an accidental close only leaves the viewer.
+                        if VIEWING.load(Ordering::SeqCst) && w2.is_visible().unwrap_or(false) && !w2.is_minimized().unwrap_or(false) {
+                            let _ = w2.emit_to("main", "close_viewer", ());
+                        } else if state.settings.lock().unwrap().close_to_tray {
+                            to_tray(&w2);
                         } else {
                             quit(&handle);
                         }

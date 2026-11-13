@@ -391,15 +391,6 @@ impl Catalog {
         Ok((part.id.clone(), part.offset))
     }
 
-    /// The session a recording belongs to, and the recording's offset in it.
-    pub fn session_of(&self, recording: &str) -> Result<(String, f64)> {
-        self.db
-            .lock()
-            .unwrap()
-            .query_row("SELECT COALESCE(grp,id),created_ms-COALESCE(grp_ms,created_ms) FROM sessions WHERE id=?1", [recording], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as f64 / 1000.0)))
-            .map_err(err)
-    }
-
     pub fn lease_at(self: &Arc<Self>, session: &str, start: f64, end: f64, kind: &str) -> Result<Lease> {
         let (recording, offset) = self.locate(session, start)?;
         self.lease(&recording, start - offset, end - offset, kind)
@@ -1060,6 +1051,25 @@ impl Catalog {
         }
     }
 
+    /// Background history off: delete the footage of every finished session CAPTURE recorded.
+    /// Left alone: the session being recorded, recovered footage from older versions, and
+    /// anything a save is using or failed on. Returns the bytes freed.
+    pub fn drop_finished(&self) -> u64 {
+        let sessions: Vec<String> = {
+            let db = self.db.lock().unwrap();
+            let found = db
+                .prepare_cached(
+                    "SELECT COALESCE(grp,id) g FROM sessions GROUP BY g
+                     HAVING MIN(ended)=1 AND MIN(managed)=1
+                       AND NOT EXISTS(SELECT 1 FROM jobs j JOIN sessions o ON o.id=j.session WHERE COALESCE(o.grp,o.id)=g)",
+                )
+                .and_then(|mut q| q.query_map([], |r| r.get::<_, String>(0))?.collect::<std::result::Result<Vec<_>, _>>())
+                .unwrap_or_default();
+            found
+        };
+        sessions.iter().map(|s| self.delete_session(s).unwrap_or(0)).sum()
+    }
+
     fn reconcile(&self) -> Result<()> {
         let db = self.db.lock().unwrap();
         let mut q = db.prepare("SELECT path FROM previews").map_err(err)?;
@@ -1276,6 +1286,14 @@ mod tests {
         let(c,id,dir)=fixture();let p=segment(&c,&id,&dir,0,0.0);let clip=dir.parent().unwrap().join("kept.mp4");std::fs::write(&clip,"clip").unwrap();
         assert!(c.delete_session(&id).is_err() && p.exists(),"a recording still being written is kept");
         c.end(&id);assert_eq!(c.delete_session(&id).unwrap(),100);assert!(!p.exists() && clip.exists() && !dir.exists());assert!(c.state(7200).unwrap().sessions.is_empty());
+    }
+    #[test] fn history_off_drops_finished_sessions_but_not_live_held_or_legacy_footage(){
+        let(c,live,dir)=fixture();let root=dir.parent().unwrap().to_path_buf();let keep=segment(&c,&live,&dir,0,0.0);
+        let(a,da)=recording(&c,&root,"2026-11-10_08-00-00_7","Done",1_800_000_000_000);let gone=segment(&c,&a,&da,0,0.0);c.end(&a);
+        let(b,db)=recording(&c,&root,"2026-11-10_09-00-00_7","Saving",1_800_003_600_000);let held=segment(&c,&b,&db,0,0.0);c.end(&b);let lease=c.lease(&b,0.0,2.0,"save").unwrap();
+        let(l,dl)=recording(&c,&root,"2026-11-10_10-00-00_7","Legacy",1_800_007_200_000);let legacy=segment(&c,&l,&dl,0,0.0);c.end(&l);c.db.lock().unwrap().execute("UPDATE sessions SET managed=0 WHERE id=?1",[&l]).unwrap();
+        assert_eq!(c.drop_finished(),100);assert!(!gone.exists() && !da.exists() && keep.exists() && held.exists() && legacy.exists());
+        drop(lease);assert_eq!(c.drop_finished(),100);assert!(!held.exists() && keep.exists() && legacy.exists());
     }
     #[test] fn emptied_recordings_are_forgotten_and_legacy_footage_does_not_use_the_budget(){
         let(c,id,dir)=fixture();let root=dir.parent().unwrap().to_path_buf();segment(&c,&id,&dir,0,0.0);c.db.lock().unwrap().execute("UPDATE sessions SET managed=0",[]).unwrap();

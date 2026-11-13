@@ -40,7 +40,6 @@ pub enum Command {
     SaveReplay,
     /// Bookmark the current moment of the running session.
     AddMarker { #[serde(default)] label: Option<String> },
-    RenameMarker { id: u64, label: String },
     RemoveMarker { id: u64 },
     /// Make the buffered footage playable for the review timeline (stream copy into a
     /// temporary MP4). Footage used by the review is protected until released.
@@ -301,6 +300,12 @@ pub struct GameRule {
 }
 
 impl EngineConfig {
+    /// How much footage is kept on disk: the background history, or with that off just the
+    /// replay window (plus a little slack so a save always finds its first keyframe).
+    pub fn kept_secs(&self) -> u32 {
+        if self.background_history { self.history_secs.clamp(60, 21600) } else { self.replay_secs.clamp(5, 3600) + 30 }
+    }
+
     /// This configuration with the rule for `exe` (if any) applied.
     pub fn for_game(&self, exe: &str) -> EngineConfig {
         let mut c = self.clone();
@@ -377,6 +382,10 @@ pub struct EngineConfig {
     pub replay_secs: u32,
     #[serde(default = "default_history_secs")]
     pub history_secs: u32,
+    /// Off: only the Instant Replay window of the game being played is kept, and it is removed
+    /// when the game closes. Nothing is kept as a background recording.
+    #[serde(default = "yes")]
+    pub background_history: bool,
     pub target: CaptureTarget,
     pub quality: Quality,
     pub fps: u32,
