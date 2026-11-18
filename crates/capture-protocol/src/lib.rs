@@ -88,6 +88,9 @@ pub enum Command {
     ExportStems { path: String },
     /// Duration of a saved clip (answered with `ClipInfo`).
     ClipInfo { path: String },
+    /// Cut a saved clip down to `start..end` (seconds into it) without re-encoding. The result is
+    /// written next to it as `<clip>.partial` and answered with `ClipTrimmed`; the app swaps it in.
+    TrimClip { path: String, start: f64, end: f64 },
     ListTargets,
     GetState,
     /// Delete leftover temporary buffer footage that is not part of the running session.
@@ -122,6 +125,9 @@ pub enum Event {
     HistoryReady(HistoryState),
     HistoryFrames { frames: Vec<FrameTiming>, error: Option<String> },
     ClipInfo { path: String, duration_secs: Option<f64>, error: Option<String> },
+    /// `start`: where the trimmed clip really begins in the original (a keyframe at or just
+    /// before the requested start).
+    ClipTrimmed { path: String, start: Option<f64>, duration_secs: Option<f64>, error: Option<String> },
     AudioDevices { inputs: Vec<AudioDevice>, outputs: Vec<AudioDevice>, apps: Vec<AudioApp> },
     /// Real audio levels since the previous `Levels` message (peak and RMS, linear 0..1).
     Levels { tracks: Vec<Level>, mic_monitor: Option<Level> },

@@ -382,6 +382,149 @@ unsafe fn remux_inner(segments: &[(PathBuf, f64)], lead_in: Option<&Path>, seg0_
     Ok(actual_start)
 }
 
+/// Trim a saved clip to `start..end` (seconds into it): the same stream copy as a save, so it
+/// is fast and loses no quality. It begins on the last keyframe at or before `start` (keyframes
+/// are 1 s apart) and ends exactly at `end`. Written to `<clip>.partial` and verified; the
+/// original is not touched. Returns the result and where it really begins in the original.
+pub fn trim(clip: &Path, start: f64, end: f64) -> Result<(ClipResult, f64), String> {
+    if !(start >= 0.0 && end > start) {
+        return Err("Choose a start and an end for the trim.".into());
+    }
+    let partial = storage::partial_path(clip);
+    let r = unsafe { trim_inner(clip, start, end, &partial) }.and_then(|(actual, end, audio)| {
+        let v = verify(&partial, audio)?;
+        if v.duration_secs + 0.15 < end - actual {
+            return Err("The trimmed clip came out incomplete. The original is unchanged.".into());
+        }
+        Ok((v, actual))
+    });
+    if r.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    r
+}
+
+/// Returns (actual start, actual end, audio track count), in seconds into the original.
+unsafe fn trim_inner(clip: &Path, start: f64, end: f64, out: &Path) -> Result<(f64, f64, u32), String> {
+    let ic = open_input(clip).map_err(|e| format!("The clip could not be opened: {e}"))?;
+    let n = (*ic.0).nb_streams as usize;
+    let stream = |i: usize| *(*ic.0).streams.add(i);
+    let kind = |i: usize| (*(*stream(i)).codecpar).codec_type;
+    let video_idx = (0..n).find(|&i| kind(i) == ff::AVMediaType::AVMEDIA_TYPE_VIDEO).ok_or("This file has no video to trim")?;
+    if (0..n).any(|i| !matches!(kind(i), ff::AVMediaType::AVMEDIA_TYPE_VIDEO | ff::AVMediaType::AVMEDIA_TYPE_AUDIO)) {
+        return Err("This file has tracks CAPTURE cannot trim.".into());
+    }
+    let total = (*ic.0).duration as f64 / ff::AV_TIME_BASE as f64;
+    let end = if total > 0.0 { end.min(total) } else { end };
+    if end - start < 0.2 {
+        return Err("The trim is too short.".into());
+    }
+
+    let cpath = av::cstr(&out.to_string_lossy());
+    let mut oc = null_mut();
+    check(ff::avformat_alloc_output_context2(&mut oc, null(), av::cstr("mp4").as_ptr(), cpath.as_ptr()), "mp4 ctx")?;
+    struct Out(*mut ff::AVFormatContext);
+    impl Drop for Out {
+        fn drop(&mut self) {
+            unsafe {
+                if !(*self.0).pb.is_null() {
+                    ff::avio_closep(&mut (*self.0).pb);
+                }
+                ff::avformat_free_context(self.0);
+            }
+        }
+    }
+    let oc = Out(oc);
+    // Everything about the tracks stays as it was: labels, default track, colour tags.
+    for i in 0..n {
+        let ist = stream(i);
+        let ost = ff::avformat_new_stream(oc.0, null());
+        check(ff::avcodec_parameters_copy((*ost).codecpar, (*ist).codecpar), "codecpar")?;
+        (*(*ost).codecpar).codec_tag = 0;
+        (*ost).time_base = (*ist).time_base;
+        (*ost).disposition = (*ist).disposition;
+        let label = ff::av_dict_get((*ist).metadata, av::cstr("handler_name").as_ptr(), null(), 0);
+        if !label.is_null() {
+            ff::av_dict_set(&mut (*ost).metadata, av::cstr("handler_name").as_ptr(), (*label).value, 0);
+        }
+    }
+    av::dict_set(&mut (*oc.0).metadata, "comment", "Recorded with CAPTURE");
+    check(ff::avio_open(&mut (*oc.0).pb, cpath.as_ptr(), ff::AVIO_FLAG_WRITE), "create trimmed file")?;
+    let mut opts = null_mut();
+    av::dict_set(&mut opts, "movflags", "+faststart");
+    let r = ff::avformat_write_header(oc.0, &mut opts);
+    ff::av_dict_free(&mut opts);
+    check(r, "trimmed clip header")?;
+
+    let vst = stream(video_idx);
+    let vtb = (*vst).time_base;
+    let secs = |pts: i64| pts as f64 * vtb.num as f64 / vtb.den as f64;
+    let zero = if (*vst).start_time == ff::AV_NOPTS_VALUE { 0 } else { (*vst).start_time };
+    let want = zero + (start * vtb.den as f64 / vtb.num as f64).round() as i64;
+    let pkt = ff::av_packet_alloc();
+    struct PktGuard(*mut ff::AVPacket);
+    impl Drop for PktGuard {
+        fn drop(&mut self) {
+            unsafe { ff::av_packet_free(&mut self.0) };
+        }
+    }
+    let _pg = PktGuard(pkt);
+    let rewind = |ic: *mut ff::AVFormatContext| check(ff::av_seek_frame(ic, video_idx as i32, want, ff::AVSEEK_FLAG_BACKWARD), "find the start of the trim");
+    // First pass: which keyframe the trim begins on. Sound read before it arrives may belong
+    // to the trim, so the copy starts over from the same place once the origin is known.
+    rewind(ic.0)?;
+    let mut origin = None;
+    while origin.is_none() && ff::av_read_frame(ic.0, pkt) >= 0 {
+        if (*pkt).stream_index as usize == video_idx && (*pkt).flags & ff::AV_PKT_FLAG_KEY != 0 && (*pkt).pts != ff::AV_NOPTS_VALUE {
+            origin = Some((*pkt).pts);
+        }
+        ff::av_packet_unref(pkt);
+    }
+    let origin = origin.ok_or("No video was found at the start of the trim.")?;
+    let actual = secs(origin - zero).max(0.0);
+    let span = end - actual;
+    rewind(ic.0)?;
+    let mut last_dts = vec![i64::MIN; n];
+    while ff::av_read_frame(ic.0, pkt) >= 0 {
+        let si = (*pkt).stream_index as usize;
+        let tb = (*stream(si)).time_base;
+        if (*pkt).pts == ff::AV_NOPTS_VALUE {
+            ff::av_packet_unref(pkt);
+            continue;
+        }
+        let o_in = ff::av_rescale_q(origin, vtb, tb);
+        let rel = ((*pkt).pts - o_in) as f64 * tb.num as f64 / tb.den as f64;
+        if si == video_idx && rel > span + 2.0 {
+            ff::av_packet_unref(pkt);
+            break; // well past the end: nothing later belongs to the trim
+        }
+        if rel < 0.0 || rel >= span - 0.000_001 {
+            ff::av_packet_unref(pkt);
+            continue;
+        }
+        let remaining = ((span - rel) * tb.den as f64 / tb.num as f64).round() as i64;
+        if (*pkt).duration > remaining {
+            (*pkt).duration = remaining;
+        }
+        (*pkt).pts -= o_in;
+        if (*pkt).dts != ff::AV_NOPTS_VALUE {
+            (*pkt).dts -= o_in;
+        } else {
+            (*pkt).dts = (*pkt).pts;
+        }
+        if (*pkt).dts <= last_dts[si] {
+            ff::av_packet_unref(pkt);
+            continue;
+        }
+        last_dts[si] = (*pkt).dts;
+        ff::av_packet_rescale_ts(pkt, tb, (*(*(*oc.0).streams.add(si))).time_base);
+        (*pkt).pos = -1;
+        check(ff::av_interleaved_write_frame(oc.0, pkt), "write trimmed clip")?;
+    }
+    check(ff::av_write_trailer(oc.0), "finish trimmed clip")?;
+    Ok((actual, end, (n - 1) as u32))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

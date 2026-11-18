@@ -120,7 +120,7 @@ function filesChanged(library: boolean) {
 }
 
 function onEngine(m: EngineMessage) {
-  if (m.event === 'history_frames' || m.event === 'history_thumb' || m.event === 'save_finished' || m.event === 'save_failed') {
+  if (m.event === 'history_frames' || m.event === 'history_thumb' || m.event === 'save_finished' || m.event === 'save_failed' || m.event === 'clip_trimmed') {
     const id = m.re;
     if (id !== undefined) {
       const finish = pendingResults.get(id);
@@ -282,7 +282,7 @@ async function requestReview(cmd: string, args: Record<string, unknown> | undefi
   const reply = earlyReplies.get(id); if (reply) { earlyReplies.delete(id); reviewReply(reply); }
 }
 export const historyReview = (session: string, at: number, prefetch = false) => requestReview('history_review', { session, at, viewer, prefetch }, prefetch);
-type CommandResult = Extract<EngineMessage, { event: 'history_frames' | 'history_thumb' | 'save_finished' | 'save_failed' }>;
+type CommandResult = Extract<EngineMessage, { event: 'history_frames' | 'history_thumb' | 'save_finished' | 'save_failed' | 'clip_trimmed' }>;
 const pendingResults = new Map<number, (result?: CommandResult) => void>();
 const earlyResults = new Map<number, CommandResult>();
 
@@ -321,6 +321,19 @@ export const deleteRecording = (session: string) => engine('history_delete', { s
 export async function saveTrim(session: string, start: number, end: number) {
   const reply = await commandResult('history_save', { session, start, end, aligned: true });
   return reply?.event === 'save_finished';
+}
+/** Cut a saved clip down to `start..end` seconds, in place. The untrimmed original goes to the
+ * Recycle Bin. Resolves to an error message, or null when the trim is saved. */
+export async function trimClip(path: string, start: number, end: number, release: () => void): Promise<string | null> {
+  const reply = await commandResult('trim_clip', { path, start, end });
+  if (reply?.event !== 'clip_trimmed') return 'CAPTURE’s recorder is not running, so the clip was not trimmed.';
+  if (reply.data.error || reply.data.start == null) return reply.data.error ?? 'The clip was not trimmed.';
+  release(); // the player lets go of the file before it is replaced
+  try { await invoke('finish_trim', { path, start: reply.data.start, end }); } catch (e) { return String(e); }
+  delete app.clipInfo[path];
+  app.libraryVersion++;
+  refreshClips();
+  return null;
 }
 export function requestClipInfo(path: string) {
   if (!(path in app.clipInfo)) {

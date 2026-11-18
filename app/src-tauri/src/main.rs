@@ -390,7 +390,7 @@ fn engine_command(state: State<AppState>, command: Command) -> Result<u64, Strin
     }
     // File paths the engine opens (FFmpeg also accepts URLs such as `http:`) must be CAPTURE
     // recordings inside the capture folder.
-    if let Command::ExportStems { path } | Command::ClipInfo { path } = &command {
+    if let Command::ExportStems { path } | Command::ClipInfo { path } | Command::TrimClip { path, .. } = &command {
         recording_path(&state, path)?;
     }
     state.worker.send(command)
@@ -434,12 +434,65 @@ fn show_main(app: AppHandle, tab: Option<String>) {
 /// Move a clip to the Recycle Bin (recoverable). Only files inside the capture folder.
 #[tauri::command(async)]
 fn delete_clip(state: State<AppState>, path: String) -> Result<(), String> {
-    use windows::core::PCWSTR;
-    use windows::Win32::UI::Shell::*;
     let p = inside_root(&state, &path)?;
     if !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp4") || e.eq_ignore_ascii_case("png")) {
         return Err("Only clips, sessions and screenshots can be deleted from here.".into());
     }
+    recycle(&p)?;
+    let _ = std::fs::remove_file(library::sidecar(&p));
+    Ok(())
+}
+
+/// Put the trimmed copy the engine wrote (`<clip>.partial`, see `Command::TrimClip`) in the
+/// clip's place. The untrimmed original goes to the Recycle Bin as "<name> (before trim)", so a
+/// trim can be undone from there. `start..end`: the kept part, in seconds of the original.
+#[tauri::command(async)]
+fn finish_trim(state: State<AppState>, path: String, start: f64, end: f64) -> Result<(), String> {
+    let p = recording_path(&state, &path)?;
+    let partial = PathBuf::from(format!("{}.partial", p.display()));
+    if !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp4")) || !partial.is_file() {
+        return Err("There is no trimmed clip to save.".into());
+    }
+    let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let before = (1..).map(|i| p.with_file_name(if i == 1 { format!("{stem} (before trim).mp4") } else { format!("{stem} (before trim {i}).mp4") })).find(|c| !c.exists()).unwrap();
+    if let Err(e) = std::fs::rename(&p, &before) {
+        let _ = std::fs::remove_file(&partial);
+        return Err(format!("The clip is in use and could not be replaced: {e}"));
+    }
+    if let Err(e) = std::fs::rename(&partial, &p) {
+        let _ = std::fs::rename(&before, &p);
+        let _ = std::fs::remove_file(&partial);
+        return Err(format!("The trimmed clip could not be saved: {e}"));
+    }
+    // From here the trim is saved. If the Recycle Bin refuses, the original simply stays in the
+    // Library under its "(before trim)" name.
+    let _ = recycle(&before);
+    // Editor audio files were cut for the old length: stale ones would no longer line up.
+    let stems = library::stems_dir(&p);
+    if stems.is_dir() {
+        let _ = recycle(&stems);
+    }
+    // Markers move with the footage; those in the removed parts go.
+    let side = library::sidecar(&p);
+    if let Some(mut doc) = std::fs::read(&side).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) {
+        let kept: Vec<serde_json::Value> = doc["markers"].as_array().into_iter().flatten().filter_map(|m| {
+            let t = m["t"].as_f64()?;
+            (t >= start && t <= end).then(|| { let mut m = m.clone(); m["t"] = serde_json::json!(((t - start) * 100.0).round() / 100.0); m })
+        }).collect();
+        if kept.is_empty() {
+            let _ = std::fs::remove_file(&side);
+        } else {
+            doc["markers"] = serde_json::Value::Array(kept);
+            let _ = std::fs::write(&side, serde_json::to_vec_pretty(&doc).unwrap_or_default());
+        }
+    }
+    Ok(())
+}
+
+/// Move a file or folder to the Recycle Bin (recoverable).
+fn recycle(p: &Path) -> Result<(), String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::*;
     let mut from: Vec<u16> = p.as_os_str().to_string_lossy().encode_utf16().collect();
     from.extend([0, 0]);
     let mut op = SHFILEOPSTRUCTW {
@@ -452,7 +505,6 @@ fn delete_clip(state: State<AppState>, path: String) -> Result<(), String> {
     if r != 0 || op.fAnyOperationsAborted.as_bool() {
         return Err(format!("Could not move the clip to the Recycle Bin (code {r})."));
     }
-    let _ = std::fs::remove_file(library::sidecar(&p));
     Ok(())
 }
 
@@ -1229,6 +1281,7 @@ fn main() {
             show_main,
             set_viewing,
             delete_clip,
+            finish_trim,
             rename_clip,
             set_start_with_windows,
             check_paths,

@@ -144,6 +144,7 @@ export type EngineMessage = { v: number; re?: number } & (
   | { event: 'history_ready'; data: HistoryState }
   | { event: 'history_frames'; data: { frames: FrameTiming[]; error: string | null } }
   | { event: 'clip_info'; data: { path: string; duration_secs: number | null; error: string | null } }
+  | { event: 'clip_trimmed'; data: { path: string; start: number | null; duration_secs: number | null; error: string | null } }
   | { event: 'audio_devices'; data: { inputs: AudioDevice[]; outputs: AudioDevice[]; apps: AudioApp[] } }
   | { event: 'stems_done'; data: { path: string; folder: string | null; files: string[]; error: string | null } }
   | { event: 'screenshot_saved'; data: { path: string } }

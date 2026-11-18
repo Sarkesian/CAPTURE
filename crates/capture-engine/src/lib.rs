@@ -584,6 +584,18 @@ impl Engine {
                     emit(Message::new(re, ev));
                 });
             }
+            Command::TrimClip { path, start, end } => {
+                let emit = self.emit.clone();
+                std::thread::spawn(move || {
+                    let done = std::panic::catch_unwind(|| save::trim(Path::new(&path), start, end)).unwrap_or_else(|_| Err("The clip could not be read".into()));
+                    let ev = match done {
+                        Ok((clip, actual)) => Event::ClipTrimmed { path, start: Some(actual), duration_secs: Some(clip.duration_secs), error: None },
+                        Err(e) => Event::ClipTrimmed { path, start: None, duration_secs: None, error: Some(e) },
+                    };
+                    emit(Message::new(re, ev));
+                });
+                return true; // nothing about the engine changed
+            }
             Command::ClipInfo { path } => {
                 let _ = self.clip_info.send((re, path));
                 return true; // nothing about the engine changed
