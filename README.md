@@ -4,7 +4,7 @@ Windows-first, local-first game recording and instant replay. Press a hotkey and
 `Captures\<Game>\Clips\`, with a playable Preview Mix plus separate Game / Microphone / Voice Chat tracks
 for editing.
 
-**Status:** v0.5.1 release candidate (not a verified release: unsigned, tested on one PC). Instant replay,
+**Status:** v0.7.3 development source, including saved-clip trimming (unsigned, tested on one PC). Instant replay,
 overlay with review timeline and markers, sessions, screenshots, separate game/mic/voice-chat tracks, editor audio
 files, library, portable folder and per-user installer. See `docs/STATUS.md` for every requirement and its evidence
 and `docs/AUDIT_0.5.1.md` for the release audit.
@@ -31,10 +31,15 @@ Build with `scripts\package-portable.ps1` (payload + zip) and `scripts\build-ins
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\fetch-deps.ps1   # pinned FFmpeg LGPL + libclang into third_party\
-$env:RUSTUP_HOME='D:\Programs\Rust\rustup'; $env:CARGO_HOME='D:\Programs\Rust\cargo'
+# Install Rust (MSVC), Visual Studio C++ build tools, and Node.js before building.
+# Set RUSTUP_HOME/CARGO_HOME only if your Rust installation uses custom locations.
+cd app
+npm ci
+npm run build
+cd ..
 cargo test --workspace                                              # unit tests
 powershell -ExecutionPolicy Bypass -File scripts\package-portable.ps1   # -> dist\CAPTURE-<version>\ + portable zip
-powershell -ExecutionPolicy Bypass -File scriptsbuild-installer.ps1    # -> dist\CAPTURE-<version>-setup.exe
+powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1    # -> dist\CAPTURE-<version>-setup.exe
 node scripts\e2e-distribution.mjs <version> D:\some\work\dir          # portable + installer end to end
 ```
 
